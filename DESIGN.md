@@ -5,10 +5,12 @@ purpose; the decisions below are commitments, the details are drafts.
 
 ## What we are actually building
 
-A terminal application platform in the dBASE IV lineage: one binary that is
-simultaneously a database browser, a form/report/menu *builder*, and the
-*runtime* for the applications users build with it — backed by SQLite/libSQL
-with the [timeless-libsql](https://github.com/awksedgreep/timeless-libsql)
+A terminal application platform in the lineage of the late-80s database
+desktops (dBASE IV, Paradox, FoxPro — named here historically; see the
+trademark note at the end): one binary that is simultaneously a database
+browser, a form/report/menu *builder*, and the *runtime* for the
+applications users build with it — backed by SQLite/libSQL with the
+[timeless-libsql](https://github.com/awksedgreep/timeless-libsql)
 extension for compressed telemetry and self-monitoring (`dbhealth`).
 
 The test of success is the CRM scenario: a person who is not a programmer
@@ -16,11 +18,13 @@ sits down with phosphor, creates tables, paints an entry form, defines two
 reports and a menu that ties them together — and their team then *uses* that
 application daily, over sqld, at terminal speed.
 
-## The dBASE IV revival map
+## The revival map
 
-What we bring back, what it becomes:
+What we bring back, what it becomes. (The left column names dBASE IV
+features by their historical names for comparison — nominative use; no
+affiliation or compatibility is implied or intended.)
 
-| dBASE IV (1988) | phosphor (2026) | notes |
+| the 1988 feature | phosphor (2026) | notes |
 |---|---|---|
 | The dot prompt | SQL + app-command REPL with history & completion | the identity feature; always one keystroke away |
 | Control Center / ASSIST | The home screen: panels for Data, Queries, Forms, Reports, Apps, Admin | the ASCII mock in the README |
@@ -41,10 +45,11 @@ What we bring back, what it becomes:
 | `SET` commands | A `set` command namespace at the dot prompt (`set theme amber`) | persisted per-user |
 | dBASE language (`DO WHILE`, `.prg`) | **Not revived in v1.** SQL + the menu/action layer covers the 90% case | a scripting hook (Lua?) is a later, separate decision |
 
-Deliberate omissions: the dBASE language interpreter (see above), `.dbf`
-compatibility (import/export CSV & SQLite instead), and multi-user file
-locking (that's sqld's job now — this is the part 1988 got wrong and we
-don't have to).
+Deliberate omissions: the dBASE-style language interpreter (see above),
+`.dbf` file compatibility — **phosphor reads and writes SQLite/libSQL
+databases, period** (CSV import/export covers migration), and multi-user
+file locking (that's sqld's job now — this is the part 1988 got wrong and
+we don't have to).
 
 ## Throwforward: what 1988 couldn't do
 
@@ -135,10 +140,21 @@ immediately, and the builder features land on a UI that already feels right.
 
 1. Name: `phosphor` chosen for the founding commit (the glow of a P1
    CRT). GitHub renames redirect, so this is reversible cheaply.
-2. Scripting hook (Lua? Rhai? none?) — deferred until the menu/action
-   layer proves insufficient, not before.
+2. Scripting hook (Lua? Rhai? none?) — **tabled (author decision,
+   2026-07-27)**. Nothing in phases 1–5 depends on the answer: the
+   menu/action layer is declarative, and its `action_kind` enum is the
+   natural extension point if a scripting action is ever added. Revisit
+   only when a real user hits the declarative layer's ceiling.
 3. Printing path for reports/labels (direct to `lp`? text file only?) —
    decide in phase 4 with real users' printers in mind.
 4. Whether the embedded backend bundles SQLite (static, with extension
    statically linked) or uses the system library + `.so` — bundling is
    likelier (one binary, no "not authorized" macOS surprises).
+
+---
+
+*Trademark note: dBASE® is a trademark of dBase, LLC; Paradox and FoxPro
+belong to their respective owners. phosphor is an original, unaffiliated
+work; historical product and feature names in this document are used only
+to describe what inspired it, and phosphor implements no compatibility
+with those products or their file formats.*

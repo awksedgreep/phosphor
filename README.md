@@ -1,8 +1,9 @@
 # phosphor
 
-**dBASE IV reborn. Green screen, dot prompt, banded reports, painted forms,
-user-built menus — on top of a database that is wicked fast, compressed,
-networked, and monitors itself. 1988 the way it should have turned out.**
+**The green-screen database desktop of 1988, reborn. Dot prompt, banded
+reports, painted forms, user-built menus — on top of a database that is
+wicked fast, compressed, networked, and monitors itself. 1988 the way it
+should have turned out.**
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -23,11 +24,11 @@ networked, and monitors itself. 1988 the way it should have turned out.**
 ## The dream
 
 Twenty years of dreaming, stated plainly: terminals never stopped being the
-fastest UI humans have ever had. dBASE IV's Control Center let a
-non-programmer build a real business application — data, forms, reports,
-menus — in an afternoon, and every keystroke responded *instantly*. We
-traded that for web apps with 400 ms round trips and forms built by
-committees.
+fastest UI humans have ever had. The great late-80s database desktops —
+dBASE IV, Paradox, FoxPro — let a non-programmer build a real business
+application — data, forms, reports, menus — in an afternoon, and every
+keystroke responded *instantly*. We traded that for web apps with 400 ms
+round trips and forms built by committees.
 
 phosphor brings it back, and forward:
 
@@ -76,3 +77,9 @@ cargo run   # q or Esc to exit — that part works already
 ## License
 
 [MIT](LICENSE)
+
+*phosphor is an original work inspired by the terminal database tools of
+the late 1980s. It is not affiliated with, endorsed by, or compatible with
+dBASE® (a trademark of dBase, LLC), Paradox, FoxPro, or their successors;
+historical product names appear only for comparison. phosphor works
+exclusively with SQLite and libSQL databases.*
