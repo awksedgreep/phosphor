@@ -1,0 +1,10 @@
+[package]
+name = "phosphor"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "dBASE IV reborn in a modern terminal: forms, reports, menus, and a self-monitoring database. The moon in a terminal."
+repository = "https://github.com/awksedgreep/phosphor"
+
+[dependencies]
+ratatui = "0.29"
