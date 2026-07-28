@@ -506,7 +506,7 @@ fn draw_health(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " s sample · r refresh · Esc close ",
+            " LIVE · sampling every 5s while open · s now · Esc close ",
             th.dim(),
         ));
     let inner = block.inner(area);

@@ -233,9 +233,18 @@ rate, and whether sampling is still running at all. Below it,
 sparklines chart each metric's recent history straight from the
 compressed series.
 
-  s   take a sample right now and watch the trends move
+While the console is open it is LIVE: phosphor takes a sample
+every five seconds, so the trends move on their own.
+
+  s   take a sample right now
   r   refresh the console
-  Esc back to work
+  Esc back to work — and note that closing the console also stops
+      the sampling; the store itself never samples on its own
+
+For continuous history when nobody is watching, run the sample
+command on a timer: a one-line cron job calling sqlite3 with the
+extension loaded is the classic (the timeless-libsql user guide has
+it ready to copy), or have your application sample on its heartbeat.
 
 The status bar keeps a health dot (●) visible at all times: green
 is well, amber wants attention, red means read the report.

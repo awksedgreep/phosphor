@@ -219,6 +219,8 @@ pub struct App {
     pub visible_cols_width: u16,
     /// Armed delete: (table, rowid) — second 'x' on the same row fires.
     pending_delete: Option<(String, i64)>,
+    /// Last automatic health sample (the console is LIVE while open).
+    last_auto_sample: std::time::Instant,
     /// The last `find <text>` needle; 'n' repeats it.
     last_find: Option<String>,
 }
@@ -248,6 +250,7 @@ impl App {
             visible_cols_width: 80,
             pending_delete: None,
             last_find: None,
+            last_auto_sample: std::time::Instant::now(),
         };
         app.reload_tables();
         app.health = app.db.health();
@@ -810,6 +813,20 @@ impl App {
         Some((view, base))
     }
 
+    /// Time-based behavior between keystrokes (main loop ticks ~4x/s).
+    /// While the DBHEALTH console is open it is LIVE: phosphor takes a
+    /// sample every 5 seconds so the trends move on their own — the
+    /// passive vtab never samples itself (that is the design), so the
+    /// open console volunteers as the collector.
+    pub fn tick(&mut self) {
+        if matches!(self.overlay, Overlay::Health(_))
+            && self.last_auto_sample.elapsed() >= std::time::Duration::from_secs(5)
+        {
+            self.last_auto_sample = std::time::Instant::now();
+            self.health_sample();
+        }
+    }
+
     /// F1: open help on the topic for wherever the user is right now.
     fn open_help(&mut self) {
         let key = match &self.overlay {
@@ -924,6 +941,7 @@ impl App {
         }
 
         self.health = self.db.health();
+        self.last_auto_sample = std::time::Instant::now();
         self.overlay = Overlay::Health(HealthView {
             table: base,
             report,
@@ -2504,6 +2522,42 @@ mod tests {
         a.apply(Command::Help);
         let Overlay::Help(st) = &a.overlay else { panic!() };
         assert_eq!(crate::help::TOPICS[st.topic].key, "prompt");
+    }
+
+    /// Full-stack: the LIVE console samples on tick without keys.
+    #[test]
+    fn health_console_ticks_a_sample_when_due() {
+        let ext = "../timeless-libsql/target/release/libtimeless_ext.so";
+        if !std::path::Path::new(ext).exists() {
+            eprintln!("skipping: {ext} not built");
+            return;
+        }
+        std::env::set_var("PHOSPHOR_EXT", ext);
+        let (db, warn) = crate::db::EmbeddedDb::open(":memory:").unwrap();
+        assert!(warn.is_none(), "extension failed to load: {warn:?}");
+        db.execute("CREATE VIRTUAL TABLE dbhealth USING timeless_health")
+            .unwrap();
+        db.execute("INSERT INTO dbhealth(dbhealth) VALUES ('sample')")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenHealth);
+        assert!(matches!(a.overlay, Overlay::Health(_)));
+        let count = |a: &App| -> i64 {
+            match a.db.query("SELECT count(*) FROM dbhealth").unwrap().rows[0][0] {
+                PValue::Int(n) => n,
+                _ => panic!(),
+            }
+        };
+        let before = count(&a);
+        a.tick(); // not due yet: opening reset the clock
+        assert_eq!(count(&a), before, "tick must respect the 5s cadence");
+        // Time-travel the clock 6 seconds into the past and tick again.
+        a.last_auto_sample = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(6))
+            .unwrap();
+        a.tick();
+        assert!(count(&a) > before, "due tick takes a sample");
+        assert!(matches!(a.overlay, Overlay::Health(_)), "console stays open");
     }
 
     #[test]

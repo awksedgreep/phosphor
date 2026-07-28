@@ -75,19 +75,26 @@ fn main() -> std::io::Result<()> {
         if let Err(e) = terminal.draw(|f| ui::draw(f, &mut app)) {
             break Err(e);
         }
-        match event::read() {
-            Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
-                if let Some(cmd) = app.map_key(key) {
-                    // The command bus: every action goes through apply()
-                    // (see DESIGN.md, "Building scripting-ready").
-                    app.apply(cmd);
+        // Poll instead of block so time-based behavior (the live health
+        // console) can tick between keystrokes.
+        match event::poll(std::time::Duration::from_millis(250)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                    if let Some(cmd) = app.map_key(key) {
+                        // The command bus: every action goes through
+                        // apply() (DESIGN.md, "Building scripting-ready").
+                        app.apply(cmd);
+                    }
                 }
-                if app.quit {
-                    break Ok(());
-                }
-            }
-            Ok(_) => {}
+                Ok(_) => {}
+                Err(e) => break Err(e),
+            },
+            Ok(false) => {}
             Err(e) => break Err(e),
+        }
+        app.tick();
+        if app.quit {
+            break Ok(());
         }
     };
     ratatui::restore();
