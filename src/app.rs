@@ -2266,7 +2266,7 @@ mod tests {
     /// door: dbhealth vtab + samples + the console over the bus.
     #[test]
     fn health_console_over_timeless_extension() {
-        let ext = "../timeless-libsql/target/release/libtimeless_ext.so";
+        let ext = "../timeless-libsql/target/release/libdbhealth_ext.so";
         if !std::path::Path::new(ext).exists() {
             eprintln!("skipping: {ext} not built");
             return;
@@ -2527,7 +2527,7 @@ mod tests {
     /// Full-stack: the LIVE console samples on tick without keys.
     #[test]
     fn health_console_ticks_a_sample_when_due() {
-        let ext = "../timeless-libsql/target/release/libtimeless_ext.so";
+        let ext = "../timeless-libsql/target/release/libdbhealth_ext.so";
         if !std::path::Path::new(ext).exists() {
             eprintln!("skipping: {ext} not built");
             return;
