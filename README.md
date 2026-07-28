@@ -78,8 +78,10 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
 
 - **Browse** — schema sidebar (tables ▪, views ◇), virtualized **BROWSE**
   grid that pages through millions of rows, **EDIT** record form on Enter
-  (PICTURE-style ¶ pk / * not-null markers, typed parsing), a live **dot
-  prompt** (`.`) running real SQL with history, four themes
+  (PICTURE-style ¶ pk / * not-null markers, typed parsing), `a`dd and
+  `x`-twice-delete rows, `find <text>` + `n` to seek, a live **dot
+  prompt** (`.`) running real SQL with history, Tab completion, and
+  Ctrl-A/E/U/W line editing, four themes
   (`set theme green|amber|paper|blue`), F1 help, query latency in the
   status bar.
 - **Network** — the same UI over Hrana HTTP to self-hosted

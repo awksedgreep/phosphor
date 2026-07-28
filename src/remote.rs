@@ -32,6 +32,7 @@ struct StmtOut {
     cols: Vec<String>,
     rows: Vec<Vec<PValue>>,
     affected: i64,
+    last_rowid: Option<i64>,
 }
 
 impl RemoteDb {
@@ -168,10 +169,15 @@ fn decode_result(result: &Json) -> DbResult<StmtOut> {
         }
     }
     let affected = result["affected_row_count"].as_i64().unwrap_or(0);
+    // Hrana sends last_insert_rowid as a string (64-bit precision).
+    let last_rowid = result["last_insert_rowid"]
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok());
     Ok(StmtOut {
         cols,
         rows,
         affected,
+        last_rowid,
     })
 }
 
@@ -344,6 +350,38 @@ impl DbLink for RemoteDb {
             Ok(())
         } else {
             Err(format!("expected to update 1 row, updated {}", out.affected))
+        }
+    }
+
+    fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64> {
+        let sql = if changes.is_empty() {
+            format!("INSERT INTO {} DEFAULT VALUES", Self::quote(table))
+        } else {
+            let cols: Vec<String> = changes.iter().map(|(c, _)| Self::quote(c)).collect();
+            let marks: Vec<String> =
+                (1..=changes.len()).map(|i| format!("?{i}")).collect();
+            format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                Self::quote(table),
+                cols.join(", "),
+                marks.join(", ")
+            )
+        };
+        let args: Vec<Json> = changes.iter().map(|(_, v)| encode(v)).collect();
+        let out = self.one(&sql, args)?;
+        out.last_rowid
+            .ok_or_else(|| "sqld did not report last_insert_rowid".into())
+    }
+
+    fn delete_row(&self, table: &str, rowid: i64) -> DbResult<()> {
+        let out = self.one(
+            &format!("DELETE FROM {} WHERE rowid = ?1", Self::quote(table)),
+            vec![encode(&PValue::Int(rowid))],
+        )?;
+        if out.affected == 1 {
+            Ok(())
+        } else {
+            Err(format!("expected to delete 1 row, deleted {}", out.affected))
         }
     }
 

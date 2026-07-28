@@ -76,10 +76,9 @@ fn draw_form(f: &mut Frame, app: &App) {
     for (i, field) in st.spec.fields.iter().enumerate() {
         let selected = i == st.cursor;
         let style = if selected { th.cursor() } else { th.base() };
-        let label: Span = if selected && st.editing.is_some() {
-            editing_span(st.editing.as_ref().unwrap(), th)
-        } else {
-            Span::styled(field.label.clone(), style)
+        let label: Span = match (selected, &st.editing) {
+            (true, Some(buf)) => editing_span(buf, th),
+            _ => Span::styled(field.label.clone(), style),
         };
         lines.push(Line::from(vec![
             Span::styled(pad(&field.column, 16), style),
@@ -123,18 +122,19 @@ fn draw_apps(f: &mut Frame, app: &App) {
     for (i, item) in st.items.iter().enumerate() {
         let selected = i == st.cursor;
         let style = if selected { th.cursor() } else { th.base() };
-        let (label, target): (Span, Span) = if selected && st.editing.is_some() {
-            let buf = editing_span(st.editing.as_ref().unwrap(), th);
-            if st.editing_ref {
-                (Span::styled(pad(&item.label, 24), style), buf)
-            } else {
-                (buf, Span::styled(item.action_ref.clone(), style))
-            }
-        } else {
-            (
+        let (label, target): (Span, Span) = match (selected, &st.editing) {
+            (true, Some(buf)) if st.editing_ref => (
+                Span::styled(pad(&item.label, 24), style),
+                editing_span(buf, th),
+            ),
+            (true, Some(buf)) => (
+                editing_span(buf, th),
+                Span::styled(item.action_ref.clone(), style),
+            ),
+            _ => (
                 Span::styled(pad(&item.label, 24), style),
                 Span::styled(item.action_ref.clone(), style),
-            )
+            ),
         };
         lines.push(Line::from(vec![
             label,
@@ -229,10 +229,9 @@ fn draw_qbe(f: &mut Frame, app: &App) {
     for (i, col) in st.spec.cols.iter().enumerate() {
         let selected = i == st.cursor;
         let row_style = if selected { th.cursor() } else { th.base() };
-        let filter: Span = if selected && st.editing.is_some() && !st.naming {
-            editing_span(st.editing.as_ref().unwrap(), th)
-        } else {
-            Span::styled(col.filter.clone(), row_style)
+        let filter: Span = match (selected && !st.naming, &st.editing) {
+            (true, Some(buf)) => editing_span(buf, th),
+            _ => Span::styled(col.filter.clone(), row_style),
         };
         lines.push(Line::from(vec![
             Span::styled(pad(&col.name, 18), row_style),
@@ -284,13 +283,12 @@ fn draw_report(f: &mut Frame, app: &App) {
     let mut lines = Vec::new();
     for (i, (label, value)) in fields.iter().enumerate() {
         let selected = i == st.cursor;
-        let value_span = if selected && st.editing.is_some() {
-            editing_span(st.editing.as_ref().unwrap(), th)
-        } else {
-            Span::styled(
+        let value_span = match (selected, &st.editing) {
+            (true, Some(buf)) => editing_span(buf, th),
+            _ => Span::styled(
                 value.clone(),
                 if selected { th.cursor() } else { th.base() },
-            )
+            ),
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -694,14 +692,16 @@ fn draw_edit(f: &mut Frame, app: &App) {
     let area = centered(f.area(), 62, (ed.fields.len() as u16 + 4).min(f.area().height));
     f.render_widget(Clear, area);
     let dirty = if ed.dirty() { " *" } else { "" };
+    let title = if ed.inserting {
+        format!(" NEW {} record{dirty} ", ed.table)
+    } else {
+        format!(" EDIT {} · rowid {}{dirty} ", ed.table, ed.rowid)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(th.bright())
         .style(th.base())
-        .title(Span::styled(
-            format!(" EDIT {} · rowid {}{dirty} ", ed.table, ed.rowid),
-            th.bright(),
-        ));
+        .title(Span::styled(title, th.bright()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -721,8 +721,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
             w = label_w
         );
         let selected = i == ed.cursor;
-        let value_span = if selected && ed.editing.is_some() {
-            let buf = ed.editing.as_ref().unwrap();
+        let value_span = if let (true, Some(buf)) = (selected, &ed.editing) {
             Span::styled(format!("{buf}▏"), th.cursor())
         } else {
             let (text, edited) = match &ed.inputs[i] {
@@ -768,6 +767,7 @@ fn draw_help(f: &mut Frame, app: &App) {
         ("Enter", "open table · edit row · run"),
         ("↑↓←→ or hjkl", "move"),
         ("PgUp/PgDn g G", "page · top · bottom"),
+        ("a / x / n", "add row · delete (x twice) · find next"),
         ("Q R L F A", "qbe · report · labels · form · apps"),
         ("F5 / r", "refresh"),
         ("F10", "dbhealth console (save, in EDIT)"),

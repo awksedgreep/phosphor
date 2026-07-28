@@ -49,6 +49,8 @@ pub struct HealthView {
 
 pub struct EditState {
     pub table: String,
+    /// true → this is a NEW record (INSERT on save; rowid unused).
+    pub inserting: bool,
     pub rowid: i64,
     pub fields: Vec<(ColumnInfo, PValue)>,
     /// Display labels (custom when a crafted form exists for the table).
@@ -176,6 +178,12 @@ pub enum Command {
     OpenForm(Option<String>),
     OpenApps(Option<String>),
     OpenAppMenu(Option<String>),
+    OpenInsert,
+    DeleteRow,
+    FindNext,
+    PromptClear,
+    PromptDeleteWord,
+    PromptComplete,
 }
 
 pub struct App {
@@ -197,6 +205,10 @@ pub struct App {
     /// Grid viewport height, reported back by the renderer each frame.
     pub visible_rows: i64,
     pub visible_cols_width: u16,
+    /// Armed delete: (table, rowid) — second 'x' on the same row fires.
+    pending_delete: Option<(String, i64)>,
+    /// The last `find <text>` needle; 'n' repeats it.
+    last_find: Option<String>,
 }
 
 impl App {
@@ -222,6 +234,8 @@ impl App {
             quit: false,
             visible_rows: 20,
             visible_cols_width: 80,
+            pending_delete: None,
+            last_find: None,
         };
         app.reload_tables();
         app.health = app.db.health();
@@ -383,18 +397,27 @@ impl App {
             return Some(Command::OpenHealth);
         }
         match self.focus {
-            Focus::Prompt => Some(match key.code {
-                Enter => Command::PromptRun,
-                Esc => Command::Back,
-                Backspace => Command::PromptBackspace,
-                Left => Command::PromptMove(-1),
-                Right => Command::PromptMove(1),
-                Up => Command::PromptHistory(-1),
-                Down => Command::PromptHistory(1),
-                Tab => Command::Focus(Focus::Sidebar),
-                Char(c) => Command::PromptChar(c),
-                _ => return None,
-            }),
+            Focus::Prompt => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                Some(match key.code {
+                    Enter => Command::PromptRun,
+                    Esc => Command::Back,
+                    Backspace => Command::PromptBackspace,
+                    Left => Command::PromptMove(-1),
+                    Right => Command::PromptMove(1),
+                    Up => Command::PromptHistory(-1),
+                    Down => Command::PromptHistory(1),
+                    Home => Command::PromptMove(i64::MIN / 2),
+                    End => Command::PromptMove(i64::MAX / 2),
+                    Char('a') if ctrl => Command::PromptMove(i64::MIN / 2),
+                    Char('e') if ctrl => Command::PromptMove(i64::MAX / 2),
+                    Char('u') if ctrl => Command::PromptClear,
+                    Char('w') if ctrl => Command::PromptDeleteWord,
+                    Tab => Command::PromptComplete,
+                    Char(c) => Command::PromptChar(c),
+                    _ => return None,
+                })
+            }
             Focus::Sidebar => Some(match key.code {
                 Char('q') => Command::Quit,
                 Up | Char('k') => Command::SidebarMove(-1),
@@ -429,6 +452,9 @@ impl App {
                 Char('g') => Command::GridTop,
                 Char('G') => Command::GridBottom,
                 Enter => Command::OpenEdit,
+                Char('a') | Insert => Command::OpenInsert,
+                Char('x') | Delete => Command::DeleteRow,
+                Char('n') => Command::FindNext,
                 F(5) => Command::Refresh,
                 Char('Q') => Command::OpenQbe(None),
                 Char('R') => Command::OpenReport(None),
@@ -445,6 +471,7 @@ impl App {
     // ── the bus ──────────────────────────────────────────────────────
 
     pub fn apply(&mut self, cmd: Command) {
+        let is_delete = matches!(cmd, Command::DeleteRow);
         match cmd {
             Command::Quit => self.quit = true,
             Command::Focus(f) => self.focus = f,
@@ -582,6 +609,35 @@ impl App {
             Command::OpenForm(t) => self.open_form(t),
             Command::OpenApps(name) => self.open_apps(name),
             Command::OpenAppMenu(name) => self.open_app_menu(name),
+            Command::OpenInsert => self.open_insert(),
+            Command::DeleteRow => self.delete_row(),
+            Command::FindNext => self.find_next(),
+            Command::PromptClear => {
+                self.prompt.input.clear();
+                self.prompt.cursor = 0;
+            }
+            Command::PromptDeleteWord => {
+                let chars: Vec<char> = self.prompt.input.chars().collect();
+                let mut i = self.prompt.cursor.min(chars.len());
+                while i > 0 && chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                while i > 0 && !chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                let removed: String = chars[..i]
+                    .iter()
+                    .chain(&chars[self.prompt.cursor.min(chars.len())..])
+                    .collect();
+                self.prompt.input = removed;
+                self.prompt.cursor = i;
+            }
+            Command::PromptComplete => self.prompt_complete(),
+        }
+        // Any command other than a second DeleteRow disarms the pending
+        // delete (moving the cursor, refreshing, anything).
+        if !is_delete {
+            self.pending_delete = None;
         }
     }
 
@@ -1464,7 +1520,7 @@ impl App {
             Err(e) => return self.err(e),
         };
         let mut fields: Vec<(ColumnInfo, PValue)> =
-            cols.into_iter().zip(row.into_iter()).collect();
+            cols.into_iter().zip(row).collect();
         let mut labels: Vec<String> = fields.iter().map(|(c, _)| c.name.clone()).collect();
         let mut required: Vec<bool> = vec![false; fields.len()];
 
@@ -1490,6 +1546,7 @@ impl App {
         let n = fields.len();
         self.overlay = Overlay::Edit(EditState {
             table: name,
+            inserting: false,
             rowid,
             fields,
             labels,
@@ -1498,6 +1555,219 @@ impl App {
             cursor: 0,
             editing: None,
         });
+    }
+
+    /// 'a' in BROWSE: a blank record form; save INSERTs (crafted forms
+    /// and required validation apply exactly as for EDIT).
+    fn open_insert(&mut self) {
+        let Some(Grid {
+            source: GridSource::Table { name, editable },
+            ..
+        }) = &self.grid
+        else {
+            return self.say("insert needs a table BROWSE (query results are read-only)");
+        };
+        if !editable {
+            return self.say("this table has no rowid; cannot insert here");
+        }
+        let name = name.clone();
+        let cols = match self.db.columns(&name) {
+            Ok(c) => c,
+            Err(e) => return self.err(e),
+        };
+        let mut fields: Vec<(ColumnInfo, PValue)> =
+            cols.into_iter().map(|c| (c, PValue::Null)).collect();
+        let mut labels: Vec<String> = fields.iter().map(|(c, _)| c.name.clone()).collect();
+        let mut required: Vec<bool> = vec![false; fields.len()];
+        if let Some(spec) = FormSpec::load(self.db.as_ref(), &name) {
+            let mut ordered = Vec::new();
+            let mut new_labels = Vec::new();
+            let mut new_required = Vec::new();
+            for f in spec.fields.iter().filter(|f| f.include) {
+                if let Some(idx) = fields.iter().position(|(c, _)| c.name == f.column) {
+                    ordered.push(fields[idx].clone());
+                    new_labels.push(f.label.clone());
+                    new_required.push(f.required);
+                }
+            }
+            if !ordered.is_empty() {
+                fields = ordered;
+                labels = new_labels;
+                required = new_required;
+            }
+        }
+        let n = fields.len();
+        self.overlay = Overlay::Edit(EditState {
+            table: name,
+            inserting: true,
+            rowid: 0,
+            fields,
+            labels,
+            required,
+            inputs: vec![None; n],
+            cursor: 0,
+            editing: None,
+        });
+    }
+
+    /// 'x' in BROWSE: armed double-press delete of the current row.
+    fn delete_row(&mut self) {
+        let Some(Grid {
+            source: GridSource::Table { name, editable },
+            cur_row,
+            cache_start,
+            rowids,
+            ..
+        }) = &self.grid
+        else {
+            return self.say("delete needs a table BROWSE");
+        };
+        if !editable {
+            return self.say("this table has no rowid; cannot delete here");
+        }
+        let idx = (cur_row - cache_start) as usize;
+        let Some(rowid) = rowids.as_ref().and_then(|r| r.get(idx)).copied() else {
+            return;
+        };
+        let table = name.clone();
+        if self.pending_delete == Some((table.clone(), rowid)) {
+            self.pending_delete = None;
+            match self.db.delete_row(&table, rowid) {
+                Ok(()) => {
+                    self.refresh_grid_keep_position();
+                    self.say("row deleted");
+                }
+                Err(e) => self.err(e),
+            }
+        } else {
+            self.pending_delete = Some((table, rowid));
+            self.err(format!("press x again to DELETE rowid {rowid}"));
+        }
+    }
+
+    /// Refresh the current table grid without losing the cursor.
+    fn refresh_grid_keep_position(&mut self) {
+        if let Some(Grid {
+            source: GridSource::Table { name, .. },
+            cur_row,
+            cur_col,
+            ..
+        }) = &self.grid
+        {
+            let (name, row, col) = (name.clone(), *cur_row, *cur_col);
+            self.open_table(&name);
+            if let Some(g) = &mut self.grid {
+                g.cur_col = col.min(g.columns.len().saturating_sub(1));
+            }
+            self.grid_jump(row);
+        }
+    }
+
+    /// `find <text>` / 'n': scan forward from the cursor for a row with
+    /// any cell containing the needle (case-insensitive). Client-side
+    /// scan in pages; capped so a miss on a huge table stays bounded.
+    fn find(&mut self, needle: &str) {
+        const SCAN_CAP: i64 = 100_000;
+        let needle_lc = needle.to_ascii_lowercase();
+        let Some(g) = &self.grid else {
+            return self.say("find works in a grid");
+        };
+        let (start, total) = (g.cur_row + 1, g.total);
+        let table = match &g.source {
+            GridSource::Table { name, .. } => Some(name.clone()),
+            GridSource::Query { .. } => None,
+        };
+        let hit = match table {
+            None => {
+                let g = self.grid.as_ref().unwrap();
+                (start..total).find(|&abs| {
+                    g.row(abs).is_some_and(|row| {
+                        row.iter()
+                            .any(|v| v.render().to_ascii_lowercase().contains(&needle_lc))
+                    })
+                })
+            }
+            Some(name) => {
+                let mut found = None;
+                let mut offset = start;
+                let end = total.min(start + SCAN_CAP);
+                'scan: while offset < end {
+                    let limit = 1024.min(end - offset);
+                    match self.db.page(&name, offset, limit) {
+                        Ok(page) => {
+                            for (i, row) in page.rows.iter().enumerate() {
+                                if row.iter().any(|v| {
+                                    v.render().to_ascii_lowercase().contains(&needle_lc)
+                                }) {
+                                    found = Some(offset + i as i64);
+                                    break 'scan;
+                                }
+                            }
+                            if page.rows.is_empty() {
+                                break;
+                            }
+                            offset += limit;
+                        }
+                        Err(e) => return self.err(e),
+                    }
+                }
+                found
+            }
+        };
+        self.last_find = Some(needle.to_owned());
+        match hit {
+            Some(abs) => {
+                self.grid_jump(abs);
+                self.focus = Focus::Grid;
+                self.say(format!("found at row {}", abs + 1));
+            }
+            None => self.say(format!("{needle:?} not found below (g for top, n to retry)")),
+        }
+    }
+
+    fn find_next(&mut self) {
+        match self.last_find.clone() {
+            Some(n) => self.find(&n),
+            None => self.say("no previous find (use: find <text>)"),
+        }
+    }
+
+    /// Tab at the prompt: complete the last token against table names
+    /// and prompt commands.
+    fn prompt_complete(&mut self) {
+        let input = self.prompt.input.clone();
+        let (head, token) = match input.rfind(char::is_whitespace) {
+            Some(i) => (&input[..=i], &input[i + 1..]),
+            None => ("", input.as_str()),
+        };
+        if token.is_empty() {
+            return;
+        }
+        let mut candidates: Vec<String> =
+            self.tables.iter().map(|t| t.name.clone()).collect();
+        candidates.extend(
+            [
+                "select", "help", "tables", "health", "qbe", "report", "labels",
+                "form", "apps", "app", "run", "find", "set theme",
+            ]
+            .map(str::to_owned),
+        );
+        let matches: Vec<&String> = candidates
+            .iter()
+            .filter(|c| c.starts_with(token) && c.as_str() != token)
+            .collect();
+        match matches.len() {
+            0 => self.say(format!("no completion for {token:?}")),
+            1 => {
+                self.prompt.input = format!("{head}{}", matches[0]);
+                self.prompt.cursor = self.prompt.input.chars().count();
+            }
+            _ => {
+                let list: Vec<&str> =
+                    matches.iter().take(6).map(|s| s.as_str()).collect();
+                self.say(list.join(" · "));
+            }
+        }
     }
 
     fn edit_save(&mut self) {
@@ -1521,7 +1791,7 @@ impl App {
             }
         }
         let payload = match &self.overlay {
-            Overlay::Edit(ed) if !ed.dirty() => None,
+            Overlay::Edit(ed) if !ed.dirty() && !ed.inserting => None,
             Overlay::Edit(ed) => {
                 let changes: Vec<(String, PValue)> = ed
                     .fields
@@ -1533,25 +1803,39 @@ impl App {
                         })
                     })
                     .collect();
-                Some((ed.table.clone(), ed.rowid, changes))
+                Some((ed.table.clone(), ed.rowid, changes, ed.inserting))
             }
             _ => return,
         };
-        let Some((table, rowid, changes)) = payload else {
+        let Some((table, rowid, changes, inserting)) = payload else {
             self.overlay = Overlay::None;
             return self.say("no changes");
         };
         let n = changes.len();
-        match self.db.update_row(&table, rowid, &changes) {
-            Ok(()) => {
+        let result = if inserting {
+            self.db
+                .insert_row(&table, &changes)
+                .map(|rowid| format!("inserted rowid {rowid}"))
+        } else {
+            self.db
+                .update_row(&table, rowid, &changes)
+                .map(|()| format!("saved {n} field(s)"))
+        };
+        match result {
+            Ok(msg) => {
                 self.overlay = Overlay::None;
-                // Invalidate the cache so the grid shows the new truth.
-                if let Some(g) = &mut self.grid {
-                    g.cache.clear();
-                    g.cache_start = g.cur_row;
+                if inserting {
+                    // Total changed: full refresh, keep the cursor near.
+                    self.refresh_grid_keep_position();
+                } else {
+                    // Invalidate the cache so the grid shows the new truth.
+                    if let Some(g) = &mut self.grid {
+                        g.cache.clear();
+                        g.cache_start = g.cur_row;
+                    }
+                    self.ensure_cache();
                 }
-                self.ensure_cache();
-                self.say(format!("saved {n} field(s)"));
+                self.say(msg);
             }
             Err(e) => self.err(e),
         }
@@ -1625,6 +1909,12 @@ impl App {
                 Some(sql) => self.run_select(&sql),
                 None => self.err(format!("no saved query named {name:?}")),
             };
+        }
+        if let Some(rest) = line.strip_prefix("find ") {
+            let needle = rest.trim().to_owned();
+            if !needle.is_empty() {
+                return self.find(&needle);
+            }
         }
         if let Some(rest) = line.strip_prefix("form") {
             let t = rest.trim();
@@ -1889,6 +2179,78 @@ mod tests {
         a.apply(Command::Back); // grid → sidebar
         a.apply(Command::Back); // sidebar → app menu (app mode)
         assert!(matches!(a.overlay, Overlay::AppMenu(_)));
+    }
+
+    #[test]
+    fn insert_and_delete_rows_through_the_bus() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        assert_eq!(a.grid.as_ref().unwrap().total, 500);
+
+        // INSERT: 'a' opens a NEW form; type into b; save.
+        a.apply(Command::OpenInsert);
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("insert form did not open")
+        };
+        assert!(ed.inserting);
+        a.apply(Command::EditMove(1)); // to column b
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        for c in "the 501st".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        a.apply(Command::EditSave);
+        assert!(matches!(a.overlay, Overlay::None));
+        assert_eq!(a.grid.as_ref().unwrap().total, 501);
+
+        // DELETE: first x arms, second x fires; a move in between disarms.
+        a.apply(Command::GridBottom);
+        a.apply(Command::DeleteRow);
+        assert!(a.status.as_ref().is_some_and(|(m, _)| m.contains("again")));
+        a.apply(Command::GridMove { dr: -1, dc: 0 }); // disarm
+        a.apply(Command::DeleteRow); // re-arm on new row
+        a.apply(Command::DeleteRow); // fire
+        assert_eq!(a.grid.as_ref().unwrap().total, 500);
+    }
+
+    #[test]
+    fn find_scans_forward_and_repeats() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        for c in "find row437".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 436);
+        // 'n' finds nothing further (unique value) and says so politely.
+        a.apply(Command::FindNext);
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("not found")));
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 436);
+    }
+
+    #[test]
+    fn prompt_completion_and_line_editing() {
+        let mut a = app();
+        // Unique table-name completion: "select * from t" is the goal.
+        for c in "hea".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptComplete);
+        assert_eq!(a.prompt.input, "health");
+        // Ctrl-U clears; Ctrl-W deletes a word.
+        a.apply(Command::PromptClear);
+        assert!(a.prompt.input.is_empty());
+        for c in "select one two".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptDeleteWord);
+        assert_eq!(a.prompt.input, "select one ");
     }
 
     #[test]

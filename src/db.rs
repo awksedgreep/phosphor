@@ -149,6 +149,10 @@ pub trait DbLink {
         rowid: i64,
         changes: &[(String, PValue)],
     ) -> DbResult<()>;
+    /// INSERT with the provided columns (omitted ones take DB defaults);
+    /// returns the new rowid.
+    fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64>;
+    fn delete_row(&self, table: &str, rowid: i64) -> DbResult<()>;
     /// Worst dbhealth_report status if the view exists and is readable
     /// ("ok" | "warn" | "attention" | "no data"), else None.
     fn health(&self) -> Option<String>;
@@ -376,6 +380,43 @@ impl DbLink for EmbeddedDb {
             Ok(())
         } else {
             Err(format!("expected to update 1 row, updated {n}"))
+        }
+    }
+
+    fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64> {
+        let sql = if changes.is_empty() {
+            format!("INSERT INTO {} DEFAULT VALUES", Self::quote(table))
+        } else {
+            let cols: Vec<String> = changes.iter().map(|(c, _)| Self::quote(c)).collect();
+            let marks: Vec<String> =
+                (1..=changes.len()).map(|i| format!("?{i}")).collect();
+            format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                Self::quote(table),
+                cols.join(", "),
+                marks.join(", ")
+            )
+        };
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        for (i, (_, v)) in changes.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, v).map_err(|e| e.to_string())?;
+        }
+        stmt.raw_execute().map_err(|e| e.to_string())?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn delete_row(&self, table: &str, rowid: i64) -> DbResult<()> {
+        let n = self
+            .conn
+            .execute(
+                &format!("DELETE FROM {} WHERE rowid = ?1", Self::quote(table)),
+                [rowid],
+            )
+            .map_err(|e| e.to_string())?;
+        if n == 1 {
+            Ok(())
+        } else {
+            Err(format!("expected to delete 1 row, deleted {n}"))
         }
     }
 
