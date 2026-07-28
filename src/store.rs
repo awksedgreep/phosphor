@@ -79,6 +79,9 @@ pub fn upsert(
     .map(|_| ())
 }
 
+/// READ path: never creates anything. A database without _phosphor
+/// tables simply has no saved designs — that is not a reason to write
+/// to it (found on camera: opening a designer sprouted five tables).
 pub fn lookup(
     db: &dyn DbLink,
     table: &str,
@@ -86,7 +89,6 @@ pub fn lookup(
     key: &str,
     want: &[&str],
 ) -> Option<Vec<String>> {
-    ensure(db).ok()?;
     let sql = format!(
         "SELECT {} FROM {table} WHERE {key_col} = {} LIMIT 1",
         want.join(", "),
@@ -97,10 +99,8 @@ pub fn lookup(
     Some(row.iter().map(|v| text(Some(v))).collect())
 }
 
+/// READ path: never creates anything (missing table = no names).
 pub fn names(db: &dyn DbLink, table: &str, name_col: &str) -> Vec<String> {
-    if ensure(db).is_err() {
-        return Vec::new();
-    }
     db.query(&format!("SELECT {name_col} FROM {table} ORDER BY {name_col}"))
         .map(|out| {
             out.rows

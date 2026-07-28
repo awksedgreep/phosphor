@@ -160,7 +160,32 @@ fn draw_paint(f: &mut Frame, app: &App) {
             );
         }
     } else if let Some(r) = canvas_rect(inner, st.cursor.0, st.cursor.1, 1, 1) {
-        f.render_widget(Paragraph::new(Line::styled("▒", th.cursor())), r);
+        // Invert the glyph under the cursor instead of blotting it out
+        // ("▒ame:" on film). Look up what lives at this cell.
+        let (cx, cy) = st.cursor;
+        let mut under = ' ';
+        for t in &st.spec.texts {
+            if t.y == cy && cx >= t.x {
+                if let Some(ch) = t.text.chars().nth((cx - t.x) as usize) {
+                    under = ch;
+                }
+            }
+        }
+        for fl in st.spec.fields.iter().filter(|fl| fl.include) {
+            if let Some((fx, fy)) = fl.pos {
+                if fy == cy && cx >= fx {
+                    let label = format!("{}:", fl.label);
+                    if let Some(ch) = label.chars().nth((cx - fx) as usize) {
+                        under = ch;
+                    }
+                }
+            }
+        }
+        let shown = if under == ' ' { '▒' } else { under };
+        f.render_widget(
+            Paragraph::new(Line::styled(shown.to_string(), th.cursor())),
+            r,
+        );
     }
 }
 
@@ -468,7 +493,10 @@ fn draw_pager(f: &mut Frame, app: &App) {
 
 const SPARK_BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-fn sparkline(values: &[f64], width: usize) -> String {
+/// (rendered bars, is_flat). Flat series render as a LOW line — a
+/// solid mid-height bar for constant zero looked identical to real
+/// data on film, which is exactly what a chart must never do.
+fn sparkline(values: &[f64], width: usize) -> (String, bool) {
     let take = values.len().min(width);
     let window = &values[values.len() - take..];
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -476,17 +504,19 @@ fn sparkline(values: &[f64], width: usize) -> String {
         lo = lo.min(*v);
         hi = hi.max(*v);
     }
-    window
+    let flat = hi <= lo;
+    let bars = window
         .iter()
         .map(|v| {
-            let idx = if hi > lo {
-                (((v - lo) / (hi - lo)) * 7.0).round() as usize
+            let idx = if flat {
+                0
             } else {
-                3 // flat series: a calm middle bar, not a cliff
+                (((v - lo) / (hi - lo)) * 7.0).round() as usize
             };
             SPARK_BARS[idx.min(7)]
         })
-        .collect()
+        .collect();
+    (bars, flat)
 }
 
 fn draw_health(f: &mut Frame, app: &App) {
@@ -544,9 +574,10 @@ fn draw_health(f: &mut Frame, app: &App) {
     let spark_w = (sparks_area.width as usize).saturating_sub(34).max(10);
     let mut lines = vec![Line::styled("trends (oldest → newest)", th.dim())];
     for (name, values, latest) in &hv.sparks {
+        let (bars, flat) = sparkline(values, spark_w);
         lines.push(Line::from(vec![
             Span::styled(pad(name, 19), th.base()),
-            Span::styled(sparkline(values, spark_w), th.bright()),
+            Span::styled(bars, if flat { th.dim() } else { th.bright() }),
             Span::styled(format!("  {latest}"), th.dim()),
         ]));
     }
@@ -573,21 +604,29 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(focus_style(app, Focus::Sidebar))
         .title(Span::styled(" Data ", focus_style(app, Focus::Sidebar)));
-    let items: Vec<ListItem> = app
-        .tables
+    let visible = app.visible_tables();
+    let hidden = app.tables.len() - visible.len();
+    let items: Vec<ListItem> = visible
         .iter()
         .enumerate()
         .map(|(i, t)| {
             let marker = if t.is_view { "◇ " } else { "▪ " };
+            let internal = crate::app::App::is_internal(t);
             let style = if i == app.sidebar_idx {
                 th.cursor()
-            } else if t.is_view {
+            } else if internal || t.is_view {
                 th.dim()
             } else {
                 th.base()
             };
             ListItem::new(Line::styled(format!("{marker}{}", t.name), style))
         })
+        .chain((hidden > 0 && !app.show_internals).then(|| {
+            ListItem::new(Line::styled(
+                format!("  … {hidden} internal (i)"),
+                th.dim(),
+            ))
+        }))
         .collect();
     let empty = app.tables.is_empty();
     f.render_widget(List::new(items).block(block), area);

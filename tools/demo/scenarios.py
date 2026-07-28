@@ -23,7 +23,8 @@ def taps(at, keys, gap=0.28):
     return [(round(at + i * gap, 3), k) for i, k in enumerate(keys)], at + len(keys) * gap
 
 def browse():
-    steps, t = taps(0.9, ["j", "j", "j"])            # → customers
+    # First-letter seek: o jumps to orders, c back to customers.
+    steps, t = taps(0.9, ["o", "c"], gap=0.7)
     steps += [(t + 0.3, ENTER)]                        # BROWSE
     s2, t = taps(t + 1.0, ["j", "j", "l", "l"])       # wander
     steps += s2
@@ -46,7 +47,7 @@ def browse():
     record([BIN, DB], steps, f"{OUT}/browse.cast", env=ENV, title="phosphor · browse")
 
 def builders():
-    steps, t = taps(0.9, ["j", "j", "j"])             # → customers
+    steps, t = taps(0.9, ["c"])                       # seek customers
     steps += [(t + 0.3, "Q")]                          # QBE
     s2, t = taps(t + 1.2, ["j", "j", "j"])            # → balance row
     steps += s2
@@ -58,7 +59,7 @@ def builders():
     steps += [(t, F2)]                                 # run
     t += 2.4
     steps += [(t, ESC)]                                # grid → sidebar
-    s2, t = taps(t + 0.5, ["j", "j"])                 # → orders
+    s2, t = taps(t + 0.5, ["o"])                      # seek orders
     steps += s2
     steps += [(t + 0.3, "R")]                          # report designer
     s2, t = taps(t + 1.2, ["j", "j"])                 # → group by
@@ -95,11 +96,11 @@ def health():
 
 def appmode():
     steps = [(2.4, "b")]                               # hotkey: Balances report
-    steps += [(5.2, ESC), (5.8, ESC)]                  # pager → top → menu returns
-    steps += [(7.0, "c")]                              # hotkey: Customers
-    s2, t = taps(9.2, ["j", "j", "j"])
+    steps += [(5.2, ESC)]                              # ONE Esc: home to the menu
+    steps += [(6.6, "c")]                              # hotkey: Customers
+    s2, t = taps(8.8, ["j", "j", "j"])
     steps += s2
-    steps += [(t + 0.5, ESC), (t + 1.0, ESC)]         # back home to the menu
+    steps += [(t + 0.5, ESC), (t + 1.0, ESC)]         # grid → top → menu
     steps += [(t + 2.4, CTRL_Q)]
     record([BIN, "--app", DB], steps, f"{OUT}/appmode.cast", env=ENV,
            title="phosphor · --app: the database IS the application")

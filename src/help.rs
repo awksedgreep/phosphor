@@ -51,8 +51,11 @@ the application travels with it.",
         title: "Browsing & editing",
         body: "\
 The left panel lists tables (▪) and views (◇). Move with the arrow
-keys and press Enter to open one in BROWSE — a grid that loads rows
-as you scroll, so a million-row table opens instantly.
+keys — or just type a letter to jump to the next table starting
+with it — and press Enter to open one in BROWSE, a grid that loads
+rows as you scroll, so a million-row table opens instantly.
+phosphor's own machinery (shadow tables, _phosphor catalogs, the
+dbhealth views) stays hidden; press i to reveal it.
 
 In the grid:
 
@@ -291,7 +294,8 @@ Everywhere
   Tab cycle focus · F10 dbhealth console
 
 Table list
-  ↑↓ move · Enter browse · r refresh · q quit
+  ↑↓ move · letters seek · i internals · Enter browse
+  r refresh · q quit
 
 BROWSE grid
   ↑↓←→ / hjkl move · PgUp PgDn page · g G first/last row

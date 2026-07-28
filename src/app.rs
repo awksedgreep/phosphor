@@ -196,6 +196,10 @@ pub enum Command {
     PaintDelete,
     HelpScroll(i64),
     HelpTopic(i64),
+    /// First-letter seek in the sidebar (dBASE-style, cycling).
+    SidebarSeek(char),
+    /// Show/hide internal tables (shadow, _phosphor, dbhealth views).
+    ToggleInternals,
 }
 
 pub struct App {
@@ -223,6 +227,10 @@ pub struct App {
     last_auto_sample: std::time::Instant,
     /// The last `find <text>` needle; 'n' repeats it.
     last_find: Option<String>,
+    /// Sidebar shows internal tables (shadow/_phosphor/health views)?
+    pub show_internals: bool,
+    /// An overlay was launched from the app menu: Esc returns HOME.
+    menu_launched: bool,
 }
 
 impl App {
@@ -250,6 +258,8 @@ impl App {
             visible_cols_width: 80,
             pending_delete: None,
             last_find: None,
+            show_internals: false,
+            menu_launched: false,
             last_auto_sample: std::time::Instant::now(),
         };
         app.reload_tables();
@@ -265,11 +275,55 @@ impl App {
         self.status = Some((msg.into(), true));
     }
 
+    /// Internal machinery a user did not create: phosphor's own
+    /// catalog, engine shadow tables, and dbhealth's companion views.
+    /// Heuristic by naming convention; the i toggle shows everything.
+    pub fn is_internal(t: &TableInfo) -> bool {
+        let n = t.name.as_str();
+        n.starts_with('_')
+            || [
+                "_chunks", "_meta", "_series", "_blocks", "_terms", "_trace_blocks",
+            ]
+            .iter()
+            .any(|suf| n.ends_with(suf))
+            || (t.is_view && ["_report", "_now", "_trends"].iter().any(|s| n.ends_with(s)))
+    }
+
+    /// The tables the sidebar shows, honoring the internals toggle.
+    pub fn visible_tables(&self) -> Vec<&TableInfo> {
+        self.tables
+            .iter()
+            .filter(|t| self.show_internals || !Self::is_internal(t))
+            .collect()
+    }
+
+    fn sidebar_seek(&mut self, c: char) {
+        let visible = self.visible_tables();
+        let n = visible.len();
+        if n == 0 {
+            return;
+        }
+        for step in 1..=n {
+            let idx = (self.sidebar_idx + step) % n;
+            if visible[idx]
+                .name
+                .chars()
+                .next()
+                .is_some_and(|f| f.eq_ignore_ascii_case(&c))
+            {
+                self.sidebar_idx = idx;
+                return;
+            }
+        }
+    }
+
     fn reload_tables(&mut self) {
         match self.db.tables() {
             Ok(t) => {
                 self.tables = t;
-                self.sidebar_idx = self.sidebar_idx.min(self.tables.len().saturating_sub(1));
+                self.sidebar_idx = self
+                    .sidebar_idx
+                    .min(self.visible_tables().len().saturating_sub(1));
             }
             Err(e) => self.err(e),
         }
@@ -493,6 +547,12 @@ impl App {
                     }
                 }
                 Char('r') => Command::Refresh,
+                Char('i') => Command::ToggleInternals,
+                // First-letter seek (cycling). j/k/q/r/i stay mnemonic;
+                // seek covers everything else, including '_' and digits.
+                Char(c) if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' => {
+                    Command::SidebarSeek(c)
+                }
                 _ => return None,
             }),
             Focus::Grid => Some(match key.code {
@@ -547,7 +607,7 @@ impl App {
             }
             Command::Refresh => self.refresh(),
             Command::SidebarMove(d) => {
-                let n = self.tables.len() as i64;
+                let n = self.visible_tables().len() as i64;
                 if n > 0 {
                     self.sidebar_idx =
                         (self.sidebar_idx as i64 + d).rem_euclid(n) as usize;
@@ -701,6 +761,16 @@ impl App {
                 self.prompt.cursor = i;
             }
             Command::PromptComplete => self.prompt_complete(),
+            Command::SidebarSeek(c) => self.sidebar_seek(c),
+            Command::ToggleInternals => {
+                self.show_internals = !self.show_internals;
+                self.sidebar_idx = 0;
+                self.say(if self.show_internals {
+                    "internal tables shown (i to hide)"
+                } else {
+                    "internal tables hidden (i to show)"
+                });
+            }
             Command::PaintMove { dx, dy } => self.paint_move(dx, dy),
             Command::PaintPlace => self.paint_place(),
             Command::PaintBox => self.paint_box(),
@@ -741,6 +811,13 @@ impl App {
                         editing: None,
                     });
                 }
+            }
+            Overlay::Pager(_) if self.menu_launched => {
+                // Home means home: a menu-launched pager closes back to
+                // the application menu, not to the bare browser.
+                self.menu_launched = false;
+                let home = self.app_home.clone();
+                self.open_app_menu(home);
             }
             Overlay::Edit(_)
             | Overlay::Help(_)
@@ -975,7 +1052,10 @@ impl App {
                 source: GridSource::Table { name, .. },
                 ..
             }) if self.focus == Focus::Grid => Some(name.clone()),
-            _ => self.tables.get(self.sidebar_idx).map(|t| t.name.clone()),
+            _ => self
+                .visible_tables()
+                .get(self.sidebar_idx)
+                .map(|t| t.name.clone()),
         })
     }
 
@@ -1376,6 +1456,10 @@ impl App {
     }
 
     fn app_run_item(&mut self, item: &AppItem) {
+        // In app mode, whatever this launches should come home to the
+        // menu when it closes (found on film: Esc from a menu-launched
+        // report stranded the user at the bare browser).
+        self.menu_launched = self.app_home.is_some();
         match item.kind {
             ActionKind::Browse => {
                 let table = item.action_ref.clone();
@@ -1552,9 +1636,8 @@ impl App {
         let name = name
             .or_else(|| appsgen::list_apps(self.db.as_ref()).into_iter().next())
             .unwrap_or_else(|| "app".to_owned());
-        if let Err(e) = appsgen::ensure_app(self.db.as_ref(), &name) {
-            return self.err(e);
-        }
+        // Deliberately no ensure here: opening the designer is a READ.
+        // The first DesignerAdd creates the app (and its tables).
         let items = appsgen::items(self.db.as_ref(), &name);
         self.overlay = Overlay::Apps(AppDesignState {
             app: name,
@@ -1615,7 +1698,7 @@ impl App {
     }
 
     fn open_selected(&mut self) {
-        if let Some(t) = self.tables.get(self.sidebar_idx) {
+        if let Some(t) = self.visible_tables().get(self.sidebar_idx) {
             let name = t.name.clone();
             self.open_table(&name);
         }
@@ -2340,8 +2423,9 @@ mod tests {
         let text = p.lines.join("\n");
         assert!(text.contains("t report"), "page header with title");
         assert!(text.contains("TOTAL (500 rows)"), "grand totals");
-        // id column 1..=500 sums to 125250.
-        assert!(text.contains("125250"), "numeric column summed");
+        // The pk column is an identifier, not a quantity: its 1..=500
+        // sum (125250) must NOT appear anywhere in the report.
+        assert!(!text.contains("125250"), "pk column must not be totaled");
     }
 
     #[test]
@@ -2558,6 +2642,52 @@ mod tests {
         a.tick();
         assert!(count(&a) > before, "due tick takes a sample");
         assert!(matches!(a.overlay, Overlay::Health(_)), "console stays open");
+    }
+
+    #[test]
+    fn sidebar_hides_internals_and_seeks_by_letter() {
+        let mut a = app();
+        a.db
+            .execute("CREATE TABLE zeta(x); CREATE TABLE t_chunks(x); CREATE TABLE _phosphor_apps(id INTEGER)")
+            .unwrap();
+        a.apply(Command::Refresh);
+        let names: Vec<String> =
+            a.visible_tables().iter().map(|t| t.name.clone()).collect();
+        assert!(names.contains(&"t".into()) && names.contains(&"zeta".into()));
+        assert!(
+            !names.iter().any(|n| n == "t_chunks" || n == "_phosphor_apps"),
+            "internals hidden by default: {names:?}"
+        );
+        // First-letter seek jumps to zeta.
+        a.apply(Command::SidebarSeek('z'));
+        let vis = a.visible_tables();
+        assert_eq!(vis[a.sidebar_idx].name, "zeta");
+        // Toggle reveals everything.
+        a.apply(Command::ToggleInternals);
+        let all: Vec<String> =
+            a.visible_tables().iter().map(|t| t.name.clone()).collect();
+        assert!(all.iter().any(|n| n == "_phosphor_apps"), "{all:?}");
+    }
+
+    #[test]
+    fn app_mode_pager_closes_back_to_the_menu() {
+        let mut a = app();
+        appsgen::ensure_app(a.db.as_ref(), "demo").unwrap();
+        appsgen::add_item(a.db.as_ref(), "demo", "Totals").unwrap();
+        let mut items = appsgen::items(a.db.as_ref(), "demo");
+        items[0].kind = ActionKind::Report;
+        items[0].action_ref = "t".into();
+        appsgen::update_item(a.db.as_ref(), &items[0]).unwrap();
+
+        a.app_home = Some("demo".into());
+        a.apply(Command::OpenAppMenu(Some("demo".into())));
+        a.apply(Command::DesignerRun); // run the report → pager
+        assert!(matches!(a.overlay, Overlay::Pager(_)));
+        a.apply(Command::Back); // Esc: home means home
+        assert!(
+            matches!(a.overlay, Overlay::AppMenu(_)),
+            "menu-launched pager must return to the menu in app mode"
+        );
     }
 
     #[test]

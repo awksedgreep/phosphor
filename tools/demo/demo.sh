@@ -4,6 +4,7 @@
 # Needs: agg (cargo install --git https://github.com/asciinema/agg)
 # and any monospace font (AGG_FONT to override).
 set -euo pipefail
+export PATH="$HOME/.cargo/bin:$PATH"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FONT="${AGG_FONT:-CaskaydiaMono Nerd Font Mono}"
 

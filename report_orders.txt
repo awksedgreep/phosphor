@@ -1,0 +1,15 @@
+orders report  ·  page 1
+id  customer product     qty amount  region
+───────────────────────────────────────────
+1   Ada      compiler      1    99.0 east  
+2   Grace    linker        2    45.0 east  
+3   Barbara  abstraction   3   120.0 east  
+4   Niklaus  pascal        1    80.0 west  
+5   Edsger   semaphore     5    25.0 west  
+6   Donald   tex           1    7.99 west  
+7   Ada      engine        1   250.0 east  
+8   Margaret apollo        1   400.0 east  
+
+───────────────────────────────────────────
+TOTAL (8 rows)
+                          15 1026.99       

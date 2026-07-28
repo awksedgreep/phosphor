@@ -131,6 +131,27 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
     if let Some(gi) = group_idx {
         numeric[gi] = false;
     }
+    // Identifiers are not quantities: never total a table's PRIMARY KEY,
+    // nor id-shaped columns from arbitrary SELECT sources ("TOTAL: 36"
+    // over customer ids was proudly displayed nonsense — found on film).
+    let src = spec.source.trim();
+    if !src.to_ascii_lowercase().starts_with("select")
+        && !src.to_ascii_lowercase().starts_with("with")
+    {
+        if let Ok(cols) = db.columns(src) {
+            for c in cols.iter().filter(|c| c.pk) {
+                if let Some(i) = q.columns.iter().position(|n| *n == c.name) {
+                    numeric[i] = false;
+                }
+            }
+        }
+    }
+    for (i, name) in q.columns.iter().enumerate() {
+        let lower = name.to_ascii_lowercase();
+        if lower == "id" || lower == "rowid" || lower.ends_with("_id") {
+            numeric[i] = false;
+        }
+    }
 
     // Grand totals first: numeric columns must be wide enough for their
     // own SUM line, not just their data (a column of 3-digit ids has a
