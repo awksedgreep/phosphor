@@ -10,6 +10,7 @@ mod app;
 mod appsgen;
 mod db;
 mod forms;
+mod help;
 mod qbe;
 mod remote;
 mod report;

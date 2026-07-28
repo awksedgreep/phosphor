@@ -30,7 +30,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, app, status_line);
 
     match &app.overlay {
-        Overlay::Help => draw_help(f, app),
+        Overlay::Help(_) => draw_help(f, app),
         Overlay::Edit(_) => draw_edit(f, app),
         Overlay::Health(_) => draw_health(f, app),
         Overlay::Qbe(_) => draw_qbe(f, app),
@@ -922,39 +922,52 @@ fn draw_edit(f: &mut Frame, app: &App) {
 
 fn draw_help(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let area = centered(f.area(), 58, 20);
+    let Overlay::Help(st) = &app.overlay else { return };
+    let topics = crate::help::TOPICS;
+    let topic = &topics[st.topic.min(topics.len() - 1)];
+
+    let area = f.area().inner(ratatui::layout::Margin {
+        horizontal: 4,
+        vertical: 1,
+    });
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(th.bright())
         .style(th.base())
-        .title(Span::styled(" Help ", th.bright()));
+        .title(Span::styled(" HELP ", th.bright()))
+        .title_bottom(Line::styled(
+            " ←→ topics · ↑↓ scroll · Esc close ",
+            th.dim(),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let rows = [
-        ("Tab / Esc", "cycle focus / back out"),
-        (".", "dot prompt (SQL + commands)"),
-        ("Enter", "open table · edit row · run"),
-        ("↑↓←→ or hjkl", "move"),
-        ("PgUp/PgDn g G", "page · top · bottom"),
-        ("a / x / n", "add row · delete (x twice) · find next"),
-        ("Q R L F A", "qbe · report · labels · form · apps"),
-        ("F5 / r", "refresh"),
-        ("F10", "dbhealth console (save, in EDIT)"),
-        ("q / Ctrl-Q", "quit"),
-        ("", ""),
-        ("prompt:", "SQL · help · tables · health · qbe"),
-        ("", "report · labels · form · apps · app"),
-        ("", "run <query> · set theme green|amber|…"),
-    ];
-    let lines: Vec<Line> = rows
+
+    let [toc, _, body] = Layout::horizontal([
+        Constraint::Length(16),
+        Constraint::Length(2),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+
+    let toc_lines: Vec<Line> = topics
         .iter()
-        .map(|(k, v)| {
-            Line::from(vec![
-                Span::styled(format!(" {k:>14}  "), th.bright()),
-                Span::styled(*v, th.base()),
-            ])
+        .enumerate()
+        .map(|(i, t)| {
+            Line::styled(
+                format!(" {} ", t.title),
+                if i == st.topic { th.cursor() } else { th.dim() },
+            )
         })
         .collect();
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(toc_lines), toc);
+
+    let mut body_lines: Vec<Line> = vec![
+        Line::styled(topic.title.to_uppercase(), th.bright()),
+        Line::raw(""),
+    ];
+    body_lines.extend(topic.body.lines().map(|l| Line::styled(l, th.base())));
+    let scroll = (st.scroll as usize)
+        .min(body_lines.len().saturating_sub(body.height as usize / 2)) as u16;
+    f.render_widget(Paragraph::new(body_lines).scroll((scroll, 0)), body);
 }

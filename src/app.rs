@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::db::{ColumnInfo, DbLink, PValue, TableInfo};
 use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
+use crate::help::{self, HelpState};
 use crate::qbe::{QbeSpec, QbeState};
 use crate::report::{self, PagerState, ReportSpec, ReportState};
 use crate::theme::{self, Theme};
@@ -25,7 +26,7 @@ pub enum Focus {
 
 pub enum Overlay {
     None,
-    Help,
+    Help(HelpState),
     Edit(EditState),
     Health(HealthView),
     Qbe(QbeState),
@@ -193,6 +194,8 @@ pub enum Command {
     PaintBox,
     PaintText,
     PaintDelete,
+    HelpScroll(i64),
+    HelpTopic(i64),
 }
 
 pub struct App {
@@ -289,19 +292,30 @@ impl App {
                 (None, Char('s')) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     Command::EditSave
                 }
+                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
         }
-        if matches!(self.overlay, Overlay::Help) {
-            return matches!(key.code, Esc | Enter | F(1) | Char('q'))
-                .then_some(Command::Back);
+        if matches!(self.overlay, Overlay::Help(_)) {
+            return Some(match key.code {
+                Esc | Char('q') | F(1) => Command::Back,
+                Up | Char('k') => Command::HelpScroll(-1),
+                Down | Char('j') => Command::HelpScroll(1),
+                PageUp => Command::HelpScroll(-20),
+                PageDown | Char(' ') => Command::HelpScroll(20),
+                Home | Char('g') => Command::HelpScroll(i64::MIN / 2),
+                Left | Char('h') => Command::HelpTopic(-1),
+                Right | Char('l') | Tab => Command::HelpTopic(1),
+                _ => return None,
+            });
         }
         if matches!(self.overlay, Overlay::Health(_)) {
             return Some(match key.code {
                 Esc | Char('q') | F(10) => Command::Back,
                 Char('s') => Command::HealthSample,
                 Char('r') | F(5) => Command::OpenHealth,
+                F(1) => Command::Help,
                 _ => return None,
             });
         }
@@ -318,6 +332,7 @@ impl App {
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
                 (None, F(6)) => Command::DesignerSave,
+                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -334,6 +349,7 @@ impl App {
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
                 (None, F(6)) => Command::DesignerSave,
+                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -348,6 +364,7 @@ impl App {
                 Home | Char('g') => Command::PagerScroll(i64::MIN / 2),
                 End | Char('G') => Command::PagerScroll(i64::MAX / 2),
                 Char('w') => Command::PagerWrite,
+                F(1) => Command::Help,
                 _ => return None,
             });
         }
@@ -366,6 +383,7 @@ impl App {
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun, // → the painter
                 (None, F(6)) => Command::DesignerSave,
+                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -388,6 +406,7 @@ impl App {
                 (None, Char('+') | Char('=')) => Command::DesignerSwap(1),
                 (None, Char('-')) => Command::DesignerSwap(-1),
                 (None, F(6)) => Command::DesignerSave,
+                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -408,6 +427,7 @@ impl App {
                 (None, Char('[')) => Command::DesignerSwap(-1),
                 (None, Char(']')) => Command::DesignerSwap(1),
                 (None, F(2)) => Command::DesignerRun,
+                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -418,6 +438,7 @@ impl App {
                 Up => Command::DesignerMove(-1),
                 Down => Command::DesignerMove(1),
                 Enter => Command::DesignerRun,
+                F(1) => Command::Help,
                 Char(c) => Command::DesignerChar(c), // hotkey jump-and-run
                 _ => return None,
             });
@@ -508,7 +529,19 @@ impl App {
             Command::Quit => self.quit = true,
             Command::Focus(f) => self.focus = f,
             Command::Back => self.back(),
-            Command::Help => self.overlay = Overlay::Help,
+            Command::Help => self.open_help(),
+            Command::HelpScroll(d) => {
+                if let Overlay::Help(st) = &mut self.overlay {
+                    st.scroll = (st.scroll as i64 + d).clamp(0, 500) as u16;
+                }
+            }
+            Command::HelpTopic(d) => {
+                if let Overlay::Help(st) = &mut self.overlay {
+                    let n = help::TOPICS.len() as i64;
+                    st.topic = (st.topic as i64 + d).rem_euclid(n) as usize;
+                    st.scroll = 0;
+                }
+            }
             Command::Refresh => self.refresh(),
             Command::SidebarMove(d) => {
                 let n = self.tables.len() as i64;
@@ -707,7 +740,7 @@ impl App {
                 }
             }
             Overlay::Edit(_)
-            | Overlay::Help
+            | Overlay::Help(_)
             | Overlay::Health(_)
             | Overlay::Qbe(_)
             | Overlay::Report(_)
@@ -775,6 +808,27 @@ impl App {
         };
         let base = view.strip_suffix("_report")?.to_owned();
         Some((view, base))
+    }
+
+    /// F1: open help on the topic for wherever the user is right now.
+    fn open_help(&mut self) {
+        let key = match &self.overlay {
+            Overlay::Edit(_) => "browse",
+            Overlay::Health(_) => "health",
+            Overlay::Qbe(_) => "qbe",
+            Overlay::Report(_) | Overlay::Pager(_) => "reports",
+            Overlay::Form(_) | Overlay::Paint(_) => "forms",
+            Overlay::Apps(_) | Overlay::AppMenu(_) => "apps",
+            Overlay::Help(_) => return,
+            Overlay::None => match self.focus {
+                Focus::Prompt => "prompt",
+                _ => "browse",
+            },
+        };
+        self.overlay = Overlay::Help(HelpState {
+            topic: help::topic_index(key),
+            scroll: 0,
+        });
     }
 
     fn open_health(&mut self) {
@@ -2049,8 +2103,7 @@ impl App {
             };
         }
         if line == "help" {
-            self.overlay = Overlay::Help;
-            return;
+            return self.open_help();
         }
         if line == "health" {
             return self.open_health();
@@ -2425,6 +2478,32 @@ mod tests {
         }
         a.apply(Command::PromptRun);
         assert_eq!(a.theme.name, "amber");
+    }
+
+    #[test]
+    fn help_is_context_sensitive() {
+        let mut a = app();
+        // From the QBE designer, F1 lands on the QBE topic.
+        a.apply(Command::OpenQbe(Some("t".into())));
+        a.apply(Command::Help);
+        let Overlay::Help(st) = &a.overlay else {
+            panic!("help did not open");
+        };
+        assert_eq!(crate::help::TOPICS[st.topic].key, "qbe");
+        // Topics cycle; scroll clamps at zero.
+        a.apply(Command::HelpTopic(1));
+        a.apply(Command::HelpScroll(-5));
+        let Overlay::Help(st) = &a.overlay else { panic!() };
+        assert_eq!(crate::help::TOPICS[st.topic].key, "reports");
+        assert_eq!(st.scroll, 0);
+        // Esc closes back toward where the user was.
+        a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::None));
+        // From the prompt, F1 lands on the prompt topic.
+        a.apply(Command::Focus(Focus::Prompt));
+        a.apply(Command::Help);
+        let Overlay::Help(st) = &a.overlay else { panic!() };
+        assert_eq!(crate::help::TOPICS[st.topic].key, "prompt");
     }
 
     #[test]

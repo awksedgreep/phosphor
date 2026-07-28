@@ -83,7 +83,8 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   prompt** (`.`) running real SQL with history, Tab completion, and
   Ctrl-A/E/U/W line editing, four themes
   (`set theme green|amber|paper|blue`), F1 help, query latency in the
-  status bar.
+  status bar. **F1 anywhere** opens context-sensitive help written in
+  English — the topic for the screen you are on, ←→ to wander the manual.
 - **Network** — the same UI over Hrana HTTP to self-hosted
   [sqld](https://github.com/tursodatabase/libsql): one `DbLink` trait,
   two backends, chosen by the argument. Multi-user, no lock files —
