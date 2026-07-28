@@ -8,7 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::db::{ColumnInfo, DbLink, PValue, TableInfo};
-use crate::forms::{FormSpec, FormState};
+use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
 use crate::qbe::{QbeSpec, QbeState};
 use crate::report::{self, PagerState, ReportSpec, ReportState};
 use crate::theme::{self, Theme};
@@ -32,6 +32,7 @@ pub enum Overlay {
     Report(ReportState),
     Pager(PagerState),
     Form(FormState),
+    Paint(PaintState),
     Apps(AppDesignState),
     AppMenu(AppMenuState),
 }
@@ -51,6 +52,9 @@ pub struct EditState {
     pub table: String,
     /// true → this is a NEW record (INSERT on save; rowid unused).
     pub inserting: bool,
+    /// The painted layout, when the crafted form has 2D coordinates —
+    /// draw_edit renders CREATE SCREEN style instead of the list.
+    pub painted: Option<FormSpec>,
     pub rowid: i64,
     pub fields: Vec<(ColumnInfo, PValue)>,
     /// Display labels (custom when a crafted form exists for the table).
@@ -184,6 +188,11 @@ pub enum Command {
     PromptClear,
     PromptDeleteWord,
     PromptComplete,
+    PaintMove { dx: i64, dy: i64 },
+    PaintPlace,
+    PaintBox,
+    PaintText,
+    PaintDelete,
 }
 
 pub struct App {
@@ -355,6 +364,29 @@ impl App {
                 (None, Char('[')) => Command::DesignerSwap(-1),
                 (None, Char(']')) => Command::DesignerSwap(1),
                 (None, Enter) => Command::DesignerEditBegin,
+                (None, F(2)) => Command::DesignerRun, // → the painter
+                (None, F(6)) => Command::DesignerSave,
+                (None, Esc) => Command::Back,
+                _ => return None,
+            });
+        }
+        if let Overlay::Paint(st) = &self.overlay {
+            return Some(match (&st.editing, key.code) {
+                (Some(_), Enter) => Command::DesignerCommit,
+                (Some(_), Esc) => Command::Back,
+                (Some(_), Backspace) => Command::DesignerBackspace,
+                (Some(_), Char(c)) => Command::DesignerChar(c),
+                (None, Up | Char('k')) => Command::PaintMove { dx: 0, dy: -1 },
+                (None, Down | Char('j')) => Command::PaintMove { dx: 0, dy: 1 },
+                (None, Left | Char('h')) => Command::PaintMove { dx: -1, dy: 0 },
+                (None, Right | Char('l')) => Command::PaintMove { dx: 1, dy: 0 },
+                (None, Tab) => Command::DesignerCycle,
+                (None, Char(' ')) => Command::PaintPlace,
+                (None, Char('b')) => Command::PaintBox,
+                (None, Char('t')) => Command::PaintText,
+                (None, Char('x')) => Command::PaintDelete,
+                (None, Char('+') | Char('=')) => Command::DesignerSwap(1),
+                (None, Char('-')) => Command::DesignerSwap(-1),
                 (None, F(6)) => Command::DesignerSave,
                 (None, Esc) => Command::Back,
                 _ => return None,
@@ -633,6 +665,15 @@ impl App {
                 self.prompt.cursor = i;
             }
             Command::PromptComplete => self.prompt_complete(),
+            Command::PaintMove { dx, dy } => self.paint_move(dx, dy),
+            Command::PaintPlace => self.paint_place(),
+            Command::PaintBox => self.paint_box(),
+            Command::PaintText => {
+                if let Overlay::Paint(st) = &mut self.overlay {
+                    st.editing = Some(String::new());
+                }
+            }
+            Command::PaintDelete => self.paint_delete(),
         }
         // Any command other than a second DeleteRow disarms the pending
         // delete (moving the cursor, refreshing, anything).
@@ -651,6 +692,20 @@ impl App {
             Overlay::Report(st) if st.editing.is_some() => st.editing = None,
             Overlay::Form(st) if st.editing.is_some() => st.editing = None,
             Overlay::Apps(st) if st.editing.is_some() => st.editing = None,
+            Overlay::Paint(st) if st.editing.is_some() => st.editing = None,
+            Overlay::Paint(st) if st.pending_box.is_some() => st.pending_box = None,
+            Overlay::Paint(_) => {
+                // Painter backs out to the list designer, same spec.
+                if let Overlay::Paint(st) =
+                    std::mem::replace(&mut self.overlay, Overlay::None)
+                {
+                    self.overlay = Overlay::Form(FormState {
+                        spec: st.spec,
+                        cursor: 0,
+                        editing: None,
+                    });
+                }
+            }
             Overlay::Edit(_)
             | Overlay::Help
             | Overlay::Health(_)
@@ -972,6 +1027,7 @@ impl App {
                     let _ = appsgen::update_item(self.db.as_ref(), &item);
                 }
             }
+            Overlay::Paint(st) => st.select_next(),
             _ => {}
         }
     }
@@ -1019,7 +1075,82 @@ impl App {
             Overlay::Report(st) => st.editing.as_mut(),
             Overlay::Form(st) => st.editing.as_mut(),
             Overlay::Apps(st) => st.editing.as_mut(),
+            Overlay::Paint(st) => st.editing.as_mut(),
             _ => None,
+        }
+    }
+
+    // ── the painter (CREATE SCREEN) ──────────────────────────────────
+
+    fn paint_move(&mut self, dx: i64, dy: i64) {
+        if let Overlay::Paint(st) = &mut self.overlay {
+            let (w, h) = st.spec.size;
+            let nx = (st.cursor.0 as i64 + dx).clamp(0, w as i64 - 1) as u16;
+            let ny = (st.cursor.1 as i64 + dy).clamp(0, h as i64 - 1) as u16;
+            st.cursor = (nx, ny);
+        }
+    }
+
+    /// Space: place the selected field's label at the cursor.
+    fn paint_place(&mut self) {
+        if let Overlay::Paint(st) = &mut self.overlay {
+            if let Some(f) = st.spec.fields.get_mut(st.selected) {
+                if f.include {
+                    f.pos = Some(st.cursor);
+                }
+            }
+        }
+    }
+
+    /// 'b' twice: a box from the first corner to the cursor.
+    fn paint_box(&mut self) {
+        if let Overlay::Paint(st) = &mut self.overlay {
+            match st.pending_box.take() {
+                None => st.pending_box = Some(st.cursor),
+                Some((x0, y0)) => {
+                    let (x1, y1) = st.cursor;
+                    let (x, y) = (x0.min(x1), y0.min(y1));
+                    let w = x0.abs_diff(x1) + 1;
+                    let h = y0.abs_diff(y1) + 1;
+                    if w >= 2 && h >= 2 {
+                        st.spec.boxes.push(BoxItem { x, y, w, h });
+                    } else {
+                        self.say("box needs at least 2×2 (move before second b)");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 'x': delete whatever sits under the cursor — a text (by its
+    /// span), a box (by its corner), or unplace the field whose label
+    /// starts here. Most specific first.
+    fn paint_delete(&mut self) {
+        if let Overlay::Paint(st) = &mut self.overlay {
+            let (cx, cy) = st.cursor;
+            if let Some(i) = st.spec.texts.iter().position(|t| {
+                t.y == cy && cx >= t.x && (cx as usize) < t.x as usize + t.text.chars().count()
+            }) {
+                st.spec.texts.remove(i);
+                return;
+            }
+            if let Some(f) = st
+                .spec
+                .fields
+                .iter_mut()
+                .find(|f| f.pos == Some((cx, cy)))
+            {
+                f.pos = None;
+                return;
+            }
+            if let Some(i) = st
+                .spec
+                .boxes
+                .iter()
+                .position(|b| (b.x, b.y) == (cx, cy))
+            {
+                st.spec.boxes.remove(i);
+            }
         }
     }
 
@@ -1104,6 +1235,15 @@ impl App {
                     }
                 }
             }
+            Overlay::Paint(st) => {
+                // Commit a static text at the cursor.
+                if let Some(buf) = st.editing.take() {
+                    if !buf.is_empty() {
+                        let (x, y) = st.cursor;
+                        st.spec.texts.push(TextItem { x, y, text: buf });
+                    }
+                }
+            }
             _ => {}
         }
         if let (Some(name), Overlay::Qbe(st)) = (&save_as, &self.overlay) {
@@ -1149,6 +1289,14 @@ impl App {
             Overlay::AppMenu(st) => {
                 if let Some(item) = st.items.get(st.cursor) {
                     self.app_run_item(&item.clone());
+                }
+            }
+            Overlay::Form(_) => {
+                // F2 in the list designer: enter the painter.
+                if let Overlay::Form(st) =
+                    std::mem::replace(&mut self.overlay, Overlay::None)
+                {
+                    self.overlay = Overlay::Paint(PaintState::new(st.spec));
                 }
             }
             _ => {}
@@ -1228,6 +1376,16 @@ impl App {
                     Err(e) => self.err(e),
                 }
             }
+            Overlay::Paint(st) => {
+                let spec = st.spec.clone();
+                match spec.save(self.db.as_ref()) {
+                    Ok(()) => self.say(format!(
+                        "saved painted form for {:?} — EDIT renders it now",
+                        spec.table
+                    )),
+                    Err(e) => self.err(e),
+                }
+            }
             _ => {}
         }
     }
@@ -1262,6 +1420,12 @@ impl App {
                 if to >= 0 && to < n {
                     st.spec.fields.swap(st.cursor, to as usize);
                     st.cursor = to as usize;
+                }
+            }
+            Overlay::Paint(st) => {
+                // +/- in the painter: widen/narrow the selected value cell.
+                if let Some(f) = st.spec.fields.get_mut(st.selected) {
+                    f.width = (f.width as i64 + d * 2).clamp(1, 60) as u16;
                 }
             }
             Overlay::Apps(st) => {
@@ -1524,29 +1688,15 @@ impl App {
         let mut labels: Vec<String> = fields.iter().map(|(c, _)| c.name.clone()).collect();
         let mut required: Vec<bool> = vec![false; fields.len()];
 
-        // A crafted form (phase 5) reorders, relabels, hides, requires.
-        if let Some(spec) = FormSpec::load(self.db.as_ref(), &name) {
-            let mut ordered = Vec::new();
-            let mut new_labels = Vec::new();
-            let mut new_required = Vec::new();
-            for f in spec.fields.iter().filter(|f| f.include) {
-                if let Some(idx) = fields.iter().position(|(c, _)| c.name == f.column) {
-                    ordered.push(fields[idx].clone());
-                    new_labels.push(f.label.clone());
-                    new_required.push(f.required);
-                }
-            }
-            if !ordered.is_empty() {
-                fields = ordered;
-                labels = new_labels;
-                required = new_required;
-            }
-        }
+        // A crafted form (phase 5) reorders, relabels, hides, requires;
+        // a PAINTED one also brings its 2D layout for rendering.
+        let painted = self.apply_crafted_form(&name, &mut fields, &mut labels, &mut required);
 
         let n = fields.len();
         self.overlay = Overlay::Edit(EditState {
             table: name,
             inserting: false,
+            painted,
             rowid,
             fields,
             labels,
@@ -1555,6 +1705,35 @@ impl App {
             cursor: 0,
             editing: None,
         });
+    }
+
+    /// Apply the saved form for `table` (order/labels/hide/required) to
+    /// the parallel field vectors; returns the spec when it is PAINTED
+    /// so EDIT can render the 2D layout.
+    fn apply_crafted_form(
+        &self,
+        table: &str,
+        fields: &mut Vec<(ColumnInfo, PValue)>,
+        labels: &mut Vec<String>,
+        required: &mut Vec<bool>,
+    ) -> Option<FormSpec> {
+        let spec = FormSpec::load(self.db.as_ref(), table)?;
+        let mut ordered = Vec::new();
+        let mut new_labels = Vec::new();
+        let mut new_required = Vec::new();
+        for f in spec.fields.iter().filter(|f| f.include) {
+            if let Some(idx) = fields.iter().position(|(c, _)| c.name == f.column) {
+                ordered.push(fields[idx].clone());
+                new_labels.push(f.label.clone());
+                new_required.push(f.required);
+            }
+        }
+        if !ordered.is_empty() {
+            *fields = ordered;
+            *labels = new_labels;
+            *required = new_required;
+        }
+        spec.painted().then_some(spec)
     }
 
     /// 'a' in BROWSE: a blank record form; save INSERTs (crafted forms
@@ -1579,27 +1758,12 @@ impl App {
             cols.into_iter().map(|c| (c, PValue::Null)).collect();
         let mut labels: Vec<String> = fields.iter().map(|(c, _)| c.name.clone()).collect();
         let mut required: Vec<bool> = vec![false; fields.len()];
-        if let Some(spec) = FormSpec::load(self.db.as_ref(), &name) {
-            let mut ordered = Vec::new();
-            let mut new_labels = Vec::new();
-            let mut new_required = Vec::new();
-            for f in spec.fields.iter().filter(|f| f.include) {
-                if let Some(idx) = fields.iter().position(|(c, _)| c.name == f.column) {
-                    ordered.push(fields[idx].clone());
-                    new_labels.push(f.label.clone());
-                    new_required.push(f.required);
-                }
-            }
-            if !ordered.is_empty() {
-                fields = ordered;
-                labels = new_labels;
-                required = new_required;
-            }
-        }
+        let painted = self.apply_crafted_form(&name, &mut fields, &mut labels, &mut required);
         let n = fields.len();
         self.overlay = Overlay::Edit(EditState {
             table: name,
             inserting: true,
+            painted,
             rowid: 0,
             fields,
             labels,
@@ -2261,5 +2425,74 @@ mod tests {
         }
         a.apply(Command::PromptRun);
         assert_eq!(a.theme.name, "amber");
+    }
+
+    #[test]
+    fn paint_a_form_and_edit_uses_it() {
+        let mut a = app();
+        // List designer → F2 → painter; fields auto-place in a column.
+        a.apply(Command::OpenForm(Some("t".into())));
+        a.apply(Command::DesignerRun);
+        let Overlay::Paint(st) = &a.overlay else {
+            panic!("painter did not open");
+        };
+        assert_eq!(st.spec.fields[0].pos, Some((2, 1)), "auto-placed");
+        assert_eq!(st.spec.fields[1].pos, Some((2, 3)));
+
+        // Select field b (cursor snaps to its spot), walk to (10, 5),
+        // and place it there.
+        a.apply(Command::DesignerCycle);
+        for _ in 0..8 {
+            a.apply(Command::PaintMove { dx: 1, dy: 0 });
+        }
+        a.apply(Command::PaintMove { dx: 0, dy: 1 });
+        a.apply(Command::PaintMove { dx: 0, dy: 1 });
+        a.apply(Command::PaintPlace);
+        // A title text typed at the cursor — moved OFF the field first
+        // (x deletes most-specific-first, and overlap would shadow it).
+        a.apply(Command::PaintMove { dx: 10, dy: -5 });
+        a.apply(Command::PaintText);
+        for c in "ROW ENTRY".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        // A box: corner at cursor, far corner after moving.
+        a.apply(Command::PaintBox);
+        a.apply(Command::PaintMove { dx: 5, dy: 3 });
+        a.apply(Command::PaintBox);
+        a.apply(Command::DesignerSave);
+
+        // Reload from storage: painted, with everything in place.
+        let spec = crate::forms::FormSpec::load(a.db.as_ref(), "t").unwrap();
+        assert!(spec.painted());
+        assert_eq!(spec.fields[1].pos, Some((10, 5)));
+        assert_eq!(spec.texts.len(), 1);
+        assert_eq!(spec.texts[0].text, "ROW ENTRY");
+        assert_eq!(spec.boxes.len(), 1);
+        assert_eq!(spec.boxes[0].w, 6);
+        assert_eq!(spec.boxes[0].h, 4);
+
+        // EDIT now carries the painted layout.
+        a.apply(Command::Back); // painter → list designer
+        a.apply(Command::Back); // close
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenEdit);
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("edit did not open");
+        };
+        assert!(ed.painted.is_some(), "EDIT renders the painted form");
+
+        // And 'x' in the painter unplaces the field under the cursor.
+        a.apply(Command::Back);
+        a.apply(Command::OpenForm(Some("t".into())));
+        a.apply(Command::DesignerRun);
+        if let Overlay::Paint(st) = &mut a.overlay {
+            st.cursor = (10, 5);
+        }
+        a.apply(Command::PaintDelete);
+        let Overlay::Paint(st) = &a.overlay else {
+            panic!("painter gone");
+        };
+        assert_eq!(st.spec.fields[1].pos, None, "field unplaced by x");
     }
 }

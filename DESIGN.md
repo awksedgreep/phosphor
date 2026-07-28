@@ -158,7 +158,7 @@ Cost of retrofitting them later: the rework we're avoiding.
 | **2 — remote** ✅ (2026-07-27) | DbLink over Hrana/sqld; capability detection; same UI | multi-user story works |
 | **3 — dbhealth console** ✅ (2026-07-27) | Admin panel: report, trends, sparklines; status-bar health dot; live 's' sampling | "db intelligence" is real |
 | **4 — QBE + reports** ✅ (2026-07-27) | query grid → SQL; banded report writer + pager; labels | the paperwork engine |
-| **5 — forms + apps** ✅ (2026-07-27) | form designer (list-based v1); menu designer; app runtime mode (`phosphor --app crm.db`) | the CRM scenario, end to end |
+| **5 — forms + apps** ✅ (2026-07-27) | form designer (list + **2D painter**: fields at x/y, texts, boxes — layout v2, v1 loads compatibly); menu designer; app runtime mode (`phosphor --app crm.db`) | the CRM scenario, end to end, painted |
 
 Each phase ships usable. The order is deliberate: browsing pays rent
 immediately, and the builder features land on a UI that already feels right.

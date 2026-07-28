@@ -37,9 +37,130 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Report(_) => draw_report(f, app),
         Overlay::Pager(_) => draw_pager(f, app),
         Overlay::Form(_) => draw_form(f, app),
+        Overlay::Paint(_) => draw_paint(f, app),
         Overlay::Apps(_) => draw_apps(f, app),
         Overlay::AppMenu(_) => draw_app_menu(f, app),
         Overlay::None => {}
+    }
+}
+
+/// A Rect at canvas coords (x,y) inside `inner`, clamped so partially
+/// off-canvas elements truncate instead of panicking.
+fn canvas_rect(inner: Rect, x: u16, y: u16, w: u16, h: u16) -> Option<Rect> {
+    if x >= inner.width || y >= inner.height {
+        return None;
+    }
+    Some(Rect {
+        x: inner.x + x,
+        y: inner.y + y,
+        width: w.min(inner.width - x),
+        height: h.min(inner.height - y),
+    })
+}
+
+/// Paint a form's boxes, texts, and fields into `inner`. Shared by the
+/// painter canvas and the painted EDIT form — designers must never
+/// drift from the runtime.
+#[allow(clippy::too_many_arguments)]
+fn paint_spec(
+    f: &mut Frame,
+    inner: Rect,
+    spec: &crate::forms::FormSpec,
+    th: &crate::theme::Theme,
+    selected_col: Option<&str>,
+    mut value_of: impl FnMut(&str) -> Option<Span<'static>>,
+) {
+    for b in &spec.boxes {
+        if let Some(r) = canvas_rect(inner, b.x, b.y, b.w, b.h) {
+            f.render_widget(
+                Block::default().borders(Borders::ALL).border_style(th.dim()),
+                r,
+            );
+        }
+    }
+    for t in &spec.texts {
+        let w = t.text.chars().count() as u16;
+        if let Some(r) = canvas_rect(inner, t.x, t.y, w, 1) {
+            f.render_widget(Paragraph::new(Line::styled(t.text.clone(), th.bright())), r);
+        }
+    }
+    for field in spec.fields.iter().filter(|fl| fl.include) {
+        let Some((x, y)) = field.pos else { continue };
+        let selected = selected_col == Some(field.column.as_str());
+        let label = format!("{}:", field.label);
+        let lw = label.chars().count() as u16;
+        if let Some(r) = canvas_rect(inner, x, y, lw, 1) {
+            f.render_widget(
+                Paragraph::new(Line::styled(
+                    label,
+                    if selected { th.cursor() } else { th.base() },
+                )),
+                r,
+            );
+        }
+        let vx = x + lw + 1;
+        let value = value_of(&field.column)
+            .unwrap_or_else(|| Span::styled("_".repeat(field.width as usize), th.dim()));
+        if let Some(r) = canvas_rect(inner, vx, y, field.width, 1) {
+            f.render_widget(Paragraph::new(Line::from(value)), r);
+        }
+    }
+}
+
+fn draw_paint(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::Paint(st) = &app.overlay else { return };
+    let (cw, ch) = st.spec.size;
+    let area = centered(f.area(), cw + 2, ch + 2);
+    f.render_widget(Clear, area);
+    let sel_name = st
+        .spec
+        .fields
+        .get(st.selected)
+        .map(|fl| fl.label.as_str())
+        .unwrap_or("-");
+    let mode = if st.editing.is_some() {
+        "text: type + Enter".to_owned()
+    } else if st.pending_box.is_some() {
+        "box: move + b for the far corner".to_owned()
+    } else {
+        format!("field: {sel_name}")
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" FORM PAINTER · {} · {mode} ", st.spec.table),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " Tab field · Space place · t text · b box · x del · +/- width · F6 save ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let selected_col = st.spec.fields.get(st.selected).map(|fl| fl.column.clone());
+    paint_spec(f, inner, &st.spec, th, selected_col.as_deref(), |_| None);
+
+    // Pending box corner marker, then the cursor cell on top.
+    if let Some((bx, by)) = st.pending_box {
+        if let Some(r) = canvas_rect(inner, bx, by, 1, 1) {
+            f.render_widget(Paragraph::new(Line::styled("┌", th.bright())), r);
+        }
+    }
+    if let Some(buf) = &st.editing {
+        // Live text entry rendered at the cursor.
+        let w = (buf.chars().count() as u16 + 1).max(1);
+        if let Some(r) = canvas_rect(inner, st.cursor.0, st.cursor.1, w, 1) {
+            f.render_widget(
+                Paragraph::new(Line::from(editing_span(buf, th))),
+                r,
+            );
+        }
+    } else if let Some(r) = canvas_rect(inner, st.cursor.0, st.cursor.1, 1, 1) {
+        f.render_widget(Paragraph::new(Line::styled("▒", th.cursor())), r);
     }
 }
 
@@ -61,7 +182,7 @@ fn draw_form(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " Space show · Enter label · r required · [ ] reorder · F6 save ",
+            " Space show · Enter label · r req · [ ] order · F2 PAINT · F6 save ",
             th.dim(),
         ));
     let inner = block.inner(area);
@@ -682,6 +803,55 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn draw_edit(f: &mut Frame, app: &App) {
     let th = app.theme;
     let Overlay::Edit(ed) = &app.overlay else { return };
+    // Painted forms render CREATE SCREEN style; unpainted stay a list.
+    if let Some(spec) = &ed.painted {
+        let (cw, ch) = spec.size;
+        let area = centered(f.area(), cw + 2, ch + 2);
+        f.render_widget(Clear, area);
+        let dirty = if ed.dirty() { " *" } else { "" };
+        let title = if ed.inserting {
+            format!(" NEW {} record{dirty} ", ed.table)
+        } else {
+            format!(" EDIT {} · rowid {}{dirty} ", ed.table, ed.rowid)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(th.bright())
+            .style(th.base())
+            .title(Span::styled(title, th.bright()))
+            .title_bottom(Line::styled(
+                " ↑↓ field · Enter edit · F10/Ctrl-S save · Esc ",
+                th.dim(),
+            ));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let selected_col = ed.fields.get(ed.cursor).map(|(c, _)| c.name.clone());
+        paint_spec(f, inner, spec, th, selected_col.as_deref(), |col| {
+            let i = ed.fields.iter().position(|(c, _)| c.name == col)?;
+            let selected = i == ed.cursor;
+            Some(match (selected, &ed.editing) {
+                (true, Some(buf)) => Span::styled(format!("{buf}▏"), th.cursor()),
+                _ => {
+                    let (text, edited) = match &ed.inputs[i] {
+                        Some(t) => (t.clone(), true),
+                        None => (ed.fields[i].1.render(), false),
+                    };
+                    Span::styled(
+                        text,
+                        if selected {
+                            th.cursor()
+                        } else if edited {
+                            th.bright()
+                        } else {
+                            th.base()
+                        },
+                    )
+                }
+            })
+        });
+        return;
+    }
     let label_w = ed
         .labels
         .iter()

@@ -98,8 +98,11 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   writes, F2 runs, F6 saves), `R`eports (banded: page headers, group
   bands with subtotals, automatic totals on numeric columns, grand
   totals; preview in a pager, `w` writes the file), `L`abels
-  (three-across, zero config), and `F`orms (reorder, relabel, hide, and
-  require fields — EDIT uses your form from then on).
+  (three-across, zero config), and `F`orms — reorder, relabel, hide,
+  and require fields, then press **F2 for the FORM PAINTER**: place
+  fields anywhere on a canvas, add title texts, draw boxes
+  (`CREATE SCREEN`, reborn) — EDIT and NEW render your painted screen
+  from then on.
 - **The Applications Generator** — press `A`, craft a menu of actions
   (browse a table, run a saved query or report, execute SQL), and the
   result is an *application* stored in `_phosphor_*` tables inside the
