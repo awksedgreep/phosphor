@@ -18,13 +18,15 @@ import termios
 import time
 
 
-def record(cmd, steps, out_path, cols=100, rows=30, env=None, tail=1.5, title=""):
+def record(cmd, steps, out_path, cols=100, rows=30, env=None, tail=1.5, title="", cwd=None):
     child_env = dict(os.environ)
     child_env.update(env or {})
     child_env["TERM"] = "xterm-256color"
 
     pid, fd = pty.fork()
     if pid == 0:  # child
+        if cwd:
+            os.chdir(cwd)
         os.execvpe(cmd[0], cmd, child_env)
 
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))

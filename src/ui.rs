@@ -349,7 +349,11 @@ fn editing_span<'a>(buf: &'a str, th: &crate::theme::Theme) -> Span<'a> {
 fn draw_qbe(f: &mut Frame, app: &App) {
     let th = app.theme;
     let Overlay::Qbe(st) = &app.overlay else { return };
-    let area = centered(f.area(), 76, (st.spec.cols.len() as u16 + 8).min(f.area().height));
+    let area = centered(
+        f.area(),
+        76,
+        (st.spec.cols.len() as u16 + 10).min(f.area().height),
+    );
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -370,7 +374,7 @@ fn draw_qbe(f: &mut Frame, app: &App) {
         Span::styled(pad("COLUMN", 18), th.dim()),
         Span::styled(pad("SHOW", 5), th.dim()),
         Span::styled(pad("SORT", 5), th.dim()),
-        Span::styled("FILTER (e.g. > 100, like 'a%', or a bare value)", th.dim()),
+        Span::styled("FILTER (> 100 · like 'a%' · bare = equals)", th.dim()),
     ])];
     for (i, col) in st.spec.cols.iter().enumerate() {
         let selected = i == st.cursor;
@@ -393,9 +397,21 @@ fn draw_qbe(f: &mut Frame, app: &App) {
             editing_span(st.editing.as_deref().unwrap_or(""), th),
         ]));
     }
-    lines.push(Line::styled("SQL:", th.dim()));
-    lines.push(Line::styled(st.spec.sql(), th.bright()));
-    f.render_widget(Paragraph::new(lines), inner);
+    let rows_h = lines.len() as u16;
+    let [rows_area, sql_area] =
+        Layout::vertical([Constraint::Length(rows_h), Constraint::Fill(1)]).areas(inner);
+    f.render_widget(Paragraph::new(lines), rows_area);
+    // The generated SQL WRAPS — on film it silently clipped at the box
+    // edge and the ORDER BY was never visible. Showing the SQL is the
+    // whole point of QBE; it must never be cut off.
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::styled("SQL:", th.dim()),
+            Line::styled(st.spec.sql(), th.bright()),
+        ])
+        .wrap(ratatui::widgets::Wrap { trim: false }),
+        sql_area,
+    );
 }
 
 fn draw_report(f: &mut Frame, app: &App) {

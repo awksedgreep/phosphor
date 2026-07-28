@@ -382,8 +382,8 @@ impl App {
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
                 (Some(_), Char(c)) => Command::DesignerChar(c),
-                (None, Up) => Command::DesignerMove(-1),
-                (None, Down) => Command::DesignerMove(1),
+                (None, Up | Char('k')) => Command::DesignerMove(-1),
+                (None, Down | Char('j')) => Command::DesignerMove(1),
                 (None, Char(' ')) => Command::DesignerToggle,
                 (None, Char('s')) => Command::DesignerCycle,
                 (None, Enter) => Command::DesignerEditBegin,
@@ -400,8 +400,8 @@ impl App {
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
                 (Some(_), Char(c)) => Command::DesignerChar(c),
-                (None, Up) => Command::DesignerMove(-1),
-                (None, Down) => Command::DesignerMove(1),
+                (None, Up | Char('k')) => Command::DesignerMove(-1),
+                (None, Down | Char('j')) => Command::DesignerMove(1),
                 (None, Char(' ')) => Command::DesignerToggle,
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
@@ -431,8 +431,8 @@ impl App {
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
                 (Some(_), Char(c)) => Command::DesignerChar(c),
-                (None, Up) => Command::DesignerMove(-1),
-                (None, Down) => Command::DesignerMove(1),
+                (None, Up | Char('k')) => Command::DesignerMove(-1),
+                (None, Down | Char('j')) => Command::DesignerMove(1),
                 (None, Char(' ')) => Command::DesignerToggle,
                 (None, Char('r')) => Command::DesignerCycle,
                 (None, Char('[')) => Command::DesignerSwap(-1),
@@ -474,8 +474,8 @@ impl App {
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
                 (Some(_), Char(c)) => Command::DesignerChar(c),
-                (None, Up) => Command::DesignerMove(-1),
-                (None, Down) => Command::DesignerMove(1),
+                (None, Up | Char('k')) => Command::DesignerMove(-1),
+                (None, Down | Char('j')) => Command::DesignerMove(1),
                 (None, Char('n')) => Command::DesignerAdd,
                 (None, Char('x')) => Command::DesignerDelete,
                 (None, Char('c')) => Command::DesignerCycle,
@@ -670,6 +670,11 @@ impl App {
             }
             Command::EditSave => self.edit_save(),
             Command::PromptChar(c) => {
+                // The dot prompt IS the dot: a habitual '.' typed into
+                // an empty prompt is a no-op, not a syntax error later.
+                if c == '.' && self.prompt.input.is_empty() {
+                    return;
+                }
                 let cur = self.prompt.cursor;
                 self.prompt.input.insert(
                     self.prompt
@@ -1511,7 +1516,7 @@ impl App {
         match &mut self.overlay {
             Overlay::Qbe(st) => {
                 st.naming = true;
-                st.editing = Some(st.spec.table.clone());
+                st.editing = Some(String::new());
             }
             Overlay::Report(st) => {
                 let spec = st.spec.clone();
@@ -1550,7 +1555,14 @@ impl App {
         if let Overlay::Apps(st) = &self.overlay {
             let app = st.app.clone();
             match appsgen::add_item(self.db.as_ref(), &app, "New item") {
-                Ok(()) => self.apps_reload(&app),
+                Ok(()) => {
+                    self.apps_reload(&app);
+                    // Select the item just added: the next Enter must
+                    // edit IT, not whatever the cursor was on.
+                    if let Overlay::Apps(st) = &mut self.overlay {
+                        st.cursor = st.items.len().saturating_sub(1);
+                    }
+                }
                 Err(e) => self.err(e),
             }
         }
