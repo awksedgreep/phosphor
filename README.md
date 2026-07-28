@@ -66,8 +66,8 @@ means what you think it means.
 
 ## Status
 
-**Phases 1–3 work today** — the browser, the network, and the health
-console:
+**All five phases work today** — the browser, the network, the health
+console, the builders, and the applications runtime:
 
 ```sh
 cargo run -- path/to/any.db            # embedded: any SQLite/libSQL file
@@ -92,10 +92,25 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   trends fed from the compressed series, and `s` to take a live sample
   right there — works identically over a file or over sqld. The status
   bar carries the health dot at all times.
+- **The builders** — `Q`uery By Example (fill the grid, watch the SQL it
+  writes, F2 runs, F6 saves), `R`eports (banded: page headers, group
+  bands with subtotals, automatic totals on numeric columns, grand
+  totals; preview in a pager, `w` writes the file), `L`abels
+  (three-across, zero config), and `F`orms (reorder, relabel, hide, and
+  require fields — EDIT uses your form from then on).
+- **The Applications Generator** — press `A`, craft a menu of actions
+  (browse a table, run a saved query or report, execute SQL), and the
+  result is an *application* stored in `_phosphor_*` tables inside the
+  database itself. Then:
 
-See [DESIGN.md](DESIGN.md) for the feature revival map, the architecture,
-and phases 4–5 (QBE + banded reports, forms + the applications
-generator).
+  ```sh
+  phosphor --app crm.db      # your team's CRM, hotkeys and all
+  ```
+
+  Copy the file, you copied the app. Replicate it with libSQL, you
+  deployed it.
+
+See [DESIGN.md](DESIGN.md) for the feature revival map and architecture.
 
 ## License
 

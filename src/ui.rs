@@ -36,8 +36,164 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Qbe(_) => draw_qbe(f, app),
         Overlay::Report(_) => draw_report(f, app),
         Overlay::Pager(_) => draw_pager(f, app),
+        Overlay::Form(_) => draw_form(f, app),
+        Overlay::Apps(_) => draw_apps(f, app),
+        Overlay::AppMenu(_) => draw_app_menu(f, app),
         Overlay::None => {}
     }
+}
+
+fn draw_form(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::Form(st) = &app.overlay else { return };
+    let area = centered(
+        f.area(),
+        66,
+        (st.spec.fields.len() as u16 + 6).min(f.area().height),
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" FORM · {} ", st.spec.table),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " Space show · Enter label · r required · [ ] reorder · F6 save ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(pad("FIELD", 16), th.dim()),
+        Span::styled(pad("SHOW", 5), th.dim()),
+        Span::styled(pad("REQ", 4), th.dim()),
+        Span::styled("LABEL", th.dim()),
+    ])];
+    for (i, field) in st.spec.fields.iter().enumerate() {
+        let selected = i == st.cursor;
+        let style = if selected { th.cursor() } else { th.base() };
+        let label: Span = if selected && st.editing.is_some() {
+            editing_span(st.editing.as_ref().unwrap(), th)
+        } else {
+            Span::styled(field.label.clone(), style)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pad(&field.column, 16), style),
+            Span::styled(pad(if field.include { "▪" } else { " " }, 5), style),
+            Span::styled(pad(if field.required { "*" } else { " " }, 4), style),
+            label,
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_apps(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::Apps(st) = &app.overlay else { return };
+    let area = centered(
+        f.area(),
+        72,
+        (st.items.len() as u16 + 7).max(10).min(f.area().height),
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" APPLICATIONS GENERATOR · {} ", st.app),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " n new · x delete · Enter label · e ref · c kind · [ ] order · F2 run ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(pad("LABEL", 24), th.dim()),
+        Span::styled(pad("KIND", 8), th.dim()),
+        Span::styled("TARGET (table · saved query/report · SQL)", th.dim()),
+    ])];
+    for (i, item) in st.items.iter().enumerate() {
+        let selected = i == st.cursor;
+        let style = if selected { th.cursor() } else { th.base() };
+        let (label, target): (Span, Span) = if selected && st.editing.is_some() {
+            let buf = editing_span(st.editing.as_ref().unwrap(), th);
+            if st.editing_ref {
+                (Span::styled(pad(&item.label, 24), style), buf)
+            } else {
+                (buf, Span::styled(item.action_ref.clone(), style))
+            }
+        } else {
+            (
+                Span::styled(pad(&item.label, 24), style),
+                Span::styled(item.action_ref.clone(), style),
+            )
+        };
+        lines.push(Line::from(vec![
+            label,
+            Span::styled(pad(item.kind.as_str(), 8), style),
+            target,
+        ]));
+    }
+    if st.items.is_empty() {
+        lines.push(Line::styled("  n adds the first menu item", th.dim()));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_app_menu(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::AppMenu(st) = &app.overlay else { return };
+    let width = 46u16;
+    let area = centered(
+        f.area(),
+        width,
+        (st.items.len() as u16 * 2 + 6).min(f.area().height),
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" ▓▓ {} ▓▓ ", st.app.to_uppercase()),
+            th.bright(),
+        ))
+        .title_alignment(Alignment::Center)
+        .title_bottom(Line::styled(" ↑↓ + Enter · hotkey letters · Esc ", th.dim()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![Line::raw("")];
+    for (i, item) in st.items.iter().enumerate() {
+        let selected = i == st.cursor;
+        let style = if selected { th.cursor() } else { th.base() };
+        // dBASE-style: the hotkey is the bright first letter.
+        let mut chars = item.label.chars();
+        let first: String = chars.next().map(|c| c.to_string()).unwrap_or_default();
+        let rest: String = chars.collect();
+        lines.push(Line::from(vec![
+            Span::styled("   ", style),
+            Span::styled(
+                first,
+                if selected {
+                    th.cursor()
+                } else {
+                    th.bright()
+                },
+            ),
+            Span::styled(pad(&rest, width.saturating_sub(8)), style),
+        ]));
+        lines.push(Line::raw(""));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn editing_span<'a>(buf: &'a str, th: &crate::theme::Theme) -> Span<'a> {
@@ -529,9 +685,9 @@ fn draw_edit(f: &mut Frame, app: &App) {
     let th = app.theme;
     let Overlay::Edit(ed) = &app.overlay else { return };
     let label_w = ed
-        .fields
+        .labels
         .iter()
-        .map(|(c, _)| c.name.chars().count())
+        .map(|l| l.chars().count())
         .max()
         .unwrap_or(4)
         .clamp(4, 20);
@@ -551,17 +707,17 @@ fn draw_edit(f: &mut Frame, app: &App) {
 
     let mut lines = Vec::new();
     for (i, (col, original)) in ed.fields.iter().enumerate() {
-        // PICTURE-clause energy: ¶ marks the primary key, * NOT NULL.
+        // PICTURE-clause energy: ¶ pk, * NOT NULL / form-required.
         let marker = if col.pk {
             "¶"
-        } else if col.notnull {
+        } else if col.notnull || ed.required[i] {
             "*"
         } else {
             " "
         };
         let label = format!(
             "{marker}{:>w$} : ",
-            col.name.chars().take(label_w).collect::<String>(),
+            ed.labels[i].chars().take(label_w).collect::<String>(),
             w = label_w
         );
         let selected = i == ed.cursor;
@@ -612,13 +768,14 @@ fn draw_help(f: &mut Frame, app: &App) {
         ("Enter", "open table · edit row · run"),
         ("↑↓←→ or hjkl", "move"),
         ("PgUp/PgDn g G", "page · top · bottom"),
-        ("Home/End", "first / last column"),
+        ("Q R L F A", "qbe · report · labels · form · apps"),
         ("F5 / r", "refresh"),
         ("F10", "dbhealth console (save, in EDIT)"),
         ("q / Ctrl-Q", "quit"),
         ("", ""),
-        ("prompt:", "any SQL · help · tables · health"),
-        ("", "set theme green|amber|paper|blue"),
+        ("prompt:", "SQL · help · tables · health · qbe"),
+        ("", "report · labels · form · apps · app"),
+        ("", "run <query> · set theme green|amber|…"),
     ];
     let lines: Vec<Line> = rows
         .iter()

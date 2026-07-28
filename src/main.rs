@@ -7,7 +7,9 @@
 //! into embedded connections (enables dbhealth + telemetry vtabs).
 
 mod app;
+mod appsgen;
 mod db;
+mod forms;
 mod qbe;
 mod remote;
 mod report;
@@ -22,7 +24,22 @@ use crate::db::{DbLink, EmbeddedDb};
 use crate::remote::RemoteDb;
 
 fn main() -> std::io::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| ":memory:".into());
+    // phosphor [--app [name]] <file.db | http(s)://sqld>
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut app_mode = false;
+    let mut app_name: Option<String> = None;
+    if let Some(i) = args.iter().position(|a| a == "--app") {
+        app_mode = true;
+        args.remove(i);
+        // `--app crm file.db`: a non-path next arg is the app name.
+        if i < args.len() && !args[i].contains('.') && !args[i].starts_with("http") {
+            app_name = Some(args.remove(i));
+        }
+    }
+    let path = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| ":memory:".into());
     // `phosphor file.db` = embedded; `phosphor http://host:8880` = sqld
     // over Hrana HTTP (PHOSPHOR_TOKEN for authenticated servers).
     let (link, warning): (Box<dyn DbLink>, Option<String>) =
@@ -44,6 +61,13 @@ fn main() -> std::io::Result<()> {
             }
         };
     let mut app = App::new(link, warning);
+    if app_mode {
+        // The database IS the application (DESIGN.md phase 5).
+        app.app_home = app_name.clone().or_else(|| {
+            crate::appsgen::list_apps(app.db.as_ref()).into_iter().next()
+        });
+        app.apply(app::Command::OpenAppMenu(app.app_home.clone()));
+    }
 
     let mut terminal = ratatui::init();
     let result = loop {

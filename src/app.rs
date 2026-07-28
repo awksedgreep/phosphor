@@ -6,7 +6,9 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::db::{ColumnInfo, DbLink, PValue, TableInfo};
+use crate::forms::{FormSpec, FormState};
 use crate::qbe::{QbeSpec, QbeState};
 use crate::report::{self, PagerState, ReportSpec, ReportState};
 use crate::theme::{self, Theme};
@@ -29,6 +31,9 @@ pub enum Overlay {
     Qbe(QbeState),
     Report(ReportState),
     Pager(PagerState),
+    Form(FormState),
+    Apps(AppDesignState),
+    AppMenu(AppMenuState),
 }
 
 /// Phase 3: the dbhealth console — the report rendered as a system
@@ -46,6 +51,10 @@ pub struct EditState {
     pub table: String,
     pub rowid: i64,
     pub fields: Vec<(ColumnInfo, PValue)>,
+    /// Display labels (custom when a crafted form exists for the table).
+    pub labels: Vec<String>,
+    /// Required-ness per field (from the crafted form; save enforces).
+    pub required: Vec<bool>,
     /// Edited text per field; None = untouched.
     pub inputs: Vec<Option<String>>,
     pub cursor: usize,
@@ -158,12 +167,21 @@ pub enum Command {
     DesignerCommit,
     DesignerRun,
     DesignerSave,
+    DesignerAdd,
+    DesignerDelete,
+    DesignerSwap(i64),
+    DesignerEditAlt,
     PagerScroll(i64),
     PagerWrite,
+    OpenForm(Option<String>),
+    OpenApps(Option<String>),
+    OpenAppMenu(Option<String>),
 }
 
 pub struct App {
     pub db: Box<dyn DbLink>,
+    /// Set by `--app`: Esc at top level returns to this app's menu.
+    pub app_home: Option<String>,
     pub theme: &'static Theme,
     pub focus: Focus,
     pub overlay: Overlay,
@@ -185,6 +203,7 @@ impl App {
     pub fn new(db: Box<dyn DbLink>, warning: Option<String>) -> Self {
         let mut app = App {
             db,
+            app_home: None,
             theme: &theme::GREEN,
             focus: Focus::Sidebar,
             overlay: Overlay::None,
@@ -309,6 +328,54 @@ impl App {
                 _ => return None,
             });
         }
+        if let Overlay::Form(st) = &self.overlay {
+            return Some(match (&st.editing, key.code) {
+                (Some(_), Enter) => Command::DesignerCommit,
+                (Some(_), Esc) => Command::Back,
+                (Some(_), Backspace) => Command::DesignerBackspace,
+                (Some(_), Char(c)) => Command::DesignerChar(c),
+                (None, Up) => Command::DesignerMove(-1),
+                (None, Down) => Command::DesignerMove(1),
+                (None, Char(' ')) => Command::DesignerToggle,
+                (None, Char('r')) => Command::DesignerCycle,
+                (None, Char('[')) => Command::DesignerSwap(-1),
+                (None, Char(']')) => Command::DesignerSwap(1),
+                (None, Enter) => Command::DesignerEditBegin,
+                (None, F(6)) => Command::DesignerSave,
+                (None, Esc) => Command::Back,
+                _ => return None,
+            });
+        }
+        if let Overlay::Apps(st) = &self.overlay {
+            return Some(match (&st.editing, key.code) {
+                (Some(_), Enter) => Command::DesignerCommit,
+                (Some(_), Esc) => Command::Back,
+                (Some(_), Backspace) => Command::DesignerBackspace,
+                (Some(_), Char(c)) => Command::DesignerChar(c),
+                (None, Up) => Command::DesignerMove(-1),
+                (None, Down) => Command::DesignerMove(1),
+                (None, Char('n')) => Command::DesignerAdd,
+                (None, Char('x')) => Command::DesignerDelete,
+                (None, Char('c')) => Command::DesignerCycle,
+                (None, Enter) => Command::DesignerEditBegin,
+                (None, Char('e') | Tab) => Command::DesignerEditAlt,
+                (None, Char('[')) => Command::DesignerSwap(-1),
+                (None, Char(']')) => Command::DesignerSwap(1),
+                (None, F(2)) => Command::DesignerRun,
+                (None, Esc) => Command::Back,
+                _ => return None,
+            });
+        }
+        if matches!(self.overlay, Overlay::AppMenu(_)) {
+            return Some(match key.code {
+                Esc | Char('0') => Command::Back,
+                Up => Command::DesignerMove(-1),
+                Down => Command::DesignerMove(1),
+                Enter => Command::DesignerRun,
+                Char(c) => Command::DesignerChar(c), // hotkey jump-and-run
+                _ => return None,
+            });
+        }
         if key.code == F(1) {
             return Some(Command::Help);
         }
@@ -336,6 +403,8 @@ impl App {
                 Char('Q') => Command::OpenQbe(None),
                 Char('R') => Command::OpenReport(None),
                 Char('L') => Command::OpenLabels(None),
+                Char('F') => Command::OpenForm(None),
+                Char('A') => Command::OpenApps(None),
                 Char('.') => Command::Focus(Focus::Prompt),
                 Tab => {
                     if self.grid.is_some() {
@@ -364,6 +433,8 @@ impl App {
                 Char('Q') => Command::OpenQbe(None),
                 Char('R') => Command::OpenReport(None),
                 Char('L') => Command::OpenLabels(None),
+                Char('F') => Command::OpenForm(None),
+                Char('A') => Command::OpenApps(None),
                 Char('.') => Command::Focus(Focus::Prompt),
                 Tab => Command::Focus(Focus::Prompt),
                 _ => return None,
@@ -504,6 +575,13 @@ impl App {
                     }
                 }
             }
+            Command::DesignerAdd => self.designer_add(),
+            Command::DesignerDelete => self.designer_delete(),
+            Command::DesignerSwap(d) => self.designer_swap(d),
+            Command::DesignerEditAlt => self.designer_edit_alt(),
+            Command::OpenForm(t) => self.open_form(t),
+            Command::OpenApps(name) => self.open_apps(name),
+            Command::OpenAppMenu(name) => self.open_app_menu(name),
         }
     }
 
@@ -515,12 +593,17 @@ impl App {
                 st.naming = false;
             }
             Overlay::Report(st) if st.editing.is_some() => st.editing = None,
+            Overlay::Form(st) if st.editing.is_some() => st.editing = None,
+            Overlay::Apps(st) if st.editing.is_some() => st.editing = None,
             Overlay::Edit(_)
             | Overlay::Help
             | Overlay::Health(_)
             | Overlay::Qbe(_)
             | Overlay::Report(_)
-            | Overlay::Pager(_) => self.overlay = Overlay::None,
+            | Overlay::Pager(_)
+            | Overlay::Form(_)
+            | Overlay::Apps(_)
+            | Overlay::AppMenu(_) => self.overlay = Overlay::None,
             Overlay::None => match self.focus {
                 Focus::Prompt => {
                     self.focus = if self.grid.is_some() {
@@ -530,7 +613,11 @@ impl App {
                     }
                 }
                 Focus::Grid => self.focus = Focus::Sidebar,
-                Focus::Sidebar => self.say("q quits (Esc has nothing to back out of)"),
+                Focus::Sidebar => match self.app_home.clone() {
+                    // App mode: the top level IS the application menu.
+                    Some(home) => self.open_app_menu(Some(home)),
+                    None => self.say("q quits (Esc has nothing to back out of)"),
+                },
             },
         }
     }
@@ -765,16 +852,17 @@ impl App {
     }
 
     fn designer_move(&mut self, d: i64) {
+        fn wrap(cursor: &mut usize, d: i64, n: usize) {
+            if n > 0 {
+                *cursor = (*cursor as i64 + d).rem_euclid(n as i64) as usize;
+            }
+        }
         match &mut self.overlay {
-            Overlay::Qbe(st) => {
-                let n = st.spec.cols.len() as i64;
-                if n > 0 {
-                    st.cursor = (st.cursor as i64 + d).rem_euclid(n) as usize;
-                }
-            }
-            Overlay::Report(st) => {
-                st.cursor = (st.cursor as i64 + d).rem_euclid(3) as usize;
-            }
+            Overlay::Qbe(st) => wrap(&mut st.cursor, d, st.spec.cols.len()),
+            Overlay::Report(st) => wrap(&mut st.cursor, d, 3),
+            Overlay::Form(st) => wrap(&mut st.cursor, d, st.spec.fields.len()),
+            Overlay::Apps(st) => wrap(&mut st.cursor, d, st.items.len()),
+            Overlay::AppMenu(st) => wrap(&mut st.cursor, d, st.items.len()),
             _ => {}
         }
     }
@@ -784,6 +872,11 @@ impl App {
             Overlay::Qbe(st) => {
                 let col = &mut st.spec.cols[st.cursor];
                 col.show = !col.show;
+            }
+            Overlay::Form(st) => {
+                if let Some(f) = st.spec.fields.get_mut(st.cursor) {
+                    f.include = !f.include;
+                }
             }
             Overlay::Report(st) if st.cursor == 2 => {
                 // Cycle group_by through the source's columns (and off).
@@ -806,9 +899,24 @@ impl App {
     }
 
     fn designer_cycle(&mut self) {
-        if let Overlay::Qbe(st) = &mut self.overlay {
-            let col = &mut st.spec.cols[st.cursor];
-            col.sort = col.sort.cycle();
+        match &mut self.overlay {
+            Overlay::Qbe(st) => {
+                let col = &mut st.spec.cols[st.cursor];
+                col.sort = col.sort.cycle();
+            }
+            Overlay::Form(st) => {
+                if let Some(f) = st.spec.fields.get_mut(st.cursor) {
+                    f.required = !f.required;
+                }
+            }
+            Overlay::Apps(st) => {
+                if let Some(item) = st.items.get_mut(st.cursor) {
+                    item.kind = item.kind.cycle();
+                    let item = item.clone();
+                    let _ = appsgen::update_item(self.db.as_ref(), &item);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -825,39 +933,64 @@ impl App {
                     _ => return, // group_by cycles with Space instead
                 });
             }
+            Overlay::Form(st) => {
+                if let Some(f) = st.spec.fields.get(st.cursor) {
+                    st.editing = Some(f.label.clone());
+                }
+            }
+            Overlay::Apps(st) => {
+                if let Some(item) = st.items.get(st.cursor) {
+                    st.editing_ref = false;
+                    st.editing = Some(item.label.clone());
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn designer_edit_alt(&mut self) {
+        if let Overlay::Apps(st) = &mut self.overlay {
+            if let Some(item) = st.items.get(st.cursor) {
+                st.editing_ref = true;
+                st.editing = Some(item.action_ref.clone());
+            }
+        }
+    }
+
+    fn designer_buffer(&mut self) -> Option<&mut String> {
+        match &mut self.overlay {
+            Overlay::Qbe(st) => st.editing.as_mut(),
+            Overlay::Report(st) => st.editing.as_mut(),
+            Overlay::Form(st) => st.editing.as_mut(),
+            Overlay::Apps(st) => st.editing.as_mut(),
+            _ => None,
         }
     }
 
     fn designer_char(&mut self, c: char) {
-        match &mut self.overlay {
-            Overlay::Qbe(st) => {
-                if let Some(buf) = &mut st.editing {
-                    buf.push(c);
-                }
+        // AppMenu has no buffer: letters are dBASE-style hotkeys (jump
+        // to the first item whose label starts with the letter and run).
+        if let Overlay::AppMenu(st) = &mut self.overlay {
+            let hit = st.items.iter().position(|i| {
+                i.label
+                    .chars()
+                    .next()
+                    .is_some_and(|f| f.eq_ignore_ascii_case(&c))
+            });
+            if let Some(idx) = hit {
+                st.cursor = idx;
+                self.designer_run();
             }
-            Overlay::Report(st) => {
-                if let Some(buf) = &mut st.editing {
-                    buf.push(c);
-                }
-            }
-            _ => {}
+            return;
+        }
+        if let Some(buf) = self.designer_buffer() {
+            buf.push(c);
         }
     }
 
     fn designer_backspace(&mut self) {
-        match &mut self.overlay {
-            Overlay::Qbe(st) => {
-                if let Some(buf) = &mut st.editing {
-                    buf.pop();
-                }
-            }
-            Overlay::Report(st) => {
-                if let Some(buf) = &mut st.editing {
-                    buf.pop();
-                }
-            }
-            _ => {}
+        if let Some(buf) = self.designer_buffer() {
+            buf.pop();
         }
     }
 
@@ -892,6 +1025,26 @@ impl App {
                             st.columns = cols;
                         }
                         return;
+                    }
+                }
+            }
+            Overlay::Form(st) => {
+                if let Some(buf) = st.editing.take() {
+                    if let Some(f) = st.spec.fields.get_mut(st.cursor) {
+                        f.label = buf;
+                    }
+                }
+            }
+            Overlay::Apps(st) => {
+                if let Some(buf) = st.editing.take() {
+                    if let Some(item) = st.items.get_mut(st.cursor) {
+                        if st.editing_ref {
+                            item.action_ref = buf;
+                        } else {
+                            item.label = buf;
+                        }
+                        let item = item.clone();
+                        let _ = appsgen::update_item(self.db.as_ref(), &item);
                     }
                 }
             }
@@ -933,7 +1086,64 @@ impl App {
                     Err(e) => self.err(e),
                 }
             }
+            Overlay::Apps(st) => {
+                let app = st.app.clone();
+                self.open_app_menu(Some(app));
+            }
+            Overlay::AppMenu(st) => {
+                if let Some(item) = st.items.get(st.cursor) {
+                    self.app_run_item(&item.clone());
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn app_run_item(&mut self, item: &AppItem) {
+        match item.kind {
+            ActionKind::Browse => {
+                let table = item.action_ref.clone();
+                self.overlay = Overlay::None;
+                self.open_table(&table);
+            }
+            ActionKind::Query => {
+                match QbeSpec::saved_sql(self.db.as_ref(), &item.action_ref) {
+                    Some(sql) => {
+                        self.overlay = Overlay::None;
+                        self.run_select(&sql);
+                    }
+                    None => self.err(format!(
+                        "no saved query named {:?} (QBE F6 saves one)",
+                        item.action_ref
+                    )),
+                }
+            }
+            ActionKind::Report => {
+                let spec = ReportSpec::load(self.db.as_ref(), &item.action_ref)
+                    .unwrap_or_else(|| ReportSpec::for_table(&item.action_ref));
+                match report::render(self.db.as_ref(), &spec) {
+                    Ok(lines) => {
+                        self.overlay = Overlay::Pager(PagerState {
+                            title: format!("REPORT · {}", spec.title),
+                            lines,
+                            offset: 0,
+                            file_stem: format!("report_{}", spec.name),
+                        })
+                    }
+                    Err(e) => self.err(e),
+                }
+            }
+            ActionKind::Sql => match self.db.execute(&item.action_ref) {
+                Ok((n, elapsed)) => {
+                    self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
+                    self.reload_tables();
+                    self.say(match n {
+                        -1 => "ok".to_owned(),
+                        n => format!("ok, {n} row(s) affected"),
+                    });
+                }
+                Err(e) => self.err(e),
+            },
         }
     }
 
@@ -952,8 +1162,131 @@ impl App {
                     Err(e) => self.err(e),
                 }
             }
+            Overlay::Form(st) => {
+                let spec = st.spec.clone();
+                match spec.save(self.db.as_ref()) {
+                    Ok(()) => self.say(format!(
+                        "saved form for {:?} — EDIT uses it from now on",
+                        spec.table
+                    )),
+                    Err(e) => self.err(e),
+                }
+            }
             _ => {}
         }
+    }
+
+    fn designer_add(&mut self) {
+        if let Overlay::Apps(st) = &self.overlay {
+            let app = st.app.clone();
+            match appsgen::add_item(self.db.as_ref(), &app, "New item") {
+                Ok(()) => self.apps_reload(&app),
+                Err(e) => self.err(e),
+            }
+        }
+    }
+
+    fn designer_delete(&mut self) {
+        if let Overlay::Apps(st) = &self.overlay {
+            let app = st.app.clone();
+            if let Some(item) = st.items.get(st.cursor) {
+                match appsgen::delete_item(self.db.as_ref(), item.id) {
+                    Ok(()) => self.apps_reload(&app),
+                    Err(e) => self.err(e),
+                }
+            }
+        }
+    }
+
+    fn designer_swap(&mut self, d: i64) {
+        match &mut self.overlay {
+            Overlay::Form(st) => {
+                let n = st.spec.fields.len() as i64;
+                let to = st.cursor as i64 + d;
+                if to >= 0 && to < n {
+                    st.spec.fields.swap(st.cursor, to as usize);
+                    st.cursor = to as usize;
+                }
+            }
+            Overlay::Apps(st) => {
+                let to = st.cursor as i64 + d;
+                if to >= 0 && (to as usize) < st.items.len() {
+                    let (a, b) = (st.items[st.cursor].clone(), st.items[to as usize].clone());
+                    let app = st.app.clone();
+                    let cursor_to = to as usize;
+                    match appsgen::swap_items(self.db.as_ref(), &a, &b) {
+                        Ok(()) => {
+                            self.apps_reload(&app);
+                            if let Overlay::Apps(st) = &mut self.overlay {
+                                st.cursor = cursor_to;
+                            }
+                        }
+                        Err(e) => self.err(e),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apps_reload(&mut self, app: &str) {
+        let items = appsgen::items(self.db.as_ref(), app);
+        if let Overlay::Apps(st) = &mut self.overlay {
+            st.items = items;
+            st.cursor = st.cursor.min(st.items.len().saturating_sub(1));
+        }
+    }
+
+    fn open_form(&mut self, table: Option<String>) {
+        let Some(table) = self.target_table(table) else {
+            return self.err("form: no table selected (form <table>)");
+        };
+        let spec = FormSpec::load(self.db.as_ref(), &table)
+            .map(Ok)
+            .unwrap_or_else(|| FormSpec::new(self.db.as_ref(), &table));
+        match spec {
+            Ok(spec) => {
+                self.overlay = Overlay::Form(FormState {
+                    spec,
+                    cursor: 0,
+                    editing: None,
+                })
+            }
+            Err(e) => self.err(e),
+        }
+    }
+
+    fn open_apps(&mut self, name: Option<String>) {
+        let name = name
+            .or_else(|| appsgen::list_apps(self.db.as_ref()).into_iter().next())
+            .unwrap_or_else(|| "app".to_owned());
+        if let Err(e) = appsgen::ensure_app(self.db.as_ref(), &name) {
+            return self.err(e);
+        }
+        let items = appsgen::items(self.db.as_ref(), &name);
+        self.overlay = Overlay::Apps(AppDesignState {
+            app: name,
+            items,
+            cursor: 0,
+            editing: None,
+            editing_ref: false,
+        });
+    }
+
+    fn open_app_menu(&mut self, name: Option<String>) {
+        let Some(name) = name.or_else(|| appsgen::list_apps(self.db.as_ref()).into_iter().next())
+        else {
+            return self.err("no apps in this database yet — press A to craft one");
+        };
+        let items = appsgen::items(self.db.as_ref(), &name);
+        if items.is_empty() {
+            return self.err(format!("app {name:?} has no items yet — A to design"));
+        }
+        self.overlay = Overlay::AppMenu(AppMenuState {
+            app: name,
+            items,
+            cursor: 0,
+        });
     }
 
     /// Run a SELECT into the query grid (shared by prompt + QBE + apps).
@@ -1125,17 +1458,42 @@ impl App {
             return;
         };
         let name = name.clone();
+        let row: Vec<PValue> = row.clone();
         let cols = match self.db.columns(&name) {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
-        let fields: Vec<(ColumnInfo, PValue)> =
-            cols.into_iter().zip(row.iter().cloned()).collect();
+        let mut fields: Vec<(ColumnInfo, PValue)> =
+            cols.into_iter().zip(row.into_iter()).collect();
+        let mut labels: Vec<String> = fields.iter().map(|(c, _)| c.name.clone()).collect();
+        let mut required: Vec<bool> = vec![false; fields.len()];
+
+        // A crafted form (phase 5) reorders, relabels, hides, requires.
+        if let Some(spec) = FormSpec::load(self.db.as_ref(), &name) {
+            let mut ordered = Vec::new();
+            let mut new_labels = Vec::new();
+            let mut new_required = Vec::new();
+            for f in spec.fields.iter().filter(|f| f.include) {
+                if let Some(idx) = fields.iter().position(|(c, _)| c.name == f.column) {
+                    ordered.push(fields[idx].clone());
+                    new_labels.push(f.label.clone());
+                    new_required.push(f.required);
+                }
+            }
+            if !ordered.is_empty() {
+                fields = ordered;
+                labels = new_labels;
+                required = new_required;
+            }
+        }
+
         let n = fields.len();
         self.overlay = Overlay::Edit(EditState {
             table: name,
             rowid,
             fields,
+            labels,
+            required,
             inputs: vec![None; n],
             cursor: 0,
             editing: None,
@@ -1143,6 +1501,25 @@ impl App {
     }
 
     fn edit_save(&mut self) {
+        // Required validation (crafted forms): the FINAL value of every
+        // required field must be non-NULL, edited or not.
+        if let Overlay::Edit(ed) = &self.overlay {
+            for (i, req) in ed.required.iter().enumerate() {
+                if !req {
+                    continue;
+                }
+                let is_null = match &ed.inputs[i] {
+                    Some(text) => {
+                        PValue::parse(text, &ed.fields[i].0.decl_type) == PValue::Null
+                    }
+                    None => ed.fields[i].1 == PValue::Null,
+                };
+                if is_null {
+                    let label = ed.labels[i].clone();
+                    return self.err(format!("{label:?} is required"));
+                }
+            }
+        }
         let payload = match &self.overlay {
             Overlay::Edit(ed) if !ed.dirty() => None,
             Overlay::Edit(ed) => {
@@ -1248,6 +1625,21 @@ impl App {
                 Some(sql) => self.run_select(&sql),
                 None => self.err(format!("no saved query named {name:?}")),
             };
+        }
+        if let Some(rest) = line.strip_prefix("form") {
+            let t = rest.trim();
+            return self.open_form((!t.is_empty()).then(|| t.to_owned()));
+        }
+        if let Some(rest) = line.strip_prefix("apps") {
+            let t = rest.trim();
+            return self.open_apps((!t.is_empty()).then(|| t.to_owned()));
+        }
+        if let Some(rest) = line.strip_prefix("app ") {
+            let t = rest.trim();
+            return self.open_app_menu((!t.is_empty()).then(|| t.to_owned()));
+        }
+        if line == "app" {
+            return self.open_app_menu(None);
         }
         if line == "tables" {
             self.reload_tables();
@@ -1425,6 +1817,78 @@ mod tests {
         assert!(text.contains("TOTAL (500 rows)"), "grand totals");
         // id column 1..=500 sums to 125250.
         assert!(text.contains("125250"), "numeric column summed");
+    }
+
+    #[test]
+    fn crafted_form_reorders_relabels_and_requires() {
+        let mut a = app();
+        // Craft a form for t: hide a, relabel b, make it required.
+        a.apply(Command::OpenForm(Some("t".into())));
+        let Overlay::Form(st) = &mut a.overlay else {
+            panic!("form designer did not open");
+        };
+        st.spec.fields[0].include = false; // hide id column a
+        st.spec.fields[1].label = "Row name".into();
+        st.spec.fields[1].required = true;
+        a.apply(Command::DesignerSave);
+        a.apply(Command::Back);
+
+        // EDIT now shows one field, custom label, and enforces required.
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenEdit);
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("edit did not open");
+        };
+        assert_eq!(ed.fields.len(), 1, "hidden field is gone");
+        assert_eq!(ed.labels[0], "Row name");
+        assert!(ed.required[0]);
+        // Blank the required field → save must refuse.
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        a.apply(Command::EditCommitField);
+        a.apply(Command::EditSave);
+        assert!(
+            matches!(a.overlay, Overlay::Edit(_)),
+            "save must be refused while required field is blank"
+        );
+        assert!(a.status.as_ref().is_some_and(|(m, err)| *err
+            && m.contains("required")));
+    }
+
+    #[test]
+    fn applications_generator_end_to_end() {
+        let mut a = app();
+        // Craft an app: one browse item pointing at t, one sql item.
+        a.apply(Command::OpenApps(Some("crm".into())));
+        a.apply(Command::DesignerAdd);
+        a.apply(Command::DesignerEditBegin);
+        if let Overlay::Apps(st) = &mut a.overlay {
+            st.editing = Some("Rows".into());
+        }
+        a.apply(Command::DesignerCommit);
+        a.apply(Command::DesignerEditAlt);
+        if let Overlay::Apps(st) = &mut a.overlay {
+            st.editing = Some("t".into());
+        }
+        a.apply(Command::DesignerCommit);
+        // F2: designer → live menu.
+        a.apply(Command::DesignerRun);
+        assert!(matches!(a.overlay, Overlay::AppMenu(_)));
+        // Hotkey 'r' (first letter of "Rows") runs the browse action.
+        a.apply(Command::DesignerChar('r'));
+        assert!(matches!(a.overlay, Overlay::None));
+        assert!(matches!(
+            a.grid.as_ref().unwrap().source,
+            GridSource::Table { .. }
+        ));
+        assert_eq!(a.grid.as_ref().unwrap().total, 500);
+        // App-mode Esc-at-top returns to the menu.
+        a.app_home = Some("crm".into());
+        a.apply(Command::Back); // grid → sidebar
+        a.apply(Command::Back); // sidebar → app menu (app mode)
+        assert!(matches!(a.overlay, Overlay::AppMenu(_)));
     }
 
     #[test]
