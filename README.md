@@ -66,13 +66,24 @@ means what you think it means.
 
 ## Status
 
-**Pre-alpha: a splash screen and a manifesto.** The design is real, though —
-see [DESIGN.md](DESIGN.md) for the dBASE IV feature revival map, the
-architecture, and the phasing.
+**Phase 1 — the browser — works today:**
 
 ```sh
-cargo run   # q or Esc to exit — that part works already
+cargo run -- path/to/any.db
 ```
+
+Schema sidebar (tables ▪ and views ◇), virtualized **BROWSE** grid that
+pages through millions of rows, **EDIT** record form on Enter (PICTURE-
+style ¶ pk / * not-null markers, typed parsing, Esc backs out safely), a
+live **dot prompt** (`.`) running real SQL with history, four themes
+(`set theme green|amber|paper|blue`), F1 help, and a status bar with
+query latency — plus a dbhealth dot when the database carries
+[timeless-libsql](https://github.com/awksedgreep/timeless-libsql)
+telemetry (`PHOSPHOR_EXT=/path/to/libtimeless_ext.so` to load it).
+
+See [DESIGN.md](DESIGN.md) for the feature revival map, the architecture,
+and phases 2–5 (remote sqld, the dbhealth console, QBE + banded reports,
+forms + the applications generator).
 
 ## License
 

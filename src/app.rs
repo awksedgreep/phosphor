@@ -1,0 +1,804 @@
+//! App state + the command bus (DESIGN.md, scripting-ready rule 1).
+//!
+//! Keys become `Command`s; `apply` is the ONLY place state changes. A
+//! future script emits the same commands through the same function and
+//! inherits every behavior and check for free.
+
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::db::{ColumnInfo, DbLink, PValue, TableInfo};
+use crate::theme::{self, Theme};
+
+const OVERSCAN: i64 = 64;
+const WIDTH_SAMPLE: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Focus {
+    Sidebar,
+    Grid,
+    Prompt,
+}
+
+pub enum Overlay {
+    None,
+    Help,
+    Edit(EditState),
+}
+
+pub struct EditState {
+    pub table: String,
+    pub rowid: i64,
+    pub fields: Vec<(ColumnInfo, PValue)>,
+    /// Edited text per field; None = untouched.
+    pub inputs: Vec<Option<String>>,
+    pub cursor: usize,
+    /// Some(buffer) while a field is being typed into.
+    pub editing: Option<String>,
+}
+
+impl EditState {
+    pub fn dirty(&self) -> bool {
+        self.inputs.iter().any(Option::is_some)
+    }
+}
+
+pub enum GridSource {
+    Table {
+        name: String,
+        editable: bool,
+    },
+    Query {
+        truncated: bool,
+    },
+}
+
+pub struct Grid {
+    pub source: GridSource,
+    pub columns: Vec<String>,
+    pub total: i64,
+    /// Cached rows; for Query sources this is ALL rows (cache_start 0).
+    pub cache: Vec<Vec<PValue>>,
+    pub cache_start: i64,
+    pub rowids: Option<Vec<i64>>,
+    pub cur_row: i64,
+    pub cur_col: usize,
+    pub row_off: i64,
+    pub col_off: usize,
+    pub widths: Vec<u16>,
+}
+
+impl Grid {
+    pub fn row(&self, abs: i64) -> Option<&Vec<PValue>> {
+        let idx = abs.checked_sub(self.cache_start)?;
+        self.cache.get(idx as usize)
+    }
+
+    fn compute_widths(&mut self) {
+        self.widths = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(c, name)| {
+                let mut w = name.len();
+                for row in self.cache.iter().take(WIDTH_SAMPLE) {
+                    if let Some(v) = row.get(c) {
+                        w = w.max(v.render().chars().count());
+                    }
+                }
+                w.clamp(4, 24) as u16
+            })
+            .collect();
+    }
+}
+
+pub struct Prompt {
+    pub input: String,
+    pub cursor: usize,
+    pub history: Vec<String>,
+    hist_pos: Option<usize>,
+}
+
+/// The command bus. Everything a user (or someday a script) can do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Command {
+    Quit,
+    Focus(Focus),
+    Back,
+    Help,
+    Refresh,
+    SidebarMove(i64),
+    OpenSelected,
+    GridMove { dr: i64, dc: i64 },
+    GridPage(i64),
+    GridEdge(bool),
+    GridTop,
+    GridBottom,
+    OpenEdit,
+    EditMove(i64),
+    EditBegin,
+    EditChar(char),
+    EditBackspace,
+    EditCommitField,
+    EditSave,
+    PromptChar(char),
+    PromptBackspace,
+    PromptMove(i64),
+    PromptHistory(i64),
+    PromptRun,
+}
+
+pub struct App {
+    pub db: Box<dyn DbLink>,
+    pub theme: &'static Theme,
+    pub focus: Focus,
+    pub overlay: Overlay,
+    pub tables: Vec<TableInfo>,
+    pub sidebar_idx: usize,
+    pub grid: Option<Grid>,
+    pub prompt: Prompt,
+    /// (message, is_error) for the status line.
+    pub status: Option<(String, bool)>,
+    pub last_ms: Option<f64>,
+    pub health: Option<String>,
+    pub quit: bool,
+    /// Grid viewport height, reported back by the renderer each frame.
+    pub visible_rows: i64,
+    pub visible_cols_width: u16,
+}
+
+impl App {
+    pub fn new(db: Box<dyn DbLink>, warning: Option<String>) -> Self {
+        let mut app = App {
+            db,
+            theme: &theme::GREEN,
+            focus: Focus::Sidebar,
+            overlay: Overlay::None,
+            tables: Vec::new(),
+            sidebar_idx: 0,
+            grid: None,
+            prompt: Prompt {
+                input: String::new(),
+                cursor: 0,
+                history: Vec::new(),
+                hist_pos: None,
+            },
+            status: warning.map(|w| (w, true)),
+            last_ms: None,
+            health: None,
+            quit: false,
+            visible_rows: 20,
+            visible_cols_width: 80,
+        };
+        app.reload_tables();
+        app.health = app.db.health();
+        app
+    }
+
+    fn say(&mut self, msg: impl Into<String>) {
+        self.status = Some((msg.into(), false));
+    }
+
+    fn err(&mut self, msg: impl Into<String>) {
+        self.status = Some((msg.into(), true));
+    }
+
+    fn reload_tables(&mut self) {
+        match self.db.tables() {
+            Ok(t) => {
+                self.tables = t;
+                self.sidebar_idx = self.sidebar_idx.min(self.tables.len().saturating_sub(1));
+            }
+            Err(e) => self.err(e),
+        }
+    }
+
+    // ── key → command (pure mapping; no state changes here) ──────────
+
+    pub fn map_key(&self, key: KeyEvent) -> Option<Command> {
+        use KeyCode::*;
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == Char('q') {
+            return Some(Command::Quit);
+        }
+        if let Overlay::Edit(ed) = &self.overlay {
+            return Some(match (&ed.editing, key.code) {
+                (Some(_), Enter) => Command::EditCommitField,
+                (Some(_), Esc) => Command::Back,
+                (Some(_), Backspace) => Command::EditBackspace,
+                (Some(_), Char(c)) => Command::EditChar(c),
+                (None, Up) => Command::EditMove(-1),
+                (None, Down) => Command::EditMove(1),
+                (None, Enter) => Command::EditBegin,
+                (None, F(10)) => Command::EditSave,
+                (None, Char('s')) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Command::EditSave
+                }
+                (None, Esc) => Command::Back,
+                _ => return None,
+            });
+        }
+        if matches!(self.overlay, Overlay::Help) {
+            return matches!(key.code, Esc | Enter | F(1) | Char('q'))
+                .then_some(Command::Back);
+        }
+        if key.code == F(1) {
+            return Some(Command::Help);
+        }
+        match self.focus {
+            Focus::Prompt => Some(match key.code {
+                Enter => Command::PromptRun,
+                Esc => Command::Back,
+                Backspace => Command::PromptBackspace,
+                Left => Command::PromptMove(-1),
+                Right => Command::PromptMove(1),
+                Up => Command::PromptHistory(-1),
+                Down => Command::PromptHistory(1),
+                Tab => Command::Focus(Focus::Sidebar),
+                Char(c) => Command::PromptChar(c),
+                _ => return None,
+            }),
+            Focus::Sidebar => Some(match key.code {
+                Char('q') => Command::Quit,
+                Up | Char('k') => Command::SidebarMove(-1),
+                Down | Char('j') => Command::SidebarMove(1),
+                Enter => Command::OpenSelected,
+                Char('.') => Command::Focus(Focus::Prompt),
+                Tab => {
+                    if self.grid.is_some() {
+                        Command::Focus(Focus::Grid)
+                    } else {
+                        Command::Focus(Focus::Prompt)
+                    }
+                }
+                Char('r') => Command::Refresh,
+                _ => return None,
+            }),
+            Focus::Grid => Some(match key.code {
+                Esc => Command::Back,
+                Up | Char('k') => Command::GridMove { dr: -1, dc: 0 },
+                Down | Char('j') => Command::GridMove { dr: 1, dc: 0 },
+                Left | Char('h') => Command::GridMove { dr: 0, dc: -1 },
+                Right | Char('l') => Command::GridMove { dr: 0, dc: 1 },
+                PageUp => Command::GridPage(-1),
+                PageDown => Command::GridPage(1),
+                Home => Command::GridEdge(false),
+                End => Command::GridEdge(true),
+                Char('g') => Command::GridTop,
+                Char('G') => Command::GridBottom,
+                Enter => Command::OpenEdit,
+                F(5) => Command::Refresh,
+                Char('.') => Command::Focus(Focus::Prompt),
+                Tab => Command::Focus(Focus::Prompt),
+                _ => return None,
+            }),
+        }
+    }
+
+    // ── the bus ──────────────────────────────────────────────────────
+
+    pub fn apply(&mut self, cmd: Command) {
+        match cmd {
+            Command::Quit => self.quit = true,
+            Command::Focus(f) => self.focus = f,
+            Command::Back => self.back(),
+            Command::Help => self.overlay = Overlay::Help,
+            Command::Refresh => self.refresh(),
+            Command::SidebarMove(d) => {
+                let n = self.tables.len() as i64;
+                if n > 0 {
+                    self.sidebar_idx =
+                        (self.sidebar_idx as i64 + d).rem_euclid(n) as usize;
+                }
+            }
+            Command::OpenSelected => self.open_selected(),
+            Command::GridMove { dr, dc } => self.grid_move(dr, dc),
+            Command::GridPage(dir) => self.grid_move(dir * self.visible_rows.max(1), 0),
+            Command::GridEdge(end) => {
+                if let Some(g) = &mut self.grid {
+                    g.cur_col = if end { g.columns.len().saturating_sub(1) } else { 0 };
+                }
+                self.grid_move(0, 0);
+            }
+            Command::GridTop => self.grid_jump(0),
+            Command::GridBottom => {
+                let total = self.grid.as_ref().map_or(0, |g| g.total);
+                self.grid_jump(total.saturating_sub(1));
+            }
+            Command::OpenEdit => self.open_edit(),
+            Command::EditMove(d) => {
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    let n = ed.fields.len() as i64;
+                    if n > 0 {
+                        ed.cursor = (ed.cursor as i64 + d).rem_euclid(n) as usize;
+                    }
+                }
+            }
+            Command::EditBegin => {
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    let current = ed.inputs[ed.cursor].clone().unwrap_or_else(|| {
+                        match &ed.fields[ed.cursor].1 {
+                            PValue::Null => String::new(),
+                            v => v.render(),
+                        }
+                    });
+                    ed.editing = Some(current);
+                }
+            }
+            Command::EditChar(c) => {
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    if let Some(buf) = &mut ed.editing {
+                        buf.push(c);
+                    }
+                }
+            }
+            Command::EditBackspace => {
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    if let Some(buf) = &mut ed.editing {
+                        buf.pop();
+                    }
+                }
+            }
+            Command::EditCommitField => {
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    if let Some(buf) = ed.editing.take() {
+                        ed.inputs[ed.cursor] = Some(buf);
+                    }
+                }
+            }
+            Command::EditSave => self.edit_save(),
+            Command::PromptChar(c) => {
+                let cur = self.prompt.cursor;
+                self.prompt.input.insert(
+                    self.prompt
+                        .input
+                        .char_indices()
+                        .nth(cur)
+                        .map_or(self.prompt.input.len(), |(i, _)| i),
+                    c,
+                );
+                self.prompt.cursor += 1;
+            }
+            Command::PromptBackspace => {
+                if self.prompt.cursor > 0 {
+                    let idx = self
+                        .prompt
+                        .input
+                        .char_indices()
+                        .nth(self.prompt.cursor - 1)
+                        .map(|(i, _)| i);
+                    if let Some(i) = idx {
+                        self.prompt.input.remove(i);
+                        self.prompt.cursor -= 1;
+                    }
+                }
+            }
+            Command::PromptMove(d) => {
+                let len = self.prompt.input.chars().count();
+                self.prompt.cursor =
+                    (self.prompt.cursor as i64 + d).clamp(0, len as i64) as usize;
+            }
+            Command::PromptHistory(d) => self.prompt_history(d),
+            Command::PromptRun => self.prompt_run(),
+        }
+    }
+
+    fn back(&mut self) {
+        match &mut self.overlay {
+            Overlay::Edit(ed) if ed.editing.is_some() => ed.editing = None,
+            Overlay::Edit(_) | Overlay::Help => self.overlay = Overlay::None,
+            Overlay::None => match self.focus {
+                Focus::Prompt => {
+                    self.focus = if self.grid.is_some() {
+                        Focus::Grid
+                    } else {
+                        Focus::Sidebar
+                    }
+                }
+                Focus::Grid => self.focus = Focus::Sidebar,
+                Focus::Sidebar => self.say("q quits (Esc has nothing to back out of)"),
+            },
+        }
+    }
+
+    fn refresh(&mut self) {
+        self.reload_tables();
+        if let Some(Grid {
+            source: GridSource::Table { name, .. },
+            cur_row,
+            cur_col,
+            ..
+        }) = &self.grid
+        {
+            let (name, row, col) = (name.clone(), *cur_row, *cur_col);
+            self.open_table(&name);
+            if let Some(g) = &mut self.grid {
+                g.cur_col = col.min(g.columns.len().saturating_sub(1));
+            }
+            self.grid_jump(row);
+        }
+        self.health = self.db.health();
+        self.say("refreshed");
+    }
+
+    fn open_selected(&mut self) {
+        if let Some(t) = self.tables.get(self.sidebar_idx) {
+            let name = t.name.clone();
+            self.open_table(&name);
+        }
+    }
+
+    fn open_table(&mut self, name: &str) {
+        let start = std::time::Instant::now();
+        let cols = match self.db.columns(name) {
+            Ok(c) => c,
+            Err(e) => return self.err(e),
+        };
+        let total = match self.db.count(name) {
+            Ok(n) => n,
+            Err(e) => return self.err(e),
+        };
+        let editable = self.db.has_rowid(name);
+        let mut grid = Grid {
+            source: GridSource::Table {
+                name: name.to_owned(),
+                editable,
+            },
+            columns: cols.iter().map(|c| c.name.clone()).collect(),
+            total,
+            cache: Vec::new(),
+            cache_start: 0,
+            rowids: None,
+            cur_row: 0,
+            cur_col: 0,
+            row_off: 0,
+            col_off: 0,
+            widths: Vec::new(),
+        };
+        match self.db.page(name, 0, self.visible_rows + OVERSCAN) {
+            Ok(page) => {
+                grid.cache = page.rows;
+                grid.rowids = page.rowids;
+            }
+            Err(e) => return self.err(e),
+        }
+        grid.compute_widths();
+        self.last_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+        self.grid = Some(grid);
+        self.focus = Focus::Grid;
+        self.health = self.db.health();
+    }
+
+    fn grid_jump(&mut self, row: i64) {
+        if let Some(g) = &mut self.grid {
+            g.cur_row = row.clamp(0, g.total.saturating_sub(1).max(0));
+        }
+        self.grid_move(0, 0);
+    }
+
+    fn grid_move(&mut self, dr: i64, dc: i64) {
+        let visible = self.visible_rows.max(1);
+        let Some(g) = &mut self.grid else { return };
+        if g.total == 0 {
+            return;
+        }
+        g.cur_row = (g.cur_row + dr).clamp(0, g.total - 1);
+        g.cur_col = (g.cur_col as i64 + dc).clamp(0, g.columns.len() as i64 - 1) as usize;
+        if g.cur_row < g.row_off {
+            g.row_off = g.cur_row;
+        }
+        if g.cur_row >= g.row_off + visible {
+            g.row_off = g.cur_row - visible + 1;
+        }
+        // Horizontal: slide col_off until the cursor column fits.
+        if g.cur_col < g.col_off {
+            g.col_off = g.cur_col;
+        }
+        while g.col_off < g.cur_col {
+            let used: u16 = g.widths[g.col_off..=g.cur_col]
+                .iter()
+                .map(|w| w + 1)
+                .sum();
+            if used <= self.visible_cols_width {
+                break;
+            }
+            g.col_off += 1;
+        }
+        self.ensure_cache();
+    }
+
+    /// Virtualization: keep [row_off-OVERSCAN, row_off+visible+OVERSCAN)
+    /// cached for Table sources. Query sources are fully materialized.
+    fn ensure_cache(&mut self) {
+        let visible = self.visible_rows.max(1);
+        let Some(g) = &mut self.grid else { return };
+        let GridSource::Table { name, .. } = &g.source else {
+            return;
+        };
+        let want_start = (g.row_off - OVERSCAN).max(0);
+        let want_end = (g.row_off + visible + OVERSCAN).min(g.total);
+        let have_start = g.cache_start;
+        let have_end = g.cache_start + g.cache.len() as i64;
+        if want_start >= have_start && want_end <= have_end {
+            return;
+        }
+        let name = name.clone();
+        let limit = want_end - want_start;
+        let start = std::time::Instant::now();
+        match self.db.page(&name, want_start, limit) {
+            Ok(page) => {
+                if let Some(g) = &mut self.grid {
+                    g.cache = page.rows;
+                    g.rowids = page.rowids;
+                    g.cache_start = want_start;
+                    if g.widths.is_empty() {
+                        g.compute_widths();
+                    }
+                }
+                self.last_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            Err(e) => self.err(e),
+        }
+    }
+
+    fn open_edit(&mut self) {
+        let Some(g) = &self.grid else { return };
+        let GridSource::Table { name, editable } = &g.source else {
+            return self.say("query results are read-only (Esc to go back)");
+        };
+        if !editable {
+            return self.say("this table has no rowid; BROWSE is read-only here");
+        }
+        let idx = g.cur_row - g.cache_start;
+        let (Some(row), Some(rowids)) = (g.row(g.cur_row), &g.rowids) else {
+            return;
+        };
+        let Some(rowid) = rowids.get(idx as usize).copied() else {
+            return;
+        };
+        let name = name.clone();
+        let cols = match self.db.columns(&name) {
+            Ok(c) => c,
+            Err(e) => return self.err(e),
+        };
+        let fields: Vec<(ColumnInfo, PValue)> =
+            cols.into_iter().zip(row.iter().cloned()).collect();
+        let n = fields.len();
+        self.overlay = Overlay::Edit(EditState {
+            table: name,
+            rowid,
+            fields,
+            inputs: vec![None; n],
+            cursor: 0,
+            editing: None,
+        });
+    }
+
+    fn edit_save(&mut self) {
+        let payload = match &self.overlay {
+            Overlay::Edit(ed) if !ed.dirty() => None,
+            Overlay::Edit(ed) => {
+                let changes: Vec<(String, PValue)> = ed
+                    .fields
+                    .iter()
+                    .zip(&ed.inputs)
+                    .filter_map(|((col, _), input)| {
+                        input.as_ref().map(|text| {
+                            (col.name.clone(), PValue::parse(text, &col.decl_type))
+                        })
+                    })
+                    .collect();
+                Some((ed.table.clone(), ed.rowid, changes))
+            }
+            _ => return,
+        };
+        let Some((table, rowid, changes)) = payload else {
+            self.overlay = Overlay::None;
+            return self.say("no changes");
+        };
+        let n = changes.len();
+        match self.db.update_row(&table, rowid, &changes) {
+            Ok(()) => {
+                self.overlay = Overlay::None;
+                // Invalidate the cache so the grid shows the new truth.
+                if let Some(g) = &mut self.grid {
+                    g.cache.clear();
+                    g.cache_start = g.cur_row;
+                }
+                self.ensure_cache();
+                self.say(format!("saved {n} field(s)"));
+            }
+            Err(e) => self.err(e),
+        }
+    }
+
+    fn prompt_history(&mut self, d: i64) {
+        let len = self.prompt.history.len();
+        if len == 0 {
+            return;
+        }
+        let pos = match (self.prompt.hist_pos, d) {
+            (None, -1) => Some(len - 1),
+            (None, _) => None,
+            (Some(0), -1) => Some(0),
+            (Some(p), -1) => Some(p - 1),
+            (Some(p), _) if p + 1 >= len => None,
+            (Some(p), _) => Some(p + 1),
+        };
+        self.prompt.hist_pos = pos;
+        self.prompt.input = pos
+            .map(|p| self.prompt.history[p].clone())
+            .unwrap_or_default();
+        self.prompt.cursor = self.prompt.input.chars().count();
+    }
+
+    fn prompt_run(&mut self) {
+        let line = self.prompt.input.trim().to_owned();
+        if line.is_empty() {
+            return;
+        }
+        self.prompt.history.push(line.clone());
+        self.prompt.hist_pos = None;
+        self.prompt.input.clear();
+        self.prompt.cursor = 0;
+
+        // App commands first, SQL otherwise.
+        if let Some(rest) = line.strip_prefix("set theme ") {
+            return match Theme::by_name(rest.trim()) {
+                Some(t) => {
+                    self.theme = t;
+                    self.say(format!("theme: {}", t.name));
+                }
+                None => self.err(format!(
+                    "unknown theme {:?}; themes: green, amber, paper, blue",
+                    rest.trim()
+                )),
+            };
+        }
+        if line == "help" {
+            self.overlay = Overlay::Help;
+            return;
+        }
+        if line == "tables" {
+            self.reload_tables();
+            self.focus = Focus::Sidebar;
+            return;
+        }
+
+        let head = line
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(head.as_str(), "select" | "with" | "pragma" | "explain" | "values") {
+            match self.db.query(&line) {
+                Ok(q) => {
+                    self.last_ms = Some(q.elapsed.as_secs_f64() * 1000.0);
+                    let n = q.rows.len();
+                    let mut grid = Grid {
+                        source: GridSource::Query {
+                            truncated: q.truncated,
+                        },
+                        columns: q.columns,
+                        total: n as i64,
+                        cache: q.rows,
+                        cache_start: 0,
+                        rowids: None,
+                        cur_row: 0,
+                        cur_col: 0,
+                        row_off: 0,
+                        col_off: 0,
+                        widths: Vec::new(),
+                    };
+                    grid.compute_widths();
+                    self.grid = Some(grid);
+                    self.focus = Focus::Grid;
+                    self.say(if grid_truncated(&self.grid) {
+                        format!("{n} rows (capped) — add a WHERE or LIMIT")
+                    } else {
+                        format!("{n} row(s)")
+                    });
+                }
+                Err(e) => self.err(e),
+            }
+        } else {
+            match self.db.execute(&line) {
+                Ok((n, elapsed)) => {
+                    self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
+                    self.reload_tables();
+                    self.health = self.db.health();
+                    self.say(match n {
+                        -1 => "ok (batch)".to_owned(),
+                        n => format!("ok, {n} row(s) affected"),
+                    });
+                }
+                Err(e) => self.err(e),
+            }
+        }
+    }
+}
+
+fn grid_truncated(grid: &Option<Grid>) -> bool {
+    matches!(
+        grid,
+        Some(Grid {
+            source: GridSource::Query { truncated: true },
+            ..
+        })
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::EmbeddedDb;
+
+    fn app() -> App {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+             INSERT INTO t(b)
+               WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500)
+               SELECT 'row' || x FROM c;",
+        )
+        .unwrap();
+        App::new(Box::new(db), None)
+    }
+
+    #[test]
+    fn open_browse_navigate_virtualized() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        assert_eq!(a.focus, Focus::Grid);
+        let g = a.grid.as_ref().unwrap();
+        assert_eq!(g.total, 500);
+        a.apply(Command::GridBottom);
+        let g = a.grid.as_ref().unwrap();
+        assert_eq!(g.cur_row, 499);
+        assert!(g.row(499).is_some(), "cache must follow the cursor");
+        a.apply(Command::GridTop);
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 0);
+    }
+
+    #[test]
+    fn prompt_select_becomes_query_grid() {
+        let mut a = app();
+        for c in "select count(*) as n from t".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        let g = a.grid.as_ref().unwrap();
+        assert!(matches!(g.source, GridSource::Query { .. }));
+        assert_eq!(g.row(0).unwrap()[0], PValue::Int(500));
+    }
+
+    #[test]
+    fn edit_round_trip_through_the_bus() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.apply(Command::GridMove { dr: 0, dc: 1 });
+        a.apply(Command::OpenEdit);
+        assert!(matches!(a.overlay, Overlay::Edit(_)));
+        a.apply(Command::EditMove(1)); // to column b
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        for c in "edited!".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        a.apply(Command::EditSave);
+        assert!(matches!(a.overlay, Overlay::None));
+        let g = a.grid.as_ref().unwrap();
+        assert_eq!(g.row(0).unwrap()[1], PValue::Text("edited!".into()));
+    }
+
+    #[test]
+    fn theme_command() {
+        let mut a = app();
+        for c in "set theme amber".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        assert_eq!(a.theme.name, "amber");
+    }
+}

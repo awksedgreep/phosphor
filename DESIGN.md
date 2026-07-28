@@ -122,12 +122,39 @@ table pattern from timeless-libsql, one layer up.)
 - **No async runtime in v1.** A worker thread owns the DbLink; the UI
   thread owns the terminal; they speak over channels. Boring and fast.
 
+## Building scripting-ready (without building scripting)
+
+Scripting is tabled, but phases 1–5 are built so that adding it later is
+additive, never a rework. Five standing rules:
+
+1. **One command bus.** Every user action — keystroke, menu item, prompt
+   command — becomes a `Command` value dispatched through one function.
+   A future script emits the same `Command`s; it inherits every ability
+   and every permission check for free.
+2. **`DbLink` is the only door to data.** No module talks to rusqlite or
+   Hrana directly. A script handle wraps the same trait object — same
+   capabilities, same instrumentation.
+3. **One value type.** A single `PValue` enum (Null/Int/Real/Text/Blob)
+   crosses every boundary: db rows, form fields, prompt results. It maps
+   1:1 onto Lua values, Hrana JSON, and rusqlite types — no third
+   conversion layer later.
+4. **Events are data, even with one listener.** Form/field lifecycle
+   moments (`OnChange`, `OnValidate`, `OnSave`) are enum values routed
+   through a dispatcher, even while the only handler is the built-in
+   validator. Scripts later subscribe; the routing already exists.
+5. **UI effects are values.** Screens return effects (`ShowMessage`,
+   `OpenPanel`, `Refresh`) rather than mutating the terminal directly —
+   the effect enum is exactly the "ui.*" API a script would call.
+
+Cost of these rules now: near zero (they're just good architecture).
+Cost of retrofitting them later: the rework we're avoiding.
+
 ## Phasing
 
 | phase | scope | proves |
 |---|---|---|
-| **0 — splash** (now) | repo, manifesto, compiling ratatui skeleton | the name renders in green |
-| **1 — browser** | open embedded db; schema sidebar; BROWSE (virtualized grid) + EDIT (auto form); dot prompt running real SQL with history; themes | phosphor is already the nicest way to poke a SQLite file |
+| **0 — splash** ✅ | repo, manifesto, compiling ratatui skeleton | the name renders in green |
+| **1 — browser** ✅ (2026-07-27) | open embedded db; schema sidebar; BROWSE (virtualized grid) + EDIT (auto form); dot prompt running real SQL with history; themes | phosphor is already the nicest way to poke a SQLite file |
 | **2 — remote** | DbLink over Hrana/sqld; capability detection; same UI | multi-user story works |
 | **3 — dbhealth console** | Admin panel: report, trends, sparklines; status-bar health dot | "db intelligence" is real |
 | **4 — QBE + reports** | query grid → SQL; banded report writer + pager; labels | the paperwork engine |

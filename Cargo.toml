@@ -8,3 +8,6 @@ repository = "https://github.com/awksedgreep/phosphor"
 
 [dependencies]
 ratatui = "0.29"
+# bundled: one binary, no system sqlite, no macOS "not authorized".
+# load_extension: opt-in loading of libtimeless_ext via PHOSPHOR_EXT.
+rusqlite = { version = "0.37", features = ["bundled", "load_extension"] }
