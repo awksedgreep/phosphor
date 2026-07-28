@@ -66,24 +66,36 @@ means what you think it means.
 
 ## Status
 
-**Phase 1 — the browser — works today:**
+**Phases 1–3 work today** — the browser, the network, and the health
+console:
 
 ```sh
-cargo run -- path/to/any.db
+cargo run -- path/to/any.db            # embedded: any SQLite/libSQL file
+cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
+# PHOSPHOR_TOKEN=...                     for authenticated servers (Turso-style)
+# PHOSPHOR_EXT=.../libtimeless_ext.so    embedded telemetry + dbhealth
 ```
 
-Schema sidebar (tables ▪ and views ◇), virtualized **BROWSE** grid that
-pages through millions of rows, **EDIT** record form on Enter (PICTURE-
-style ¶ pk / * not-null markers, typed parsing, Esc backs out safely), a
-live **dot prompt** (`.`) running real SQL with history, four themes
-(`set theme green|amber|paper|blue`), F1 help, and a status bar with
-query latency — plus a dbhealth dot when the database carries
-[timeless-libsql](https://github.com/awksedgreep/timeless-libsql)
-telemetry (`PHOSPHOR_EXT=/path/to/libtimeless_ext.so` to load it).
+- **Browse** — schema sidebar (tables ▪, views ◇), virtualized **BROWSE**
+  grid that pages through millions of rows, **EDIT** record form on Enter
+  (PICTURE-style ¶ pk / * not-null markers, typed parsing), a live **dot
+  prompt** (`.`) running real SQL with history, four themes
+  (`set theme green|amber|paper|blue`), F1 help, query latency in the
+  status bar.
+- **Network** — the same UI over Hrana HTTP to self-hosted
+  [sqld](https://github.com/tursodatabase/libsql): one `DbLink` trait,
+  two backends, chosen by the argument. Multi-user, no lock files —
+  the part 1988 got wrong, fixed.
+- **DBHEALTH console** — `F10` (or `health` at the prompt) on a database
+  carrying [timeless-libsql](https://github.com/awksedgreep/timeless-libsql)
+  telemetry: the plain-language health report (worst first), sparkline
+  trends fed from the compressed series, and `s` to take a live sample
+  right there — works identically over a file or over sqld. The status
+  bar carries the health dot at all times.
 
 See [DESIGN.md](DESIGN.md) for the feature revival map, the architecture,
-and phases 2–5 (remote sqld, the dbhealth console, QBE + banded reports,
-forms + the applications generator).
+and phases 4–5 (QBE + banded reports, forms + the applications
+generator).
 
 ## License
 

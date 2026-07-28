@@ -23,6 +23,18 @@ pub enum Overlay {
     None,
     Help,
     Edit(EditState),
+    Health(HealthView),
+}
+
+/// Phase 3: the dbhealth console — the report rendered as a system
+/// screen, with sparklines fed straight from the compressed series.
+pub struct HealthView {
+    /// The dbhealth vtab name (report view minus `_report`).
+    pub table: String,
+    /// (check, status, value, advice) rows, worst-first (view order).
+    pub report: Vec<[String; 4]>,
+    /// (series name, recent values oldest→newest, latest rendered).
+    pub sparks: Vec<(String, Vec<f64>, String)>,
 }
 
 pub struct EditState {
@@ -125,6 +137,8 @@ pub enum Command {
     PromptMove(i64),
     PromptHistory(i64),
     PromptRun,
+    OpenHealth,
+    HealthSample,
 }
 
 pub struct App {
@@ -220,8 +234,19 @@ impl App {
             return matches!(key.code, Esc | Enter | F(1) | Char('q'))
                 .then_some(Command::Back);
         }
+        if matches!(self.overlay, Overlay::Health(_)) {
+            return Some(match key.code {
+                Esc | Char('q') | F(10) => Command::Back,
+                Char('s') => Command::HealthSample,
+                Char('r') | F(5) => Command::OpenHealth,
+                _ => return None,
+            });
+        }
         if key.code == F(1) {
             return Some(Command::Help);
+        }
+        if key.code == F(10) {
+            return Some(Command::OpenHealth);
         }
         match self.focus {
             Focus::Prompt => Some(match key.code {
@@ -378,13 +403,17 @@ impl App {
             }
             Command::PromptHistory(d) => self.prompt_history(d),
             Command::PromptRun => self.prompt_run(),
+            Command::OpenHealth => self.open_health(),
+            Command::HealthSample => self.health_sample(),
         }
     }
 
     fn back(&mut self) {
         match &mut self.overlay {
             Overlay::Edit(ed) if ed.editing.is_some() => ed.editing = None,
-            Overlay::Edit(_) | Overlay::Help => self.overlay = Overlay::None,
+            Overlay::Edit(_) | Overlay::Help | Overlay::Health(_) => {
+                self.overlay = Overlay::None
+            }
             Overlay::None => match self.focus {
                 Focus::Prompt => {
                     self.focus = if self.grid.is_some() {
@@ -417,6 +446,146 @@ impl App {
         }
         self.health = self.db.health();
         self.say("refreshed");
+    }
+
+    // ── phase 3: the dbhealth console ────────────────────────────────
+
+    fn quote_ident(ident: &str) -> String {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    }
+
+    /// Find the dbhealth report view and its base vtab, if this
+    /// database carries one. Backend-agnostic: plain SQL via DbLink.
+    fn find_health_base(&self) -> Option<(String, String)> {
+        let q = self
+            .db
+            .query(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'view' AND name LIKE '%\\_report' ESCAPE '\\' \
+                 ORDER BY name LIMIT 1",
+            )
+            .ok()?;
+        let PValue::Text(view) = q.rows.first()?.first()?.clone() else {
+            return None;
+        };
+        let base = view.strip_suffix("_report")?.to_owned();
+        Some((view, base))
+    }
+
+    fn open_health(&mut self) {
+        let Some((view, base)) = self.find_health_base() else {
+            return self.err(
+                "no dbhealth here — needs the timeless extension and \
+                 CREATE VIRTUAL TABLE dbhealth USING timeless_health",
+            );
+        };
+        let report = match self.db.query(&format!(
+            "SELECT \"check\", status, value, advice FROM {}",
+            Self::quote_ident(&view)
+        )) {
+            Ok(q) => q
+                .rows
+                .into_iter()
+                .map(|r| {
+                    [0, 1, 2, 3].map(|i| r.get(i).map(PValue::render).unwrap_or_default())
+                })
+                .collect(),
+            Err(e) => return self.err(e),
+        };
+
+        // Sparklines: preferred series first, then whatever else exists.
+        const PREFERRED: [&str; 8] = [
+            "cache_hit_ratio",
+            "db_file_bytes",
+            "wal_file_bytes",
+            "bloat_ratio",
+            "cache_misses",
+            "cache_hits",
+            "cache_used_bytes",
+            "memory_used_bytes",
+        ];
+        let available: Vec<String> = self
+            .db
+            .query(&format!(
+                "SELECT DISTINCT name FROM {} ORDER BY name",
+                Self::quote_ident(&base)
+            ))
+            .map(|q| {
+                q.rows
+                    .into_iter()
+                    .filter_map(|r| match r.into_iter().next() {
+                        Some(PValue::Text(t)) => Some(t),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut ordered: Vec<String> = PREFERRED
+            .iter()
+            .filter(|p| available.iter().any(|a| a == *p))
+            .map(|s| s.to_string())
+            .collect();
+        for a in &available {
+            if ordered.len() >= 8 {
+                break;
+            }
+            if !ordered.contains(a) {
+                ordered.push(a.clone());
+            }
+        }
+
+        let mut sparks = Vec::new();
+        for name in ordered {
+            let safe = name.replace('\'', "''");
+            if let Ok(q) = self.db.query(&format!(
+                "SELECT value FROM {} WHERE name = '{safe}' ORDER BY ts DESC LIMIT 64",
+                Self::quote_ident(&base)
+            )) {
+                let mut vals: Vec<f64> = q
+                    .rows
+                    .into_iter()
+                    .filter_map(|r| match r.into_iter().next() {
+                        Some(PValue::Real(f)) => Some(f),
+                        Some(PValue::Int(i)) => Some(i as f64),
+                        _ => None,
+                    })
+                    .collect();
+                vals.reverse();
+                if let Some(latest) = vals.last().copied() {
+                    let rendered = if latest.abs() >= 1_048_576.0 {
+                        format!("{:.1} MB", latest / 1_048_576.0)
+                    } else if latest.fract() == 0.0 {
+                        format!("{latest:.0}")
+                    } else {
+                        format!("{latest:.3}")
+                    };
+                    sparks.push((name, vals, rendered));
+                }
+            }
+        }
+
+        self.health = self.db.health();
+        self.overlay = Overlay::Health(HealthView {
+            table: base,
+            report,
+            sparks,
+        });
+    }
+
+    fn health_sample(&mut self) {
+        let Overlay::Health(hv) = &self.overlay else { return };
+        let t = Self::quote_ident(&hv.table);
+        match self
+            .db
+            .execute(&format!("INSERT INTO {t}({t}) VALUES ('sample')"))
+        {
+            Ok((_, elapsed)) => {
+                self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
+                self.open_health(); // rebuild report + sparks + dot
+                self.say("sampled");
+            }
+            Err(e) => self.err(e),
+        }
     }
 
     fn open_selected(&mut self) {
@@ -657,6 +826,9 @@ impl App {
             self.overlay = Overlay::Help;
             return;
         }
+        if line == "health" {
+            return self.open_health();
+        }
         if line == "tables" {
             self.reload_tables();
             self.focus = Focus::Sidebar;
@@ -790,6 +962,39 @@ mod tests {
         assert!(matches!(a.overlay, Overlay::None));
         let g = a.grid.as_ref().unwrap();
         assert_eq!(g.row(0).unwrap()[1], PValue::Text("edited!".into()));
+    }
+
+    /// Full-stack phase 3, when the timeless extension is built next
+    /// door: dbhealth vtab + samples + the console over the bus.
+    #[test]
+    fn health_console_over_timeless_extension() {
+        let ext = "../timeless-libsql/target/release/libtimeless_ext.so";
+        if !std::path::Path::new(ext).exists() {
+            eprintln!("skipping: {ext} not built");
+            return;
+        }
+        std::env::set_var("PHOSPHOR_EXT", ext);
+        let (db, warn) = EmbeddedDb::open(":memory:").unwrap();
+        assert!(warn.is_none(), "extension failed to load: {warn:?}");
+        db.execute("CREATE VIRTUAL TABLE dbhealth USING timeless_health")
+            .unwrap();
+        db.execute("INSERT INTO dbhealth(dbhealth) VALUES ('sample')")
+            .unwrap();
+        db.execute("INSERT INTO dbhealth(dbhealth) VALUES ('sample')")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenHealth);
+        let Overlay::Health(hv) = &a.overlay else {
+            panic!("health console did not open");
+        };
+        assert_eq!(hv.table, "dbhealth");
+        assert!(hv.report.len() >= 7, "report rows: {}", hv.report.len());
+        assert!(!hv.sparks.is_empty(), "no sparkline series");
+        a.apply(Command::HealthSample);
+        assert!(matches!(a.overlay, Overlay::Health(_)));
+        assert!(a.health.is_some(), "status dot missing after sample");
+        a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::None));
     }
 
     #[test]

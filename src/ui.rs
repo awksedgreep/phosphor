@@ -32,8 +32,102 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.overlay {
         Overlay::Help => draw_help(f, app),
         Overlay::Edit(_) => draw_edit(f, app),
+        Overlay::Health(_) => draw_health(f, app),
         Overlay::None => {}
     }
+}
+
+const SPARK_BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+fn sparkline(values: &[f64], width: usize) -> String {
+    let take = values.len().min(width);
+    let window = &values[values.len() - take..];
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for v in window {
+        lo = lo.min(*v);
+        hi = hi.max(*v);
+    }
+    window
+        .iter()
+        .map(|v| {
+            let idx = if hi > lo {
+                (((v - lo) / (hi - lo)) * 7.0).round() as usize
+            } else {
+                3 // flat series: a calm middle bar, not a cliff
+            };
+            SPARK_BARS[idx.min(7)]
+        })
+        .collect()
+}
+
+fn draw_health(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::Health(hv) = &app.overlay else { return };
+    let area = f.area().inner(ratatui::layout::Margin {
+        horizontal: 3,
+        vertical: 1,
+    });
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" DBHEALTH · {} ", hv.table),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " s sample · r refresh · Esc close ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let report_h = (hv.report.len() as u16 + 1).min(inner.height / 2);
+    let [report_area, _, sparks_area] = Layout::vertical([
+        Constraint::Length(report_h),
+        Constraint::Length(1),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(pad("STATUS", 9), th.dim()),
+        Span::styled(pad("CHECK", 19), th.dim()),
+        Span::styled(pad("VALUE", 22), th.dim()),
+        Span::styled("ADVICE", th.dim()),
+    ])];
+    for row in &hv.report {
+        let [check, status, value, advice] = row;
+        let advice_w = (inner.width as usize).saturating_sub(56).max(8);
+        lines.push(Line::from(vec![
+            Span::styled(pad(&format!("● {status}"), 8), th.health(status)),
+            Span::styled(pad(check, 19), th.bright()),
+            Span::styled(pad(value, 22), th.base()),
+            Span::styled(
+                advice.chars().take(advice_w).collect::<String>(),
+                th.dim(),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), report_area);
+
+    let spark_w = (sparks_area.width as usize).saturating_sub(34).max(10);
+    let mut lines = vec![Line::styled("trends (oldest → newest)", th.dim())];
+    for (name, values, latest) in &hv.sparks {
+        lines.push(Line::from(vec![
+            Span::styled(pad(name, 19), th.base()),
+            Span::styled(sparkline(values, spark_w), th.bright()),
+            Span::styled(format!("  {latest}"), th.dim()),
+        ]));
+    }
+    if hv.sparks.is_empty() {
+        lines.push(Line::styled(
+            "no series yet — press s to take a sample",
+            th.dim(),
+        ));
+    }
+    f.render_widget(Paragraph::new(lines), sparks_area);
 }
 
 fn focus_style(app: &App, mine: Focus) -> ratatui::style::Style {
@@ -360,10 +454,10 @@ fn draw_help(f: &mut Frame, app: &App) {
         ("PgUp/PgDn g G", "page · top · bottom"),
         ("Home/End", "first / last column"),
         ("F5 / r", "refresh"),
-        ("F10 / Ctrl-S", "save (in EDIT)"),
+        ("F10", "dbhealth console (save, in EDIT)"),
         ("q / Ctrl-Q", "quit"),
         ("", ""),
-        ("prompt:", "any SQL · help · tables"),
+        ("prompt:", "any SQL · help · tables · health"),
         ("", "set theme green|amber|paper|blue"),
     ];
     let lines: Vec<Line> = rows

@@ -8,24 +8,39 @@
 
 mod app;
 mod db;
+mod remote;
 mod theme;
 mod ui;
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 use crate::app::App;
-use crate::db::EmbeddedDb;
+use crate::db::{DbLink, EmbeddedDb};
+use crate::remote::RemoteDb;
 
 fn main() -> std::io::Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| ":memory:".into());
-    let (link, warning) = match EmbeddedDb::open(&path) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("phosphor: cannot open {path}: {e}");
-            std::process::exit(1);
-        }
-    };
-    let mut app = App::new(Box::new(link), warning);
+    // `phosphor file.db` = embedded; `phosphor http://host:8880` = sqld
+    // over Hrana HTTP (PHOSPHOR_TOKEN for authenticated servers).
+    let (link, warning): (Box<dyn DbLink>, Option<String>) =
+        if path.starts_with("http://") || path.starts_with("https://") {
+            match RemoteDb::open(&path) {
+                Ok(db) => (Box::new(db), None),
+                Err(e) => {
+                    eprintln!("phosphor: cannot reach {path}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            match EmbeddedDb::open(&path) {
+                Ok((db, warn)) => (Box::new(db), warn),
+                Err(e) => {
+                    eprintln!("phosphor: cannot open {path}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        };
+    let mut app = App::new(link, warning);
 
     let mut terminal = ratatui::init();
     let result = loop {

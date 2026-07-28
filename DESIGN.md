@@ -155,8 +155,8 @@ Cost of retrofitting them later: the rework we're avoiding.
 |---|---|---|
 | **0 — splash** ✅ | repo, manifesto, compiling ratatui skeleton | the name renders in green |
 | **1 — browser** ✅ (2026-07-27) | open embedded db; schema sidebar; BROWSE (virtualized grid) + EDIT (auto form); dot prompt running real SQL with history; themes | phosphor is already the nicest way to poke a SQLite file |
-| **2 — remote** | DbLink over Hrana/sqld; capability detection; same UI | multi-user story works |
-| **3 — dbhealth console** | Admin panel: report, trends, sparklines; status-bar health dot | "db intelligence" is real |
+| **2 — remote** ✅ (2026-07-27) | DbLink over Hrana/sqld; capability detection; same UI | multi-user story works |
+| **3 — dbhealth console** ✅ (2026-07-27) | Admin panel: report, trends, sparklines; status-bar health dot; live 's' sampling | "db intelligence" is real |
 | **4 — QBE + reports** | query grid → SQL; banded report writer + pager; labels | the paperwork engine |
 | **5 — forms + apps** | form painter; menu designer; app runtime mode (`phosphor --app crm.db`) | the CRM scenario, end to end |
 

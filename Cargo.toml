@@ -11,3 +11,8 @@ ratatui = "0.29"
 # bundled: one binary, no system sqlite, no macOS "not authorized".
 # load_extension: opt-in loading of libtimeless_ext via PHOSPHOR_EXT.
 rusqlite = { version = "0.37", features = ["bundled", "load_extension"] }
+# Remote backend: Hrana over HTTP to self-hosted sqld (blocking by
+# design — DESIGN.md "no async runtime in v1").
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+base64 = "0.22"
