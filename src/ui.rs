@@ -33,8 +33,162 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Help => draw_help(f, app),
         Overlay::Edit(_) => draw_edit(f, app),
         Overlay::Health(_) => draw_health(f, app),
+        Overlay::Qbe(_) => draw_qbe(f, app),
+        Overlay::Report(_) => draw_report(f, app),
+        Overlay::Pager(_) => draw_pager(f, app),
         Overlay::None => {}
     }
+}
+
+fn editing_span<'a>(buf: &'a str, th: &crate::theme::Theme) -> Span<'a> {
+    Span::styled(format!("{buf}▏"), th.cursor())
+}
+
+fn draw_qbe(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::Qbe(st) = &app.overlay else { return };
+    let area = centered(f.area(), 76, (st.spec.cols.len() as u16 + 8).min(f.area().height));
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" QUERY BY EXAMPLE · {} ", st.spec.table),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " Space show · Enter filter · s sort · F2 run · F6 save · Esc ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(pad("COLUMN", 18), th.dim()),
+        Span::styled(pad("SHOW", 5), th.dim()),
+        Span::styled(pad("SORT", 5), th.dim()),
+        Span::styled("FILTER (e.g. > 100, like 'a%', or a bare value)", th.dim()),
+    ])];
+    for (i, col) in st.spec.cols.iter().enumerate() {
+        let selected = i == st.cursor;
+        let row_style = if selected { th.cursor() } else { th.base() };
+        let filter: Span = if selected && st.editing.is_some() && !st.naming {
+            editing_span(st.editing.as_ref().unwrap(), th)
+        } else {
+            Span::styled(col.filter.clone(), row_style)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pad(&col.name, 18), row_style),
+            Span::styled(pad(if col.show { "▪" } else { " " }, 5), row_style),
+            Span::styled(pad(col.sort.glyph(), 5), row_style),
+            filter,
+        ]));
+    }
+    lines.push(Line::raw(""));
+    if st.naming {
+        lines.push(Line::from(vec![
+            Span::styled("save as: ", th.bright()),
+            editing_span(st.editing.as_deref().unwrap_or(""), th),
+        ]));
+    }
+    lines.push(Line::styled("SQL:", th.dim()));
+    lines.push(Line::styled(st.spec.sql(), th.bright()));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_report(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::Report(st) = &app.overlay else { return };
+    let area = centered(f.area(), 76, 12);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" REPORT · {} ", st.spec.name),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " Enter edit · Space cycle group · F2 preview · F6 save · Esc ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let fields = [
+        ("title", st.spec.title.clone()),
+        ("source", st.spec.source.clone()),
+        (
+            "group by",
+            st.spec.group_by.clone().unwrap_or_else(|| "(none)".into()),
+        ),
+    ];
+    let mut lines = Vec::new();
+    for (i, (label, value)) in fields.iter().enumerate() {
+        let selected = i == st.cursor;
+        let value_span = if selected && st.editing.is_some() {
+            editing_span(st.editing.as_ref().unwrap(), th)
+        } else {
+            Span::styled(
+                value.clone(),
+                if selected { th.cursor() } else { th.base() },
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label:>9} : "),
+                if selected { th.bright() } else { th.dim() },
+            ),
+            value_span,
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "numeric columns total automatically; grouping adds bands + subtotals",
+        th.dim(),
+    ));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_pager(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::Pager(p) = &app.overlay else { return };
+    let area = f.area().inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    f.render_widget(Clear, area);
+    let pos = format!(
+        " {}/{} · w write file · Esc ",
+        (p.offset + 1).min(p.lines.len()),
+        p.lines.len()
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(format!(" {} ", p.title), th.bright()))
+        .title_bottom(Line::styled(pos, th.dim()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let lines: Vec<Line> = p
+        .lines
+        .iter()
+        .skip(p.offset)
+        .take(inner.height as usize)
+        .map(|l| {
+            if l == "\u{c}" {
+                Line::styled("· · · · · · · · page break · · · · · · · ·", th.dim())
+            } else if l.starts_with('▌') {
+                Line::styled(l.clone(), th.bright())
+            } else {
+                Line::styled(l.clone(), th.base())
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 const SPARK_BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -190,9 +344,15 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
         Some(Grid {
-            source: GridSource::Query { .. },
+            source: GridSource::Query { truncated },
             ..
-        }) => " QUERY ".to_owned(),
+        }) => {
+            if *truncated {
+                " QUERY (capped at 10k rows) ".to_owned()
+            } else {
+                " QUERY ".to_owned()
+            }
+        }
         None => " phosphor ".to_owned(),
     };
     let block = Block::default()

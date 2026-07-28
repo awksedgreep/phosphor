@@ -7,6 +7,8 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::db::{ColumnInfo, DbLink, PValue, TableInfo};
+use crate::qbe::{QbeSpec, QbeState};
+use crate::report::{self, PagerState, ReportSpec, ReportState};
 use crate::theme::{self, Theme};
 
 const OVERSCAN: i64 = 64;
@@ -24,6 +26,9 @@ pub enum Overlay {
     Help,
     Edit(EditState),
     Health(HealthView),
+    Qbe(QbeState),
+    Report(ReportState),
+    Pager(PagerState),
 }
 
 /// Phase 3: the dbhealth console — the report rendered as a system
@@ -139,6 +144,22 @@ pub enum Command {
     PromptRun,
     OpenHealth,
     HealthSample,
+    // Generic designer commands (QBE, report — later forms/apps): each
+    // overlay interprets them per its own semantics. One bus, always.
+    OpenQbe(Option<String>),
+    OpenReport(Option<String>),
+    OpenLabels(Option<String>),
+    DesignerMove(i64),
+    DesignerToggle,
+    DesignerCycle,
+    DesignerEditBegin,
+    DesignerChar(char),
+    DesignerBackspace,
+    DesignerCommit,
+    DesignerRun,
+    DesignerSave,
+    PagerScroll(i64),
+    PagerWrite,
 }
 
 pub struct App {
@@ -242,6 +263,52 @@ impl App {
                 _ => return None,
             });
         }
+        if let Overlay::Qbe(st) = &self.overlay {
+            return Some(match (&st.editing, key.code) {
+                (Some(_), Enter) => Command::DesignerCommit,
+                (Some(_), Esc) => Command::Back,
+                (Some(_), Backspace) => Command::DesignerBackspace,
+                (Some(_), Char(c)) => Command::DesignerChar(c),
+                (None, Up) => Command::DesignerMove(-1),
+                (None, Down) => Command::DesignerMove(1),
+                (None, Char(' ')) => Command::DesignerToggle,
+                (None, Char('s')) => Command::DesignerCycle,
+                (None, Enter) => Command::DesignerEditBegin,
+                (None, F(2)) => Command::DesignerRun,
+                (None, F(6)) => Command::DesignerSave,
+                (None, Esc) => Command::Back,
+                _ => return None,
+            });
+        }
+        if let Overlay::Report(st) = &self.overlay {
+            return Some(match (&st.editing, key.code) {
+                (Some(_), Enter) => Command::DesignerCommit,
+                (Some(_), Esc) => Command::Back,
+                (Some(_), Backspace) => Command::DesignerBackspace,
+                (Some(_), Char(c)) => Command::DesignerChar(c),
+                (None, Up) => Command::DesignerMove(-1),
+                (None, Down) => Command::DesignerMove(1),
+                (None, Char(' ')) => Command::DesignerToggle,
+                (None, Enter) => Command::DesignerEditBegin,
+                (None, F(2)) => Command::DesignerRun,
+                (None, F(6)) => Command::DesignerSave,
+                (None, Esc) => Command::Back,
+                _ => return None,
+            });
+        }
+        if matches!(self.overlay, Overlay::Pager(_)) {
+            return Some(match key.code {
+                Esc | Char('q') => Command::Back,
+                Up | Char('k') => Command::PagerScroll(-1),
+                Down | Char('j') => Command::PagerScroll(1),
+                PageUp => Command::PagerScroll(-40),
+                PageDown | Char(' ') => Command::PagerScroll(40),
+                Home | Char('g') => Command::PagerScroll(i64::MIN / 2),
+                End | Char('G') => Command::PagerScroll(i64::MAX / 2),
+                Char('w') => Command::PagerWrite,
+                _ => return None,
+            });
+        }
         if key.code == F(1) {
             return Some(Command::Help);
         }
@@ -266,6 +333,9 @@ impl App {
                 Up | Char('k') => Command::SidebarMove(-1),
                 Down | Char('j') => Command::SidebarMove(1),
                 Enter => Command::OpenSelected,
+                Char('Q') => Command::OpenQbe(None),
+                Char('R') => Command::OpenReport(None),
+                Char('L') => Command::OpenLabels(None),
                 Char('.') => Command::Focus(Focus::Prompt),
                 Tab => {
                     if self.grid.is_some() {
@@ -291,6 +361,9 @@ impl App {
                 Char('G') => Command::GridBottom,
                 Enter => Command::OpenEdit,
                 F(5) => Command::Refresh,
+                Char('Q') => Command::OpenQbe(None),
+                Char('R') => Command::OpenReport(None),
+                Char('L') => Command::OpenLabels(None),
                 Char('.') => Command::Focus(Focus::Prompt),
                 Tab => Command::Focus(Focus::Prompt),
                 _ => return None,
@@ -405,15 +478,49 @@ impl App {
             Command::PromptRun => self.prompt_run(),
             Command::OpenHealth => self.open_health(),
             Command::HealthSample => self.health_sample(),
+            Command::OpenQbe(t) => self.open_qbe(t),
+            Command::OpenReport(t) => self.open_report(t),
+            Command::OpenLabels(t) => self.open_labels(t),
+            Command::DesignerMove(d) => self.designer_move(d),
+            Command::DesignerToggle => self.designer_toggle(),
+            Command::DesignerCycle => self.designer_cycle(),
+            Command::DesignerEditBegin => self.designer_edit_begin(),
+            Command::DesignerChar(c) => self.designer_char(c),
+            Command::DesignerBackspace => self.designer_backspace(),
+            Command::DesignerCommit => self.designer_commit(),
+            Command::DesignerRun => self.designer_run(),
+            Command::DesignerSave => self.designer_save(),
+            Command::PagerScroll(d) => {
+                if let Overlay::Pager(p) = &mut self.overlay {
+                    let max = p.lines.len().saturating_sub(10) as i64;
+                    p.offset = (p.offset as i64).saturating_add(d).clamp(0, max) as usize;
+                }
+            }
+            Command::PagerWrite => {
+                if let Overlay::Pager(p) = &self.overlay {
+                    match p.write_file() {
+                        Ok(path) => self.say(format!("wrote {path}")),
+                        Err(e) => self.err(e),
+                    }
+                }
+            }
         }
     }
 
     fn back(&mut self) {
         match &mut self.overlay {
             Overlay::Edit(ed) if ed.editing.is_some() => ed.editing = None,
-            Overlay::Edit(_) | Overlay::Help | Overlay::Health(_) => {
-                self.overlay = Overlay::None
+            Overlay::Qbe(st) if st.editing.is_some() => {
+                st.editing = None;
+                st.naming = false;
             }
+            Overlay::Report(st) if st.editing.is_some() => st.editing = None,
+            Overlay::Edit(_)
+            | Overlay::Help
+            | Overlay::Health(_)
+            | Overlay::Qbe(_)
+            | Overlay::Report(_)
+            | Overlay::Pager(_) => self.overlay = Overlay::None,
             Overlay::None => match self.focus {
                 Focus::Prompt => {
                     self.focus = if self.grid.is_some() {
@@ -583,6 +690,300 @@ impl App {
                 self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
                 self.open_health(); // rebuild report + sparks + dot
                 self.say("sampled");
+            }
+            Err(e) => self.err(e),
+        }
+    }
+
+    // ── phase 4: QBE, reports, labels ────────────────────────────────
+
+    /// The table a designer should target: explicit arg, else current
+    /// grid table, else the sidebar selection.
+    fn target_table(&self, arg: Option<String>) -> Option<String> {
+        arg.or_else(|| match &self.grid {
+            Some(Grid {
+                source: GridSource::Table { name, .. },
+                ..
+            }) if self.focus == Focus::Grid => Some(name.clone()),
+            _ => self.tables.get(self.sidebar_idx).map(|t| t.name.clone()),
+        })
+    }
+
+    fn open_qbe(&mut self, table: Option<String>) {
+        let Some(table) = self.target_table(table) else {
+            return self.err("qbe: no table selected (qbe <table>)");
+        };
+        match QbeSpec::new(self.db.as_ref(), &table) {
+            Ok(spec) => self.overlay = Overlay::Qbe(QbeState::new(spec)),
+            Err(e) => self.err(e),
+        }
+    }
+
+    fn open_report(&mut self, name: Option<String>) {
+        let Some(name) = self.target_table(name) else {
+            return self.err("report: no table selected (report <table-or-saved-name>)");
+        };
+        // A saved report by this name wins; otherwise start from the table.
+        let spec = ReportSpec::load(self.db.as_ref(), &name)
+            .unwrap_or_else(|| ReportSpec::for_table(&name));
+        let columns = self.source_columns(&spec);
+        self.overlay = Overlay::Report(ReportState {
+            spec,
+            cursor: 0,
+            editing: None,
+            columns,
+        });
+    }
+
+    fn source_columns(&self, spec: &ReportSpec) -> Vec<String> {
+        let src = spec.source.trim();
+        let sql = if src.to_ascii_lowercase().starts_with("select")
+            || src.to_ascii_lowercase().starts_with("with")
+        {
+            format!("SELECT * FROM ({src}) LIMIT 0")
+        } else {
+            format!("SELECT * FROM {} LIMIT 0", Self::quote_ident(src))
+        };
+        self.db.query(&sql).map(|q| q.columns).unwrap_or_default()
+    }
+
+    fn open_labels(&mut self, table: Option<String>) {
+        let Some(table) = self.target_table(table) else {
+            return self.err("labels: no table selected (labels <table>)");
+        };
+        match report::labels(self.db.as_ref(), &table) {
+            Ok(lines) => {
+                self.overlay = Overlay::Pager(PagerState {
+                    title: format!("LABELS · {table}"),
+                    lines,
+                    offset: 0,
+                    file_stem: format!("labels_{table}"),
+                })
+            }
+            Err(e) => self.err(e),
+        }
+    }
+
+    fn designer_move(&mut self, d: i64) {
+        match &mut self.overlay {
+            Overlay::Qbe(st) => {
+                let n = st.spec.cols.len() as i64;
+                if n > 0 {
+                    st.cursor = (st.cursor as i64 + d).rem_euclid(n) as usize;
+                }
+            }
+            Overlay::Report(st) => {
+                st.cursor = (st.cursor as i64 + d).rem_euclid(3) as usize;
+            }
+            _ => {}
+        }
+    }
+
+    fn designer_toggle(&mut self) {
+        match &mut self.overlay {
+            Overlay::Qbe(st) => {
+                let col = &mut st.spec.cols[st.cursor];
+                col.show = !col.show;
+            }
+            Overlay::Report(st) if st.cursor == 2 => {
+                // Cycle group_by through the source's columns (and off).
+                let next = match &st.spec.group_by {
+                    None => st.columns.first().cloned(),
+                    Some(cur) => {
+                        let idx = st.columns.iter().position(|c| c == cur);
+                        match idx {
+                            Some(i) if i + 1 < st.columns.len() => {
+                                Some(st.columns[i + 1].clone())
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                st.spec.group_by = next;
+            }
+            _ => {}
+        }
+    }
+
+    fn designer_cycle(&mut self) {
+        if let Overlay::Qbe(st) = &mut self.overlay {
+            let col = &mut st.spec.cols[st.cursor];
+            col.sort = col.sort.cycle();
+        }
+    }
+
+    fn designer_edit_begin(&mut self) {
+        match &mut self.overlay {
+            Overlay::Qbe(st) => {
+                st.naming = false;
+                st.editing = Some(st.spec.cols[st.cursor].filter.clone());
+            }
+            Overlay::Report(st) => {
+                st.editing = Some(match st.cursor {
+                    0 => st.spec.title.clone(),
+                    1 => st.spec.source.clone(),
+                    _ => return, // group_by cycles with Space instead
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn designer_char(&mut self, c: char) {
+        match &mut self.overlay {
+            Overlay::Qbe(st) => {
+                if let Some(buf) = &mut st.editing {
+                    buf.push(c);
+                }
+            }
+            Overlay::Report(st) => {
+                if let Some(buf) = &mut st.editing {
+                    buf.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn designer_backspace(&mut self) {
+        match &mut self.overlay {
+            Overlay::Qbe(st) => {
+                if let Some(buf) = &mut st.editing {
+                    buf.pop();
+                }
+            }
+            Overlay::Report(st) => {
+                if let Some(buf) = &mut st.editing {
+                    buf.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn designer_commit(&mut self) {
+        let mut save_as: Option<String> = None;
+        match &mut self.overlay {
+            Overlay::Qbe(st) => {
+                if let Some(buf) = st.editing.take() {
+                    if st.naming {
+                        st.naming = false;
+                        if !buf.trim().is_empty() {
+                            save_as = Some(buf.trim().to_owned());
+                        }
+                    } else {
+                        st.spec.cols[st.cursor].filter = buf;
+                    }
+                }
+            }
+            Overlay::Report(st) => {
+                if let Some(buf) = st.editing.take() {
+                    match st.cursor {
+                        0 => st.spec.title = buf,
+                        1 => {
+                            st.spec.source = buf;
+                            st.spec.group_by = None;
+                        }
+                        _ => {}
+                    }
+                    if st.cursor == 1 {
+                        let cols = self.source_columns_of_overlay();
+                        if let Overlay::Report(st) = &mut self.overlay {
+                            st.columns = cols;
+                        }
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let (Some(name), Overlay::Qbe(st)) = (&save_as, &self.overlay) {
+            match st.spec.save(self.db.as_ref(), name) {
+                Ok(()) => self.say(format!("saved query {name:?} (run {name})")),
+                Err(e) => self.err(e),
+            }
+        }
+    }
+
+    fn source_columns_of_overlay(&self) -> Vec<String> {
+        match &self.overlay {
+            Overlay::Report(st) => self.source_columns(&st.spec),
+            _ => Vec::new(),
+        }
+    }
+
+    fn designer_run(&mut self) {
+        match &self.overlay {
+            Overlay::Qbe(st) => {
+                let sql = st.spec.sql();
+                self.overlay = Overlay::None;
+                self.run_select(&sql);
+            }
+            Overlay::Report(st) => {
+                let spec = st.spec.clone();
+                match report::render(self.db.as_ref(), &spec) {
+                    Ok(lines) => {
+                        self.overlay = Overlay::Pager(PagerState {
+                            title: format!("REPORT · {}", spec.title),
+                            lines,
+                            offset: 0,
+                            file_stem: format!("report_{}", spec.name),
+                        })
+                    }
+                    Err(e) => self.err(e),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn designer_save(&mut self) {
+        match &mut self.overlay {
+            Overlay::Qbe(st) => {
+                st.naming = true;
+                st.editing = Some(st.spec.table.clone());
+            }
+            Overlay::Report(st) => {
+                let spec = st.spec.clone();
+                match spec.save(self.db.as_ref()) {
+                    Ok(()) => {
+                        self.say(format!("saved report {:?} (report {})", spec.name, spec.name))
+                    }
+                    Err(e) => self.err(e),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Run a SELECT into the query grid (shared by prompt + QBE + apps).
+    fn run_select(&mut self, sql: &str) {
+        match self.db.query(sql) {
+            Ok(q) => {
+                self.last_ms = Some(q.elapsed.as_secs_f64() * 1000.0);
+                let n = q.rows.len();
+                let truncated = q.truncated;
+                let mut grid = Grid {
+                    source: GridSource::Query { truncated },
+                    columns: q.columns,
+                    total: n as i64,
+                    cache: q.rows,
+                    cache_start: 0,
+                    rowids: None,
+                    cur_row: 0,
+                    cur_col: 0,
+                    row_off: 0,
+                    col_off: 0,
+                    widths: Vec::new(),
+                };
+                grid.compute_widths();
+                self.grid = Some(grid);
+                self.focus = Focus::Grid;
+                self.say(if truncated {
+                    format!("{n} rows (capped) — add a WHERE or LIMIT")
+                } else {
+                    format!("{n} row(s)")
+                });
             }
             Err(e) => self.err(e),
         }
@@ -829,6 +1230,25 @@ impl App {
         if line == "health" {
             return self.open_health();
         }
+        if let Some(rest) = line.strip_prefix("qbe") {
+            let t = rest.trim();
+            return self.open_qbe((!t.is_empty()).then(|| t.to_owned()));
+        }
+        if let Some(rest) = line.strip_prefix("report") {
+            let t = rest.trim();
+            return self.open_report((!t.is_empty()).then(|| t.to_owned()));
+        }
+        if let Some(rest) = line.strip_prefix("labels") {
+            let t = rest.trim();
+            return self.open_labels((!t.is_empty()).then(|| t.to_owned()));
+        }
+        if let Some(rest) = line.strip_prefix("run ") {
+            let name = rest.trim();
+            return match QbeSpec::saved_sql(self.db.as_ref(), name) {
+                Some(sql) => self.run_select(&sql),
+                None => self.err(format!("no saved query named {name:?}")),
+            };
+        }
         if line == "tables" {
             self.reload_tables();
             self.focus = Focus::Sidebar;
@@ -841,36 +1261,7 @@ impl App {
             .unwrap_or("")
             .to_ascii_lowercase();
         if matches!(head.as_str(), "select" | "with" | "pragma" | "explain" | "values") {
-            match self.db.query(&line) {
-                Ok(q) => {
-                    self.last_ms = Some(q.elapsed.as_secs_f64() * 1000.0);
-                    let n = q.rows.len();
-                    let mut grid = Grid {
-                        source: GridSource::Query {
-                            truncated: q.truncated,
-                        },
-                        columns: q.columns,
-                        total: n as i64,
-                        cache: q.rows,
-                        cache_start: 0,
-                        rowids: None,
-                        cur_row: 0,
-                        cur_col: 0,
-                        row_off: 0,
-                        col_off: 0,
-                        widths: Vec::new(),
-                    };
-                    grid.compute_widths();
-                    self.grid = Some(grid);
-                    self.focus = Focus::Grid;
-                    self.say(if grid_truncated(&self.grid) {
-                        format!("{n} rows (capped) — add a WHERE or LIMIT")
-                    } else {
-                        format!("{n} row(s)")
-                    });
-                }
-                Err(e) => self.err(e),
-            }
+            self.run_select(&line);
         } else {
             match self.db.execute(&line) {
                 Ok((n, elapsed)) => {
@@ -886,16 +1277,6 @@ impl App {
             }
         }
     }
-}
-
-fn grid_truncated(grid: &Option<Grid>) -> bool {
-    matches!(
-        grid,
-        Some(Grid {
-            source: GridSource::Query { truncated: true },
-            ..
-        })
-    )
 }
 
 #[cfg(test)]
@@ -995,6 +1376,55 @@ mod tests {
         assert!(a.health.is_some(), "status dot missing after sample");
         a.apply(Command::Back);
         assert!(matches!(a.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn qbe_flow_through_the_bus() {
+        let mut a = app();
+        a.apply(Command::OpenQbe(Some("t".into())));
+        assert!(matches!(a.overlay, Overlay::Qbe(_)));
+        // Filter on column b: bare value → equality.
+        a.apply(Command::DesignerMove(1));
+        a.apply(Command::DesignerEditBegin);
+        if let Overlay::Qbe(st) = &mut a.overlay {
+            st.editing = Some(String::new());
+        }
+        for c in "row42".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        // Save under a name, then run.
+        a.apply(Command::DesignerSave);
+        if let Overlay::Qbe(st) = &mut a.overlay {
+            st.editing = Some("just42".into());
+        }
+        a.apply(Command::DesignerCommit);
+        a.apply(Command::DesignerRun);
+        let g = a.grid.as_ref().unwrap();
+        assert_eq!(g.total, 1, "exactly row42 matches");
+        assert_eq!(g.row(0).unwrap()[1], PValue::Text("row42".into()));
+        // And the saved query runs by name from the prompt.
+        for c in "run just42".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        assert_eq!(a.grid.as_ref().unwrap().total, 1);
+    }
+
+    #[test]
+    fn report_preview_through_the_bus() {
+        let mut a = app();
+        a.apply(Command::OpenReport(Some("t".into())));
+        assert!(matches!(a.overlay, Overlay::Report(_)));
+        a.apply(Command::DesignerRun); // preview
+        let Overlay::Pager(p) = &a.overlay else {
+            panic!("expected pager");
+        };
+        let text = p.lines.join("\n");
+        assert!(text.contains("t report"), "page header with title");
+        assert!(text.contains("TOTAL (500 rows)"), "grand totals");
+        // id column 1..=500 sums to 125250.
+        assert!(text.contains("125250"), "numeric column summed");
     }
 
     #[test]

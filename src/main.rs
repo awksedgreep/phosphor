@@ -8,7 +8,10 @@
 
 mod app;
 mod db;
+mod qbe;
 mod remote;
+mod report;
+mod store;
 mod theme;
 mod ui;
 
