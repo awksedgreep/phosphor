@@ -5,6 +5,8 @@ reports, painted forms, user-built menus — on top of a database that is
 wicked fast, compressed, networked, and monitors itself. 1988 the way it
 should have turned out.**
 
+![phosphor: browse, painted forms, and the dot prompt](docs/demo/browse.gif)
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  PHOSPHOR                                     [F1 Help]      │
@@ -115,6 +117,18 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
 
   Copy the file, you copied the app. Replicate it with libSQL, you
   deployed it.
+
+## Watch it work
+
+Every GIF below is generated headlessly by `tools/demo/demo.sh` — a
+scripted pty session rendered with agg, so the demos can never drift
+from the real program.
+
+| | |
+|---|---|
+| **The builders** — QBE writing its SQL, the banded report with group subtotals, the form painter | ![qbe, reports, painter](docs/demo/builders.gif) |
+| **DBHEALTH, live** — the report and sparklines moving on their own (auto-collection + the live console) | ![dbhealth console](docs/demo/health.gif) |
+| **`--app` mode** — the ▓▓ CRM ▓▓ menu; hotkeys run reports and browses; the database IS the application | ![app mode](docs/demo/appmode.gif) |
 
 See [DESIGN.md](DESIGN.md) for the feature revival map and architecture.
 

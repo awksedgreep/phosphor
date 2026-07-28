@@ -1,0 +1,15 @@
+customers report  ·  page 1
+id  name     city      balance
+──────────────────────────────
+  1 Ada      London      120.5
+  2 Grace    Arlington    80.0
+  3 Edsger   Austin      200.0
+  4 Barbara  London      310.0
+  5 Donald   Austin       45.5
+  6 Niklaus  Zurich      520.0
+  7 John     Cambridge    89.9
+  8 Margaret Arlington   150.0
+
+──────────────────────────────
+TOTAL (8 rows)
+ 36                    1515.90
