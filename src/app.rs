@@ -242,6 +242,9 @@ pub struct App {
     pub show_internals: bool,
     /// An overlay was launched from the app menu: Esc returns HOME.
     menu_launched: bool,
+    /// Select-all semantics for prefilled single-line editors: the
+    /// first typed char REPLACES the prefill; Backspace edits it.
+    editor_fresh: bool,
     /// Held-key acceleration state for record paging.
     last_edit_page: Option<std::time::Instant>,
     page_streak: u32,
@@ -274,6 +277,7 @@ impl App {
             last_find: None,
             show_internals: false,
             menu_launched: false,
+            editor_fresh: false,
             last_edit_page: None,
             page_streak: 0,
             last_auto_sample: std::time::Instant::now(),
@@ -697,16 +701,22 @@ impl App {
                         }
                     });
                     ed.editing = Some(current);
+                    self.editor_fresh = true;
                 }
             }
             Command::EditChar(c) => {
+                let fresh = std::mem::take(&mut self.editor_fresh);
                 if let Overlay::Edit(ed) = &mut self.overlay {
                     if let Some(buf) = &mut ed.editing {
+                        if fresh {
+                            buf.clear(); // first keystroke replaces prefill
+                        }
                         buf.push(c);
                     }
                 }
             }
             Command::EditBackspace => {
+                self.editor_fresh = false; // Backspace = edit the prefill
                 if let Overlay::Edit(ed) = &mut self.overlay {
                     if let Some(buf) = &mut ed.editing {
                         buf.pop();
@@ -1296,6 +1306,7 @@ impl App {
     }
 
     fn designer_edit_begin(&mut self) {
+        self.editor_fresh = true;
         match &mut self.overlay {
             Overlay::Qbe(st) => {
                 st.naming = false;
@@ -1331,6 +1342,7 @@ impl App {
     }
 
     fn designer_edit_alt(&mut self) {
+        self.editor_fresh = true;
         match &mut self.overlay {
             Overlay::Apps(st) => {
                 if let Some(item) = st.items.get(st.cursor) {
@@ -1452,12 +1464,17 @@ impl App {
             }
             return;
         }
+        let fresh = std::mem::take(&mut self.editor_fresh);
         if let Some(buf) = self.designer_buffer() {
+            if fresh {
+                buf.clear(); // first keystroke replaces prefill
+            }
             buf.push(c);
         }
     }
 
     fn designer_backspace(&mut self) {
+        self.editor_fresh = false; // Backspace = edit the prefill
         if let Some(buf) = self.designer_buffer() {
             buf.pop();
         }
@@ -3161,6 +3178,44 @@ mod tests {
         assert!(ddl.contains("\"label\" TEXT NOT NULL"), "{ddl}");
         assert!(ddl.contains("\"field3\" REAL DEFAULT 1"), "{ddl}");
         assert!(a.db.has_rowid("gadgets"));
+    }
+
+    #[test]
+    fn typing_replaces_prefilled_values_backspace_edits_them() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // b = "row1"
+        a.apply(Command::EditBegin);   // prefilled with "row1"
+        for c in "fresh".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(
+            ed.editing.as_deref(),
+            Some("fresh"),
+            "first keystroke must REPLACE the prefill, not append"
+        );
+        // Backspace first → edit mode: prefill retained minus one char.
+        a.apply(Command::Back); // cancel buffer
+        a.apply(Command::EditBegin);
+        a.apply(Command::EditBackspace);
+        a.apply(Command::EditChar('X'));
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.editing.as_deref(), Some("rowX"));
+        a.apply(Command::Back);
+        a.apply(Command::Back);
+
+        // Same contract in the table designer's name editor.
+        a.apply(Command::OpenCreate(Some("g".into())));
+        a.apply(Command::DesignerAdd); // "field2"
+        a.apply(Command::DesignerEditBegin);
+        for c in "qty".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        let Overlay::Create(st) = &a.overlay else { panic!() };
+        assert_eq!(st.draft.fields[1].name, "qty", "no backspacing required");
     }
 
     #[test]

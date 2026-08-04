@@ -201,8 +201,9 @@ def reels():
     r = Reel("crud", "edit · insert · required · delete · find")
     r.key("c").key(ENTER, 0.6).expect("BROWSE customers")
     r.key(ENTER, 0.8).expect("CUSTOMER CARD")
-    r.key(DOWN).key(ENTER, 0.4)                       # edit City
-    r.type("Testville").key(ENTER, 0.6).expect("saved 1 field(s)")
+    r.key(DOWN).key(ENTER, 0.4)                       # City shows 'London'
+    r.type("Testville").key(ENTER, 0.6)               # typing REPLACES it
+    r.expect("saved 1 field(s)").expect("Testville")
     r.key(ESC, 0.5)                                   # Enter saved already
     r.key("a", 0.6).expect("NEW customers record")
     r.key(F10, 0.6).expect('"Name" is required')
@@ -265,8 +266,7 @@ def reels():
     r.key(SPACE, 0.4)                                 # hide id
     r.key(DOWN).key("r", 0.4)                         # require customer
     r.key(ENTER, 0.3)
-    r.keys(["\x7f"] * 8, gap=0.12)                    # clear label
-    r.type("Who").key(ENTER, 0.4)
+    r.type("Who").key(ENTER, 0.4)                     # typing replaces prefill
     r.key(F6, 0.6).expect("saved form")
     r.key(F2, 0.8).expect("FORM PAINTER · orders")
     r.key(TAB, 0.4)                                   # select next field
@@ -287,8 +287,7 @@ def reels():
     r.key("A", 0.7).expect("APPLICATIONS GENERATOR · crm")
     r.key("n", 0.5).expect("New item")
     r.key(ENTER, 0.3)                                 # edits the NEW item
-    r.keys(["\x7f"] * 8, gap=0.1)
-    r.type("Zap orders").key(ENTER, 0.4)
+    r.type("Zap orders").key(ENTER, 0.4)              # typing replaces prefill
     r.key("e", 0.3).type("orders").key(ENTER, 0.5).expect("Zap orders")
     r.keys(["["] * 2, gap=0.3)                        # reorder up
     r.key(F2, 0.8).expect("CRM").expect("Zap orders").expect("Customers")
@@ -307,8 +306,7 @@ def reels():
     r.expect('"id" INTEGER PRIMARY KEY')              # live SQL preview
     r.key("n", 0.4)                                   # field2
     r.key(ENTER, 0.3)
-    r.keys(["\x7f"] * 6, gap=0.1)
-    r.type("label").key(ENTER, 0.4)
+    r.type("label").key(ENTER, 0.4)                   # typing replaces prefill
     r.key("r", 0.4).expect('"label" TEXT NOT NULL')
     r.key("n", 0.4).key("t", 0.4)                     # field3 → REAL
     r.key("d", 0.3).type("1").key(ENTER, 0.5).expect('"field3" REAL DEFAULT 1')

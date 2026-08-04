@@ -37,6 +37,8 @@ phosphor is three things in one program:
 A few habits worth forming on day one:
 
   · Esc always backs out one level. When in doubt, press it.
+  · Editing any prefilled value: just TYPE — the first keystroke
+    replaces it. Backspace instead to edit it in place.
   · F1 opens this help on the topic for wherever you are.
     Left and Right arrows move between topics; Esc leaves.
   · The dot prompt (press .) accepts real SQL and short commands.
