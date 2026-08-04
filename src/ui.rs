@@ -40,8 +40,90 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Paint(_) => draw_paint(f, app),
         Overlay::Apps(_) => draw_apps(f, app),
         Overlay::AppMenu(_) => draw_app_menu(f, app),
+        Overlay::Create(_) => draw_create(f, app),
         Overlay::None => {}
     }
+}
+
+fn draw_create(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::Create(st) = &app.overlay else { return };
+    let area = centered(
+        f.area(),
+        78,
+        (st.draft.fields.len() as u16 + 12).min(f.area().height),
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" TABLE DESIGNER · {} ", st.draft.table),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " n field · t type · p pk · r null · u uniq · d default · F2 create ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    // Row 0: the table name.
+    let name_selected = st.cursor == 0;
+    let name_span: Span = match (name_selected, st.editing_default, &st.editing) {
+        (true, false, Some(buf)) => editing_span(buf, th),
+        _ => Span::styled(
+            st.draft.table.clone(),
+            if name_selected { th.cursor() } else { th.bright() },
+        ),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(pad("NAME", 17), if name_selected { th.bright() } else { th.dim() }),
+        name_span,
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled(pad("FIELD", 17), th.dim()),
+        Span::styled(pad("TYPE", 9), th.dim()),
+        Span::styled(pad("PK", 4), th.dim()),
+        Span::styled(pad("NULL?", 6), th.dim()),
+        Span::styled(pad("UNIQ", 5), th.dim()),
+        Span::styled("DEFAULT", th.dim()),
+    ]));
+    for (i, fld) in st.draft.fields.iter().enumerate() {
+        let selected = st.cursor == i + 1;
+        let style = if selected { th.cursor() } else { th.base() };
+        let name: Span = match (selected, st.editing_default, &st.editing) {
+            (true, false, Some(buf)) => editing_span(buf, th),
+            _ => Span::styled(pad(&fld.name, 17), style),
+        };
+        let default: Span = match (selected, st.editing_default, &st.editing) {
+            (true, true, Some(buf)) => editing_span(buf, th),
+            _ => Span::styled(fld.default.clone(), style),
+        };
+        lines.push(Line::from(vec![
+            name,
+            Span::styled(pad(fld.ftype.as_str(), 9), style),
+            Span::styled(pad(if fld.pk { "¶" } else { " " }, 4), style),
+            Span::styled(pad(if fld.notnull { "*" } else { " " }, 6), style),
+            Span::styled(pad(if fld.unique { "u" } else { " " }, 5), style),
+            default,
+        ]));
+    }
+    let rows_h = lines.len() as u16 + 1;
+    let [rows_area, sql_area] =
+        Layout::vertical([Constraint::Length(rows_h), Constraint::Fill(1)]).areas(inner);
+    f.render_widget(Paragraph::new(lines), rows_area);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::styled("SQL:", th.dim()),
+            Line::styled(st.draft.sql(), th.bright()),
+        ])
+        .wrap(ratatui::widgets::Wrap { trim: false }),
+        sql_area,
+    );
 }
 
 /// A Rect at canvas coords (x,y) inside `inner`, clamped so partially
@@ -875,7 +957,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
             .style(th.base())
             .title(Span::styled(title, th.bright()))
             .title_bottom(Line::styled(
-                " ↑↓ field · PgUp/PgDn record · Enter edit · F10 save · Esc ",
+                " ↑↓ field · Enter edit/save · PgUp/PgDn record · Esc ",
                 th.dim(),
             ));
         let inner = block.inner(area);
@@ -969,7 +1051,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "Enter edit · PgUp/PgDn record · F10 save · Esc cancel",
+        "Enter edit/save · PgUp/PgDn record · Esc cancel",
         th.dim(),
     ));
     f.render_widget(Paragraph::new(lines), inner);

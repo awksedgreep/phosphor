@@ -18,9 +18,11 @@ export PHOSPHOR_EXT=/path/to/libdbhealth_ext.so
 phosphor crm.db
 ```
 
-phosphor creates the file and shows an empty table list. Press `.` —
-the dot prompt — and give your CRM its bones (paste both statements,
-one at a time):
+phosphor creates the file and shows an empty table list. Two ways to
+give your CRM bones — press **`C`** for the TABLE DESIGNER (define
+fields as rows while the CREATE TABLE writes itself underneath, `F2`
+builds it), or press `.` and speak SQL directly (paste both, one at a
+time):
 
 ```sql
 CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, balance REAL DEFAULT 0)
@@ -44,7 +46,7 @@ record:
 | `a` | a NEW record form opens |
 | `Enter`, type `Ada`, `Enter` | Name filled (it's marked `*` — required) |
 | `↓` `Enter`, type `London`, `Enter` | City filled |
-| `F10` | saved — the grid shows row 1 |
+| `Enter` again on the last field | commits — and **saves**; Enter is the save key (F10 saves-and-closes) |
 | `PgDn` / `PgUp` (in the form) | flip through records — hold it down and fly; edits save as you page |
 
 Add two or three more. Try saving one with a blank Name — phosphor

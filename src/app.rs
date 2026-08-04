@@ -7,6 +7,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
+use crate::creator::CreateState;
 use crate::db::{ColumnInfo, DbLink, PValue, TableInfo};
 use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
 use crate::help::{self, HelpState};
@@ -34,6 +35,7 @@ pub enum Overlay {
     Pager(PagerState),
     Form(FormState),
     Paint(PaintState),
+    Create(CreateState),
     Apps(AppDesignState),
     AppMenu(AppMenuState),
 }
@@ -200,6 +202,11 @@ pub enum Command {
     PaintDelete,
     HelpScroll(i64),
     HelpTopic(i64),
+    /// The TABLE DESIGNER (dBASE CREATE structure screen).
+    OpenCreate(Option<String>),
+    CreatePk,
+    CreateNull,
+    CreateUnique,
     /// First-letter seek in the sidebar (dBASE-style, cycling).
     SidebarSeek(char),
     /// Show/hide internal tables (shadow, _phosphor, dbhealth views).
@@ -350,6 +357,15 @@ impl App {
                 (Some(_), Enter) => Command::EditCommitField,
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::EditBackspace,
+                // Save WHILE typing a value: fold the buffer and save —
+                // "type, F10" must work without an Enter in between
+                // (field report: F10 appeared dead mid-edit).
+                (Some(_), F(10)) => Command::EditSave,
+                (Some(_), Char('s')) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Command::EditSave
+                }
+                (Some(_), PageDown) => Command::EditPage(1),
+                (Some(_), PageUp) => Command::EditPage(-1),
                 (Some(_), Char(c)) => Command::EditChar(c),
                 (None, Up) => Command::EditMove(-1),
                 (None, Down) => Command::EditMove(1),
@@ -417,6 +433,30 @@ impl App {
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
                 (None, F(6)) => Command::DesignerSave,
+                (None, F(1)) => Command::Help,
+                (None, Esc) => Command::Back,
+                _ => return None,
+            });
+        }
+        if let Overlay::Create(st) = &self.overlay {
+            return Some(match (&st.editing, key.code) {
+                (Some(_), Enter) => Command::DesignerCommit,
+                (Some(_), Esc) => Command::Back,
+                (Some(_), Backspace) => Command::DesignerBackspace,
+                (Some(_), Char(c)) => Command::DesignerChar(c),
+                (None, Up | Char('k')) => Command::DesignerMove(-1),
+                (None, Down | Char('j')) => Command::DesignerMove(1),
+                (None, Char('n')) => Command::DesignerAdd,
+                (None, Char('x')) => Command::DesignerDelete,
+                (None, Char('t')) => Command::DesignerCycle,
+                (None, Char('p')) => Command::CreatePk,
+                (None, Char('r')) => Command::CreateNull,
+                (None, Char('u')) => Command::CreateUnique,
+                (None, Char('d')) => Command::DesignerEditAlt,
+                (None, Char('[')) => Command::DesignerSwap(-1),
+                (None, Char(']')) => Command::DesignerSwap(1),
+                (None, Enter) => Command::DesignerEditBegin,
+                (None, F(2) | F(6)) => Command::DesignerRun,
                 (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
@@ -549,6 +589,7 @@ impl App {
                 Char('L') => Command::OpenLabels(None),
                 Char('F') => Command::OpenForm(None),
                 Char('A') => Command::OpenApps(None),
+                Char('C') => Command::OpenCreate(None),
                 Char('.') => Command::Focus(Focus::Prompt),
                 Tab => {
                     if self.grid.is_some() {
@@ -673,10 +714,20 @@ impl App {
                 }
             }
             Command::EditCommitField => {
+                // Enter commits the field, advances to the next one, and
+                // SAVES the record when it validates (user preference:
+                // Enter is the save key; F10/Ctrl-S remain save-and-
+                // close). During a NEW record with required fields still
+                // empty, the save quietly waits for them.
+                self.fold_editing_buffer();
                 if let Overlay::Edit(ed) = &mut self.overlay {
-                    if let Some(buf) = ed.editing.take() {
-                        ed.inputs[ed.cursor] = Some(buf);
+                    let n = ed.fields.len();
+                    if n > 0 {
+                        ed.cursor = (ed.cursor + 1) % n;
                     }
+                }
+                if self.edit_required_ok() {
+                    self.commit_edit();
                 }
             }
             Command::EditSave => self.edit_save(),
@@ -778,6 +829,10 @@ impl App {
                 self.prompt.cursor = i;
             }
             Command::PromptComplete => self.prompt_complete(),
+            Command::OpenCreate(name) => self.open_create(name),
+            Command::CreatePk => self.create_toggle(|f| f.pk = !f.pk),
+            Command::CreateNull => self.create_toggle(|f| f.notnull = !f.notnull),
+            Command::CreateUnique => self.create_toggle(|f| f.unique = !f.unique),
             Command::SidebarSeek(c) => self.sidebar_seek(c),
             Command::ToggleInternals => {
                 self.show_internals = !self.show_internals;
@@ -815,6 +870,10 @@ impl App {
             Overlay::Report(st) if st.editing.is_some() => st.editing = None,
             Overlay::Form(st) if st.editing.is_some() => st.editing = None,
             Overlay::Apps(st) if st.editing.is_some() => st.editing = None,
+            Overlay::Create(st) if st.editing.is_some() => {
+                st.editing = None;
+                st.editing_default = false;
+            }
             Overlay::Paint(st) if st.editing.is_some() => st.editing = None,
             Overlay::Paint(st) if st.pending_box.is_some() => st.pending_box = None,
             Overlay::Paint(_) => {
@@ -844,6 +903,7 @@ impl App {
             | Overlay::Pager(_)
             | Overlay::Form(_)
             | Overlay::Apps(_)
+            | Overlay::Create(_)
             | Overlay::AppMenu(_) => self.overlay = Overlay::None,
             Overlay::None => match self.focus {
                 Focus::Prompt => {
@@ -930,6 +990,7 @@ impl App {
             Overlay::Report(_) | Overlay::Pager(_) => "reports",
             Overlay::Form(_) | Overlay::Paint(_) => "forms",
             Overlay::Apps(_) | Overlay::AppMenu(_) => "apps",
+            Overlay::Create(_) => "browse",
             Overlay::Help(_) => return,
             Overlay::None => match self.focus {
                 Focus::Prompt => "prompt",
@@ -1076,6 +1137,31 @@ impl App {
         })
     }
 
+    fn open_create(&mut self, name: Option<String>) {
+        let name = name.unwrap_or_else(|| {
+            // A default name that doesn't collide with anything.
+            let mut n = 1;
+            loop {
+                let candidate = format!("table{n}");
+                if !self.tables.iter().any(|t| t.name == candidate) {
+                    break candidate;
+                }
+                n += 1;
+            }
+        });
+        self.overlay = Overlay::Create(CreateState::new(&name));
+    }
+
+    fn create_toggle(&mut self, f: impl FnOnce(&mut crate::creator::FieldDef)) {
+        if let Overlay::Create(st) = &mut self.overlay {
+            if let Some(i) = st.field_idx() {
+                if let Some(field) = st.draft.fields.get_mut(i) {
+                    f(field);
+                }
+            }
+        }
+    }
+
     fn open_qbe(&mut self, table: Option<String>) {
         let Some(table) = self.target_table(table) else {
             return self.err("qbe: no table selected (qbe <table>)");
@@ -1143,6 +1229,7 @@ impl App {
             Overlay::Form(st) => wrap(&mut st.cursor, d, st.spec.fields.len()),
             Overlay::Apps(st) => wrap(&mut st.cursor, d, st.items.len()),
             Overlay::AppMenu(st) => wrap(&mut st.cursor, d, st.items.len()),
+            Overlay::Create(st) => wrap(&mut st.cursor, d, st.draft.fields.len() + 1),
             _ => {}
         }
     }
@@ -1197,6 +1284,13 @@ impl App {
                 }
             }
             Overlay::Paint(st) => st.select_next(),
+            Overlay::Create(st) => {
+                if let Some(i) = st.field_idx() {
+                    if let Some(f) = st.draft.fields.get_mut(i) {
+                        f.ftype = f.ftype.cycle();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1225,16 +1319,34 @@ impl App {
                     st.editing = Some(item.label.clone());
                 }
             }
+            Overlay::Create(st) => {
+                st.editing_default = false;
+                st.editing = Some(match st.field_idx() {
+                    None => st.draft.table.clone(),
+                    Some(i) => st.draft.fields.get(i).map(|f| f.name.clone()).unwrap_or_default(),
+                });
+            }
             _ => {}
         }
     }
 
     fn designer_edit_alt(&mut self) {
-        if let Overlay::Apps(st) = &mut self.overlay {
-            if let Some(item) = st.items.get(st.cursor) {
-                st.editing_ref = true;
-                st.editing = Some(item.action_ref.clone());
+        match &mut self.overlay {
+            Overlay::Apps(st) => {
+                if let Some(item) = st.items.get(st.cursor) {
+                    st.editing_ref = true;
+                    st.editing = Some(item.action_ref.clone());
+                }
             }
+            Overlay::Create(st) => {
+                if let Some(i) = st.field_idx() {
+                    if let Some(f) = st.draft.fields.get(i) {
+                        st.editing_default = true;
+                        st.editing = Some(f.default.clone());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1245,6 +1357,7 @@ impl App {
             Overlay::Form(st) => st.editing.as_mut(),
             Overlay::Apps(st) => st.editing.as_mut(),
             Overlay::Paint(st) => st.editing.as_mut(),
+            Overlay::Create(st) => st.editing.as_mut(),
             _ => None,
         }
     }
@@ -1413,6 +1526,24 @@ impl App {
                     }
                 }
             }
+            Overlay::Create(st) => {
+                if let Some(buf) = st.editing.take() {
+                    match (st.field_idx(), st.editing_default) {
+                        (None, _) => st.draft.table = buf.trim().to_owned(),
+                        (Some(i), false) => {
+                            if let Some(f) = st.draft.fields.get_mut(i) {
+                                f.name = buf.trim().to_owned();
+                            }
+                        }
+                        (Some(i), true) => {
+                            if let Some(f) = st.draft.fields.get_mut(i) {
+                                f.default = buf;
+                            }
+                        }
+                    }
+                    st.editing_default = false;
+                }
+            }
             _ => {}
         }
         if let (Some(name), Overlay::Qbe(st)) = (&save_as, &self.overlay) {
@@ -1458,6 +1589,19 @@ impl App {
             Overlay::AppMenu(st) => {
                 if let Some(item) = st.items.get(st.cursor) {
                     self.app_run_item(&item.clone());
+                }
+            }
+            Overlay::Create(st) => {
+                let draft = st.draft.clone();
+                match draft.create(self.db.as_ref()) {
+                    Ok(()) => {
+                        self.overlay = Overlay::None;
+                        self.reload_tables();
+                        let table = draft.table.clone();
+                        self.open_table(&table);
+                        self.say(format!("created {table:?} — a adds the first record"));
+                    }
+                    Err(e) => self.err(e),
                 }
             }
             Overlay::Form(_) => {
@@ -1564,6 +1708,11 @@ impl App {
     }
 
     fn designer_add(&mut self) {
+        if let Overlay::Create(st) = &mut self.overlay {
+            let i = st.draft.add_field();
+            st.cursor = i + 1;
+            return;
+        }
         if let Overlay::Apps(st) = &self.overlay {
             let app = st.app.clone();
             match appsgen::add_item(self.db.as_ref(), &app, "New item") {
@@ -1581,6 +1730,15 @@ impl App {
     }
 
     fn designer_delete(&mut self) {
+        if let Overlay::Create(st) = &mut self.overlay {
+            if let Some(i) = st.field_idx() {
+                if i < st.draft.fields.len() {
+                    st.draft.fields.remove(i);
+                    st.cursor = st.cursor.min(st.draft.fields.len());
+                }
+            }
+            return;
+        }
         if let Overlay::Apps(st) = &self.overlay {
             let app = st.app.clone();
             if let Some(item) = st.items.get(st.cursor) {
@@ -1606,6 +1764,15 @@ impl App {
                 // +/- in the painter: widen/narrow the selected value cell.
                 if let Some(f) = st.spec.fields.get_mut(st.selected) {
                     f.width = (f.width as i64 + d * 2).clamp(1, 60) as u16;
+                }
+            }
+            Overlay::Create(st) => {
+                if let Some(i) = st.field_idx() {
+                    let to = i as i64 + d;
+                    if to >= 0 && (to as usize) < st.draft.fields.len() {
+                        st.draft.fields.swap(i, to as usize);
+                        st.cursor = to as usize + 1;
+                    }
                 }
             }
             Overlay::Apps(st) => {
@@ -1913,6 +2080,7 @@ impl App {
     /// dBASE-style — dirty edits COMMIT as you page (validation holds
     /// the page instead). The form stays open; hold the key and fly.
     fn edit_page(&mut self, d: i64) {
+        self.fold_editing_buffer();
         let (inserting, dirty, from) = match &self.overlay {
             Overlay::Edit(ed) => (ed.inserting, ed.dirty(), ed.row_abs),
             _ => return,
@@ -2176,10 +2344,33 @@ impl App {
         }
     }
 
+    /// Quietly true when every required field of the open EDIT has a
+    /// value (the loud version lives in commit_edit).
+    fn edit_required_ok(&self) -> bool {
+        let Overlay::Edit(ed) = &self.overlay else { return false };
+        ed.required.iter().enumerate().all(|(i, req)| {
+            !req || match &ed.inputs[i] {
+                Some(text) => PValue::parse(text, &ed.fields[i].0.decl_type) != PValue::Null,
+                None => ed.fields[i].1 != PValue::Null,
+            }
+        })
+    }
+
+    /// An open field-editing buffer counts as an edit: fold it into
+    /// inputs so save/paging never silently drop typed text.
+    fn fold_editing_buffer(&mut self) {
+        if let Overlay::Edit(ed) = &mut self.overlay {
+            if let Some(buf) = ed.editing.take() {
+                ed.inputs[ed.cursor] = Some(buf);
+            }
+        }
+    }
+
     /// Validate + write the current EDIT record. Returns true when the
     /// record is clean afterwards (saved, or nothing to save). Does NOT
     /// close the overlay — F10 closes, paging keeps flying.
     fn commit_edit(&mut self) -> bool {
+        self.fold_editing_buffer();
         // Required validation (crafted forms): the FINAL value of every
         // required field must be non-NULL, edited or not.
         if let Overlay::Edit(ed) = &self.overlay {
@@ -2234,8 +2425,19 @@ impl App {
         match result {
             Ok(msg) => {
                 if inserting {
-                    // Total changed: full refresh, keep the cursor near.
+                    // Total changed: full refresh, then flip the open
+                    // form onto the newly inserted record so further
+                    // Enters UPDATE it instead of inserting twins.
                     self.refresh_grid_keep_position();
+                    let last = self.grid.as_ref().map(|g| g.total - 1).unwrap_or(0);
+                    let cursor = match &self.overlay {
+                        Overlay::Edit(ed) => ed.cursor,
+                        _ => 0,
+                    };
+                    self.build_edit_for(last.max(0));
+                    if let Overlay::Edit(ed) = &mut self.overlay {
+                        ed.cursor = cursor.min(ed.fields.len().saturating_sub(1));
+                    }
                 } else {
                     // Invalidate the cache so the grid shows the new truth.
                     if let Some(g) = &mut self.grid {
@@ -2327,6 +2529,22 @@ impl App {
                 Some(sql) => self.run_select(&sql),
                 None => self.err(format!("no saved query named {name:?}")),
             };
+        }
+        {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.first().is_some_and(|t| t.eq_ignore_ascii_case("create")) && toks.len() <= 2 {
+                let second = toks.get(1).map(|t| t.to_ascii_lowercase());
+                let sql_word = matches!(
+                    second.as_deref(),
+                    Some("table" | "virtual" | "view" | "index" | "trigger"
+                        | "temp" | "temporary" | "unique" | "if")
+                );
+                if !sql_word {
+                    // `create` / `create gadgets` → the TABLE DESIGNER.
+                    // Anything SQL-shaped falls through and executes.
+                    return self.open_create(toks.get(1).map(|t| t.to_string()));
+                }
+            }
         }
         if let Some(rest) = line.strip_prefix("find ") {
             let needle = rest.trim().to_owned();
@@ -2836,6 +3054,113 @@ mod tests {
         a.apply(Command::OpenInsert);
         a.apply(Command::EditPage(1));
         assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.inserting));
+    }
+
+    #[test]
+    fn f10_saves_while_still_typing_in_a_field() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // column b
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        for c in "typed then F10".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        // NO EditCommitField — straight to save, like a human does it.
+        a.apply(Command::EditSave);
+        assert!(matches!(a.overlay, Overlay::None), "record saved+closed");
+        let q = a.db.query("SELECT b FROM t WHERE a = 1").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Text("typed then F10".into()));
+    }
+
+    #[test]
+    fn enter_saves_the_record_and_advances() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        for c in "enter-saved".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField); // Enter: commit + advance + SAVE
+        assert!(matches!(a.overlay, Overlay::Edit(_)), "form stays open");
+        let q = a.db.query("SELECT b FROM t WHERE a = 1").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Text("enter-saved".into()));
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.cursor, 0, "advanced (wrapped) to the next field");
+        assert!(!ed.dirty(), "record is clean after the Enter-save");
+    }
+
+    #[test]
+    fn enter_on_new_record_inserts_once_then_updates() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenInsert);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        for c in "once".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField); // Enter inserts...
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert!(!ed.inserting, "form flipped onto the inserted record");
+        a.apply(Command::EditMove(0));
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        for c in "twice".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField); // ...and Enter again UPDATES it
+        let q = a.db.query("SELECT count(*) FROM t WHERE b IN ('once','twice')").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Int(1), "no duplicate insert");
+    }
+
+    #[test]
+    fn table_designer_creates_a_real_editable_table() {
+        let mut a = app();
+        a.apply(Command::OpenCreate(Some("gadgets".into())));
+        assert!(matches!(a.overlay, Overlay::Create(_)));
+        a.apply(Command::DesignerAdd); // field2
+        a.apply(Command::DesignerEditBegin);
+        if let Overlay::Create(st) = &mut a.overlay {
+            st.editing = Some("label".into());
+        }
+        a.apply(Command::DesignerCommit);
+        a.apply(Command::CreateNull); // label NOT NULL
+        a.apply(Command::DesignerAdd); // field3
+        a.apply(Command::DesignerCycle); // TEXT → REAL
+        a.apply(Command::DesignerEditAlt);
+        if let Overlay::Create(st) = &mut a.overlay {
+            st.editing = Some("1".into());
+        }
+        a.apply(Command::DesignerCommit); // default 1
+        a.apply(Command::DesignerRun);
+        assert!(matches!(a.overlay, Overlay::None), "designer closed");
+        assert!(matches!(
+            &a.grid,
+            Some(Grid { source: GridSource::Table { name, .. }, .. }) if name == "gadgets"
+        ), "opened BROWSE on the new table");
+        let sql = a
+            .db
+            .query("SELECT sql FROM sqlite_master WHERE name = 'gadgets'")
+            .unwrap();
+        let PValue::Text(ddl) = &sql.rows[0][0] else { panic!() };
+        assert!(ddl.contains("\"id\" INTEGER PRIMARY KEY"), "{ddl}");
+        assert!(ddl.contains("\"label\" TEXT NOT NULL"), "{ddl}");
+        assert!(ddl.contains("\"field3\" REAL DEFAULT 1"), "{ddl}");
+        assert!(a.db.has_rowid("gadgets"));
     }
 
     #[test]

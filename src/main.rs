@@ -8,6 +8,7 @@
 
 mod app;
 mod appsgen;
+mod creator;
 mod db;
 mod forms;
 mod help;

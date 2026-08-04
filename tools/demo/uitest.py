@@ -202,12 +202,13 @@ def reels():
     r.key("c").key(ENTER, 0.6).expect("BROWSE customers")
     r.key(ENTER, 0.8).expect("CUSTOMER CARD")
     r.key(DOWN).key(ENTER, 0.4)                       # edit City
-    r.type("Testville").key(ENTER, 0.4)
-    r.key(F10, 0.6).expect("saved 1 field(s)")
+    r.type("Testville").key(ENTER, 0.6).expect("saved 1 field(s)")
+    r.key(ESC, 0.5)                                   # Enter saved already
     r.key("a", 0.6).expect("NEW customers record")
     r.key(F10, 0.6).expect('"Name" is required')
-    r.key(ENTER, 0.3).type("Zed").key(ENTER, 0.3)     # fill Name
-    r.key(F10, 0.8).expect("inserted rowid")
+    r.key(ENTER, 0.3).type("Zed").key(ENTER, 0.6).expect("inserted rowid")
+    r.key(ESC, 0.6)
+    r.key("g", 0.3)                                   # find scans forward
     r.key(".", 0.3).type("find Zed").key(ENTER, 0.7).expect("found at row")
     r.key("x", 0.5).expect("press x again")
     r.key("x", 0.7).expect("row deleted")
@@ -299,6 +300,25 @@ def reels():
     r.key(ESC, 0.4)
     out.append(r)
 
+    # ── T · the TABLE DESIGNER: structure screen → real table ────────
+    r = Reel("create", "the table designer: fields → CREATE TABLE → first record")
+    r.key(".", 0.3).type("create gadgets").key(ENTER, 0.7)
+    r.expect("TABLE DESIGNER · gadgets")
+    r.expect('"id" INTEGER PRIMARY KEY')              # live SQL preview
+    r.key("n", 0.4)                                   # field2
+    r.key(ENTER, 0.3)
+    r.keys(["\x7f"] * 6, gap=0.1)
+    r.type("label").key(ENTER, 0.4)
+    r.key("r", 0.4).expect('"label" TEXT NOT NULL')
+    r.key("n", 0.4).key("t", 0.4)                     # field3 → REAL
+    r.key("d", 0.3).type("1").key(ENTER, 0.5).expect('"field3" REAL DEFAULT 1')
+    r.key(F2, 0.8).expect("BROWSE gadgets").expect("created \"gadgets\"")
+    r.key("a", 0.6).expect("NEW gadgets record")
+    r.keys([DOWN], gap=0.2).key(ENTER, 0.3).type("widget").key(ENTER, 0.6)
+    r.expect("inserted rowid 1")
+    r.key(ESC, 0.5)
+    out.append(r)
+
     # ── P · record paging: hold the key, fly through the file ────────
     r = Reel("paging", "record paging: PgDn through 500 records")
     r.key("p").key(ENTER, 0.6).expect("BROWSE people")
@@ -311,7 +331,8 @@ def reels():
     r.keys([PGUP] * 3, gap=0.25, wait=0.5).expect("EDIT people · 242/500")
     # Dirty edit commits on page: type into note, page, check the grid.
     r.keys([DOWN] * 2, gap=0.2)
-    r.key(ENTER, 0.3).type("edited in flight").key(ENTER, 0.3)
+    r.key(ENTER, 0.3).type("edited in flight").key(ENTER, 0.5)
+    r.expect("saved 1 field(s)")                      # Enter saved it
     r.key(PGDN, 0.6).expect("EDIT people · 243/500")
     r.key(ESC, 0.5)
     r.key("g", 0.3)                                   # find scans forward

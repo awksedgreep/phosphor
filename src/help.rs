@@ -55,16 +55,20 @@ keys — or just type a letter to jump to the next table starting
 with it — and press Enter to open one in BROWSE, a grid that loads
 rows as you scroll, so a million-row table opens instantly.
 phosphor's own machinery (shadow tables, _phosphor catalogs, the
-dbhealth views) stays hidden; press i to reveal it.
+dbhealth views) stays hidden; press i to reveal it. Press C for
+the TABLE DESIGNER — define fields as rows (name, type, pk,
+null, unique, default) while the CREATE TABLE writes itself
+underneath; F2 builds it and opens the empty BROWSE.
 
 In the grid:
 
   · Arrow keys move cell by cell; PgUp/PgDn move a screenful;
     g jumps to the first row and G to the last.
   · Enter opens the current row in EDIT — a record form. Choose a
-    field, press Enter to type a new value, and press F10 (or
-    Ctrl-S) to save. Empty input means NULL. A ¶ marks the primary
-    key; a * marks a field that must not be left empty.
+    field, Enter to type a new value, and Enter again to commit it
+    — which also SAVES the record and moves to the next field.
+    F10/Ctrl-S save and close. Empty input means NULL. A ¶ marks
+    the primary key; a * marks a required field.
   · PgUp/PgDn (or ←/→) in the form flip to the previous/next
     RECORD — and holding the key ACCELERATES, up to ten records a
     stride, so a thousand-row file passes in seconds. Unsaved edits
@@ -101,6 +105,8 @@ Beyond SQL, the prompt knows a few short commands:
   help              this manual
   tables            back to the table list
   find <text>       search the current grid (n repeats)
+  create [name]     the TABLE DESIGNER (raw CREATE TABLE SQL
+                    still executes exactly as typed)
   qbe [table]       Query By Example designer
   report [name]     report designer (a table or a saved report)
   labels [table]    mailing labels, three across
@@ -299,7 +305,7 @@ Everywhere
 
 Table list
   ↑↓ move · letters seek · i internals · Enter browse
-  r refresh · q quit
+  C table designer · r refresh · q quit
 
 BROWSE grid
   ↑↓←→ / hjkl move · PgUp PgDn page · g G first/last row
@@ -309,8 +315,8 @@ BROWSE grid
 
 EDIT / NEW record
   ↑↓ field · PgUp/PgDn (or ←→) previous/next record
-  Enter edit value · Enter again commit
-  F10 / Ctrl-S save · Esc cancel value, then close
+  Enter edit value · Enter again commit + SAVE + next field
+  F10 / Ctrl-S save and close · Esc cancel value, then close
 
 Dot prompt
   Enter run · ↑↓ history · Tab complete
