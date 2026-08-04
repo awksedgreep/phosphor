@@ -235,6 +235,9 @@ pub struct App {
     pub show_internals: bool,
     /// An overlay was launched from the app menu: Esc returns HOME.
     menu_launched: bool,
+    /// Held-key acceleration state for record paging.
+    last_edit_page: Option<std::time::Instant>,
+    page_streak: u32,
 }
 
 impl App {
@@ -264,6 +267,8 @@ impl App {
             last_find: None,
             show_internals: false,
             menu_launched: false,
+            last_edit_page: None,
+            page_streak: 0,
             last_auto_sample: std::time::Instant::now(),
         };
         app.reload_tables();
@@ -1915,8 +1920,19 @@ impl App {
         if inserting {
             return self.say("save the new record first (F10), then page");
         }
+        // Held-key acceleration: rapid repeats stretch the stride, so
+        // holding PgDn goes from record-at-a-time to 10-at-a-time —
+        // key autorepeat (~25/s) stops being the speed limit.
+        let now = std::time::Instant::now();
+        let rapid = self
+            .last_edit_page
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(150));
+        self.page_streak = if rapid { self.page_streak + 1 } else { 0 };
+        self.last_edit_page = Some(now);
+        let step = (1 + self.page_streak as i64 / 6).min(10);
+
         let total = self.grid.as_ref().map(|g| g.total).unwrap_or(0);
-        let target = (from + d).clamp(0, total.saturating_sub(1).max(0));
+        let target = (from + d * step).clamp(0, total.saturating_sub(1).max(0));
         if target == from {
             return self.say(if d < 0 { "first record" } else { "last record" });
         }
@@ -2820,6 +2836,27 @@ mod tests {
         a.apply(Command::OpenInsert);
         a.apply(Command::EditPage(1));
         assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.inserting));
+    }
+
+    #[test]
+    fn paging_accelerates_while_held() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenEdit);
+        // 30 rapid presses: streak k gives stride min(1 + k/6, 10) —
+        // 6·1 + 6·2 + 6·3 + 6·4 + 6·5 = 90 records covered.
+        for _ in 0..30 {
+            a.apply(Command::EditPage(1));
+        }
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.row_abs, 90, "held paging must accelerate");
+        // A pause resets the streak back to single-stepping.
+        a.last_edit_page = Some(
+            std::time::Instant::now() - std::time::Duration::from_millis(400),
+        );
+        a.apply(Command::EditPage(1));
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.row_abs, 91, "a pause resets to stride 1");
     }
 
     #[test]

@@ -108,6 +108,14 @@ fn main() -> std::io::Result<()> {
         app.apply(app::Command::OpenAppMenu(app.app_home.clone()));
     }
 
+    fn finish(
+        _terminal: ratatui::DefaultTerminal,
+        r: std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        ratatui::restore();
+        r
+    }
+
     let mut terminal = ratatui::init();
     let result = loop {
         if let Err(e) = terminal.draw(|f| ui::draw(f, &mut app)) {
@@ -115,20 +123,37 @@ fn main() -> std::io::Result<()> {
         }
         // Poll instead of block so time-based behavior (the live health
         // console) can tick between keystrokes.
-        match event::poll(std::time::Duration::from_millis(250)) {
-            Ok(true) => match event::read() {
-                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
-                    if let Some(cmd) = app.map_key(key) {
-                        // The command bus: every action goes through
-                        // apply() (DESIGN.md, "Building scripting-ready").
-                        app.apply(cmd);
+        // Drain EVERY pending event before redrawing: at high key-
+        // repeat rates one-event-per-frame made rendering the speed
+        // limit (record paging capped at the autorepeat rate).
+        let mut budget = 64;
+        let mut first = true;
+        loop {
+            let ready = if first {
+                event::poll(std::time::Duration::from_millis(250))
+            } else {
+                event::poll(std::time::Duration::ZERO)
+            };
+            first = false;
+            match ready {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                        if let Some(cmd) = app.map_key(key) {
+                            // The command bus: every action goes through
+                            // apply() (DESIGN.md, "Building scripting-ready").
+                            app.apply(cmd);
+                        }
+                        budget -= 1;
+                        if budget == 0 || app.quit {
+                            break;
+                        }
                     }
-                }
-                Ok(_) => {}
-                Err(e) => break Err(e),
-            },
-            Ok(false) => {}
-            Err(e) => break Err(e),
+                    Ok(_) => {}
+                    Err(e) => return finish(terminal, Err(e)),
+                },
+                Ok(false) => break,
+                Err(e) => return finish(terminal, Err(e)),
+            }
         }
         app.tick();
         if app.quit {

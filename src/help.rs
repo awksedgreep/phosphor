@@ -66,8 +66,9 @@ In the grid:
     Ctrl-S) to save. Empty input means NULL. A ¶ marks the primary
     key; a * marks a field that must not be left empty.
   · PgUp/PgDn (or ←/→) in the form flip to the previous/next
-    RECORD — hold the key and fly through the file, old-school.
-    Unsaved edits SAVE as you page; a failed rule holds the page.
+    RECORD — and holding the key ACCELERATES, up to ten records a
+    stride, so a thousand-row file passes in seconds. Unsaved edits
+    SAVE as you page; a failed rule holds the page.
   · a adds a NEW record with the same form. Fields you leave blank
     take the database's own defaults.
   · x deletes the current row — but asks you to press x a second
