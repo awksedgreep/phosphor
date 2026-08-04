@@ -16,3 +16,19 @@ rusqlite = { version = "0.37", features = ["bundled", "load_extension"] }
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
 base64 = "0.22"
+
+# The faker seeder: cargo run --release --features seed --bin phosphor-seed
+fake = { version = "2", optional = true }
+rand = { version = "0.8", optional = true }
+
+[features]
+seed = ["dep:fake", "dep:rand"]
+
+[[bin]]
+name = "phosphor"
+path = "src/main.rs"
+
+[[bin]]
+name = "phosphor-seed"
+path = "src/bin/seed.rs"
+required-features = ["seed"]

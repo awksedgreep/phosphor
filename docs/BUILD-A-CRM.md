@@ -45,6 +45,7 @@ record:
 | `Enter`, type `Ada`, `Enter` | Name filled (it's marked `*` — required) |
 | `↓` `Enter`, type `London`, `Enter` | City filled |
 | `F10` | saved — the grid shows row 1 |
+| `PgDn` / `PgUp` (in the form) | flip through records — hold it down and fly; edits save as you page |
 
 Add two or three more. Try saving one with a blank Name — phosphor
 refuses, politely. That rule came free from `NOT NULL`; you'll add your

@@ -51,6 +51,9 @@ In the grid:
     field, press Enter to type a new value, and press F10 (or
     Ctrl-S) to save. Empty input means NULL. A ¶ marks the primary
     key; a * marks a field that must not be left empty.
+  · PgUp/PgDn (or ←/→) in the form flip to the previous/next
+    RECORD — hold the key and fly through the file, old-school.
+    Unsaved edits SAVE as you page; a failed rule holds the page.
   · a adds a NEW record with the same form. Fields you leave blank
     take the database's own defaults.
   · x deletes the current row — but asks you to press x a second
@@ -290,7 +293,8 @@ BROWSE grid
   Q qbe · R report · L labels · F form · A applications
 
 EDIT / NEW record
-  ↑↓ field · Enter edit value · Enter again commit
+  ↑↓ field · PgUp/PgDn (or ←→) previous/next record
+  Enter edit value · Enter again commit
   F10 / Ctrl-S save · Esc cancel value, then close
 
 Dot prompt

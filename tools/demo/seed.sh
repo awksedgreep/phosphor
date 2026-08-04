@@ -38,6 +38,18 @@ INSERT INTO _phosphor_forms(table_ref, layout_json) VALUES ('customers',
  {"column":"id","label":"ID","include":false,"required":false}]}');
 SQL
 
+# 500 deterministic people: the record-paging reel flies through these.
+sqlite3 "$DB" <<'SQL'
+CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, note TEXT);
+INSERT INTO people(name, city, note)
+  WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500)
+  SELECT 'Person ' || x,
+         CASE x % 4 WHEN 0 THEN 'London' WHEN 1 THEN 'Austin'
+                    WHEN 2 THEN 'Zurich' ELSE 'Arlington' END,
+         'record ' || x || ' of 500'
+  FROM c;
+SQL
+
 # dbhealth with a fast cadence so the live console moves on camera.
 sqlite3 "$DB" ".load $DBHEALTH_EXT" \
   "CREATE VIRTUAL TABLE dbhealth USING dbhealth(every=2);

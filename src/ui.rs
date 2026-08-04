@@ -867,7 +867,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
         let title = if ed.inserting {
             format!(" NEW {} record{dirty} ", ed.table)
         } else {
-            format!(" EDIT {} · rowid {}{dirty} ", ed.table, ed.rowid)
+            format!(" EDIT {} · {}/{}{dirty} ", ed.table, ed.row_abs + 1, app.grid.as_ref().map(|g| g.total).unwrap_or(0))
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -875,7 +875,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
             .style(th.base())
             .title(Span::styled(title, th.bright()))
             .title_bottom(Line::styled(
-                " ↑↓ field · Enter edit · F10/Ctrl-S save · Esc ",
+                " ↑↓ field · PgUp/PgDn record · Enter edit · F10 save · Esc ",
                 th.dim(),
             ));
         let inner = block.inner(area);
@@ -920,7 +920,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
     let title = if ed.inserting {
         format!(" NEW {} record{dirty} ", ed.table)
     } else {
-        format!(" EDIT {} · rowid {}{dirty} ", ed.table, ed.rowid)
+        format!(" EDIT {} · {}/{}{dirty} ", ed.table, ed.row_abs + 1, app.grid.as_ref().map(|g| g.total).unwrap_or(0))
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -969,7 +969,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "Enter edit · F10/Ctrl-S save · Esc cancel",
+        "Enter edit · PgUp/PgDn record · F10 save · Esc cancel",
         th.dim(),
     ));
     f.render_widget(Paragraph::new(lines), inner);

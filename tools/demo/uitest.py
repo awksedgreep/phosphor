@@ -299,6 +299,24 @@ def reels():
     r.key(ESC, 0.4)
     out.append(r)
 
+    # ── P · record paging: hold the key, fly through the file ────────
+    r = Reel("paging", "record paging: PgDn through 500 records")
+    r.key("p").key(ENTER, 0.6).expect("BROWSE people")
+    r.key(ENTER, 0.7).expect("EDIT people · 1/500")
+    r.keys([PGDN] * 30, gap=0.05, wait=0.6).expect("EDIT people · 31/500")
+    r.keys([PGDN] * 40, gap=0.04, wait=0.6).expect("EDIT people · 71/500")
+    r.expect("record 71 of 500")                      # the DATA flips too
+    r.keys([PGUP] * 3, gap=0.2, wait=0.5).expect("EDIT people · 68/500")
+    # Dirty edit commits on page: type into note, page, check the grid.
+    r.keys([DOWN] * 2, gap=0.2)
+    r.key(ENTER, 0.3).type("edited in flight").key(ENTER, 0.3)
+    r.key(PGDN, 0.6).expect("EDIT people · 69/500")
+    r.key(ESC, 0.5)
+    r.key("g", 0.3)                                   # find scans forward
+    r.key(".", 0.3).type("find edited in flight").key(ENTER, 0.8)
+    r.expect("found at")
+    out.append(r)
+
     # ── H · health console + contextual help ─────────────────────────
     r = Reel("health", "DBHEALTH live · contextual help")
     r.key(F10, 1.2).expect("DBHEALTH · dbhealth").expect("LIVE")

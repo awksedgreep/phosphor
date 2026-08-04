@@ -56,6 +56,8 @@ pub struct EditState {
     /// The painted layout, when the crafted form has 2D coordinates —
     /// draw_edit renders CREATE SCREEN style instead of the list.
     pub painted: Option<FormSpec>,
+    /// Absolute grid row of this record (paging context; 0 for NEW).
+    pub row_abs: i64,
     pub rowid: i64,
     pub fields: Vec<(ColumnInfo, PValue)>,
     /// Display labels (custom when a crafted form exists for the table).
@@ -184,6 +186,8 @@ pub enum Command {
     OpenApps(Option<String>),
     OpenAppMenu(Option<String>),
     OpenInsert,
+    /// Flip the EDIT form to the previous/next RECORD (dBASE paging).
+    EditPage(i64),
     DeleteRow,
     FindNext,
     PromptClear,
@@ -344,6 +348,8 @@ impl App {
                 (Some(_), Char(c)) => Command::EditChar(c),
                 (None, Up) => Command::EditMove(-1),
                 (None, Down) => Command::EditMove(1),
+                (None, PageDown | Right) => Command::EditPage(1),
+                (None, PageUp | Left) => Command::EditPage(-1),
                 (None, Enter) => Command::EditBegin,
                 (None, F(10)) => Command::EditSave,
                 (None, Char('s')) if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -743,6 +749,7 @@ impl App {
             Command::OpenApps(name) => self.open_apps(name),
             Command::OpenAppMenu(name) => self.open_app_menu(name),
             Command::OpenInsert => self.open_insert(),
+            Command::EditPage(d) => self.edit_page(d),
             Command::DeleteRow => self.delete_row(),
             Command::FindNext => self.find_next(),
             Command::PromptClear => {
@@ -1830,15 +1837,32 @@ impl App {
     }
 
     fn open_edit(&mut self) {
-        let Some(g) = &self.grid else { return };
-        let GridSource::Table { name, editable } = &g.source else {
-            return self.say("query results are read-only (Esc to go back)");
-        };
-        if !editable {
-            return self.say("this table has no rowid; BROWSE is read-only here");
+        match &self.grid {
+            Some(Grid {
+                source: GridSource::Table { editable, .. },
+                ..
+            }) => {
+                if !*editable {
+                    return self.say("this table has no rowid; BROWSE is read-only here");
+                }
+            }
+            Some(_) => return self.say("query results are read-only (Esc to go back)"),
+            None => return,
         }
-        let idx = g.cur_row - g.cache_start;
-        let (Some(row), Some(rowids)) = (g.row(g.cur_row), &g.rowids) else {
+        let abs = self.grid.as_ref().map(|g| g.cur_row).unwrap_or(0);
+        self.build_edit_for(abs);
+    }
+
+    /// Build (or rebuild) the EDIT overlay for the record at absolute
+    /// grid row `abs` — used by open_edit and by record PAGING.
+    fn build_edit_for(&mut self, abs: i64) {
+        // Make sure the cache covers the target row, and move the grid
+        // cursor with the form so context follows the flip.
+        self.grid_jump(abs);
+        let Some(g) = &self.grid else { return };
+        let GridSource::Table { name, .. } = &g.source else { return };
+        let idx = abs - g.cache_start;
+        let (Some(row), Some(rowids)) = (g.row(abs), &g.rowids) else {
             return;
         };
         let Some(rowid) = rowids.get(idx as usize).copied() else {
@@ -1860,18 +1884,46 @@ impl App {
         let painted = self.apply_crafted_form(&name, &mut fields, &mut labels, &mut required);
 
         let n = fields.len();
+        // Preserve the field cursor across a page flip.
+        let keep_cursor = match &self.overlay {
+            Overlay::Edit(prev) if !prev.inserting => prev.cursor.min(n.saturating_sub(1)),
+            _ => 0,
+        };
         self.overlay = Overlay::Edit(EditState {
             table: name,
             inserting: false,
             painted,
+            row_abs: abs,
             rowid,
             fields,
             labels,
             required,
             inputs: vec![None; n],
-            cursor: 0,
+            cursor: keep_cursor,
             editing: None,
         });
+    }
+
+    /// PgUp/PgDn (or ←→) in EDIT: flip to the previous/next RECORD,
+    /// dBASE-style — dirty edits COMMIT as you page (validation holds
+    /// the page instead). The form stays open; hold the key and fly.
+    fn edit_page(&mut self, d: i64) {
+        let (inserting, dirty, from) = match &self.overlay {
+            Overlay::Edit(ed) => (ed.inserting, ed.dirty(), ed.row_abs),
+            _ => return,
+        };
+        if inserting {
+            return self.say("save the new record first (F10), then page");
+        }
+        let total = self.grid.as_ref().map(|g| g.total).unwrap_or(0);
+        let target = (from + d).clamp(0, total.saturating_sub(1).max(0));
+        if target == from {
+            return self.say(if d < 0 { "first record" } else { "last record" });
+        }
+        if dirty && !self.commit_edit() {
+            return; // validation or db error: stay on this record
+        }
+        self.build_edit_for(target);
     }
 
     /// Apply the saved form for `table` (order/labels/hide/required) to
@@ -1931,6 +1983,7 @@ impl App {
             table: name,
             inserting: true,
             painted,
+            row_abs: 0,
             rowid: 0,
             fields,
             labels,
@@ -2102,6 +2155,15 @@ impl App {
     }
 
     fn edit_save(&mut self) {
+        if self.commit_edit() {
+            self.overlay = Overlay::None;
+        }
+    }
+
+    /// Validate + write the current EDIT record. Returns true when the
+    /// record is clean afterwards (saved, or nothing to save). Does NOT
+    /// close the overlay — F10 closes, paging keeps flying.
+    fn commit_edit(&mut self) -> bool {
         // Required validation (crafted forms): the FINAL value of every
         // required field must be non-NULL, edited or not.
         if let Overlay::Edit(ed) = &self.overlay {
@@ -2117,7 +2179,8 @@ impl App {
                 };
                 if is_null {
                     let label = ed.labels[i].clone();
-                    return self.err(format!("{label:?} is required"));
+                    self.err(format!("{label:?} is required"));
+                    return false;
                 }
             }
         }
@@ -2136,11 +2199,11 @@ impl App {
                     .collect();
                 Some((ed.table.clone(), ed.rowid, changes, ed.inserting))
             }
-            _ => return,
+            _ => return false,
         };
         let Some((table, rowid, changes, inserting)) = payload else {
-            self.overlay = Overlay::None;
-            return self.say("no changes");
+            self.say("no changes");
+            return true;
         };
         let n = changes.len();
         let result = if inserting {
@@ -2154,7 +2217,6 @@ impl App {
         };
         match result {
             Ok(msg) => {
-                self.overlay = Overlay::None;
                 if inserting {
                     // Total changed: full refresh, keep the cursor near.
                     self.refresh_grid_keep_position();
@@ -2165,10 +2227,20 @@ impl App {
                         g.cache_start = g.cur_row;
                     }
                     self.ensure_cache();
+                    // The record on screen is clean now.
+                    if let Overlay::Edit(ed) = &mut self.overlay {
+                        for input in ed.inputs.iter_mut() {
+                            *input = None;
+                        }
+                    }
                 }
                 self.say(msg);
+                true
             }
-            Err(e) => self.err(e),
+            Err(e) => {
+                self.err(e);
+                false
+            }
         }
     }
 
@@ -2700,6 +2772,54 @@ mod tests {
             matches!(a.overlay, Overlay::AppMenu(_)),
             "menu-launched pager must return to the menu in app mode"
         );
+    }
+
+    #[test]
+    fn edit_pages_through_records_and_commits_dirty_edits() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenEdit);
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.row_abs, 0);
+        assert_eq!(ed.fields[1].1, PValue::Text("row1".into()));
+
+        // Page forward: same overlay, next record.
+        a.apply(Command::EditPage(1));
+        let Overlay::Edit(ed) = &a.overlay else { panic!("form closed") };
+        assert_eq!(ed.row_abs, 1);
+        assert_eq!(ed.fields[1].1, PValue::Text("row2".into()));
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 1, "grid follows");
+
+        // Dirty edit commits on page (the dBASE contract).
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        for c in "paged-save".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        a.apply(Command::EditPage(1));
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.row_abs, 2);
+        let q = a.db.query("SELECT b FROM t WHERE a = 2").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Text("paged-save".into()));
+
+        // Fly to the end: clamped with a message, form stays open.
+        for _ in 0..600 {
+            a.apply(Command::EditPage(1));
+        }
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.row_abs, 499);
+        a.apply(Command::EditPage(1));
+        assert!(a.status.as_ref().is_some_and(|(m, _)| m == "last record"));
+
+        // Paging is blocked while inserting a NEW record.
+        a.apply(Command::Back);
+        a.apply(Command::OpenInsert);
+        a.apply(Command::EditPage(1));
+        assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.inserting));
     }
 
     #[test]
