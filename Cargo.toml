@@ -1,6 +1,6 @@
 [package]
 name = "phosphor"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "The 1988 green-screen database desktop, reborn: forms, reports, menus, and a self-monitoring SQLite/libSQL database. The moon in a terminal."
