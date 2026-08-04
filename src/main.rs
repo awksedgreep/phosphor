@@ -24,9 +24,47 @@ use crate::app::App;
 use crate::db::{DbLink, EmbeddedDb};
 use crate::remote::RemoteDb;
 
+const USAGE: &str = "\
+phosphor — the green-screen database desktop of 1988, reborn
+
+USAGE
+    phosphor [OPTIONS] [DATABASE]
+
+    DATABASE     a SQLite/libSQL file (created if missing), or an
+                 http(s):// URL of a self-hosted sqld server.
+                 Defaults to an in-memory scratch database.
+
+OPTIONS
+    --app [NAME]   boot into an application menu crafted with the
+                   Applications Generator (A inside phosphor)
+    --manual       print the full manual as markdown and exit
+    -h, --help     this help
+    -V, --version  version
+
+ENVIRONMENT
+    PHOSPHOR_EXT    path to libdbhealth_ext.so / libtimeless_ext.so —
+                    loads dbhealth + telemetry into embedded databases
+    PHOSPHOR_TOKEN  bearer token for authenticated sqld/Turso servers
+
+Inside phosphor: F1 is the manual, Esc always backs out, . is the
+dot prompt, q quits from the top level (Ctrl-Q from anywhere).
+";
+
 fn main() -> std::io::Result<()> {
     // phosphor [--app [name]] <file.db | http(s)://sqld>
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{USAGE}");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("phosphor {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--manual") {
+        print!("{}", help::manual_markdown());
+        return Ok(());
+    }
     let mut app_mode = false;
     let mut app_name: Option<String> = None;
     if let Some(i) = args.iter().position(|a| a == "--app") {

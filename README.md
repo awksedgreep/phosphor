@@ -130,7 +130,12 @@ from the real program.
 | **DBHEALTH, live** — the report and sparklines moving on their own (auto-collection + the live console) | ![dbhealth console](docs/demo/health.gif) |
 | **`--app` mode** — the ▓▓ CRM ▓▓ menu; hotkeys run reports and browses; the database IS the application | ![app mode](docs/demo/appmode.gif) |
 
-See [DESIGN.md](DESIGN.md) for the feature revival map and architecture.
+**Read more:** the [manual](docs/MANUAL.md) (generated from the
+in-app F1 help — `phosphor --manual`), the ten-minute
+[Build a CRM](docs/BUILD-A-CRM.md) tutorial, the
+[UI tour](docs/UI-TOUR.md) (every screen on film, straight from the
+test suite), and [DESIGN.md](DESIGN.md) for the feature revival map
+and architecture.
 
 ## License
 

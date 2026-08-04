@@ -1,27 +1,13 @@
-//! Online help, 1988-style: F1 anywhere opens the topic for the screen
-//! you are on, written in English rather than in keybinding shorthand.
-//! ←→ walks the topics; the whole manual lives in the binary.
+# The phosphor manual
 
-pub struct HelpTopic {
-    pub key: &'static str,
-    pub title: &'static str,
-    pub body: &'static str,
-}
+*This file is generated from the in-app help (`phosphor --manual`).
+Press F1 inside phosphor for the same manual, opened to the topic
+for whatever screen you are on. Do not edit by hand — edit
+`src/help.rs` and regenerate.*
 
-pub struct HelpState {
-    pub topic: usize,
-    pub scroll: u16,
-}
+## Welcome
 
-pub fn topic_index(key: &str) -> usize {
-    TOPICS.iter().position(|t| t.key == key).unwrap_or(0)
-}
-
-pub const TOPICS: &[HelpTopic] = &[
-    HelpTopic {
-        key: "welcome",
-        title: "Welcome",
-        body: "\
+```text
 Welcome to phosphor — the green-screen database desktop of 1988,
 reborn on a database from 2026.
 
@@ -44,12 +30,12 @@ A few habits worth forming on day one:
 
 Everything you build — forms, queries, reports, menus — is saved in
 small _phosphor tables inside the database file. Copy the file and
-the application travels with it.",
-    },
-    HelpTopic {
-        key: "browse",
-        title: "Browsing & editing",
-        body: "\
+the application travels with it.
+```
+
+## Browsing & editing
+
+```text
 The left panel lists tables (▪) and views (◇). Move with the arrow
 keys — or just type a letter to jump to the next table starting
 with it — and press Enter to open one in BROWSE, a grid that loads
@@ -78,12 +64,12 @@ your field order, your labels, your required rules, and — if you
 painted one — your screen layout.
 
 Views and query results open read-only; phosphor tells you so in
-the title bar rather than letting a save fail later.",
-    },
-    HelpTopic {
-        key: "prompt",
-        title: "The dot prompt",
-        body: "\
+the title bar rather than letting a save fail later.
+```
+
+## The dot prompt
+
+```text
 Press . from anywhere to reach the dot prompt — the fastest way to
 talk to a database ever shipped. Type a statement, press Enter.
 
@@ -108,12 +94,12 @@ Beyond SQL, the prompt knows a few short commands:
 
 Comforts: Up/Down walk your history, Tab completes table names and
 commands, Ctrl-A/Ctrl-E jump to the ends of the line, Ctrl-U clears
-it, Ctrl-W deletes the previous word.",
-    },
-    HelpTopic {
-        key: "qbe",
-        title: "Query By Example",
-        body: "\
+it, Ctrl-W deletes the previous word.
+```
+
+## Query By Example
+
+```text
 Press Q on a table (or type qbe at the prompt) to open the Query By
 Example grid: one line per column, and the SQL phosphor writes from
 it displayed at the bottom of the screen at all times. QBE's job is
@@ -135,12 +121,12 @@ Multiple filters combine with AND.
 F2 runs the query into the grid. F6 asks for a name and saves the
 query into the database; after that,  run <name>  at the prompt
 executes it, reports can use it as a source, and application menus
-can point at it.",
-    },
-    HelpTopic {
-        key: "reports",
-        title: "Reports & labels",
-        body: "\
+can point at it.
+```
+
+## Reports & labels
+
+```text
 Press R on a table (or type report at the prompt) to design a
 banded report — the kind that produced forty years of business
 paperwork: a page header with title and page number, detail lines,
@@ -163,12 +149,12 @@ w writes the report to a text file, Esc returns. F6 saves the
 design; application menus can run it by name.
 
 Labels: press L on a table for mailing labels, three across, every
-visible column on its own line — Avery energy, zero configuration.",
-    },
-    HelpTopic {
-        key: "forms",
-        title: "Forms & the painter",
-        body: "\
+visible column on its own line — Avery energy, zero configuration.
+```
+
+## Forms & the painter
+
+```text
 Press F on a table to craft its entry form. The designer lists every
 column with four properties:
 
@@ -193,12 +179,12 @@ appear on a canvas exactly the size the form will render:
   F6        save — EDIT now renders your painted screen
 
 Esc from the painter returns to the list designer; nothing is lost
-until you leave without saving.",
-    },
-    HelpTopic {
-        key: "apps",
-        title: "Applications",
-        body: "\
+until you leave without saving.
+```
+
+## Applications
+
+```text
 Press A to open the Applications Generator: craft a menu, hand the
 database to your team, and it opens as an application.
 
@@ -220,12 +206,12 @@ To ship it:   phosphor --app yourfile.db
 The menu comes up first, and Esc from the top level always returns
 to it — the database IS the application. Since menus, forms, and
 reports live in _phosphor tables inside the file, copying the file
-deploys the app, and libSQL replication deploys it everywhere.",
-    },
-    HelpTopic {
-        key: "health",
-        title: "The DBHEALTH console",
-        body: "\
+deploys the app, and libSQL replication deploys it everywhere.
+```
+
+## The DBHEALTH console
+
+```text
 If the database carries timeless-libsql telemetry (a dbhealth
 table), press F10 — or type health at the prompt — for the console.
 
@@ -256,12 +242,12 @@ To give a database dbhealth, load the timeless extension and run:
   CREATE VIRTUAL TABLE dbhealth USING timeless_health;
   INSERT INTO dbhealth(dbhealth) VALUES ('sample');
 then sample on a timer or from cron. A year of minute-by-minute
-history compresses to about two megabytes.",
-    },
-    HelpTopic {
-        key: "connect",
-        title: "Connecting",
-        body: "\
+history compresses to about two megabytes.
+```
+
+## Connecting
+
+```text
 phosphor speaks to databases two ways, chosen by the argument:
 
   phosphor crm.db
@@ -283,12 +269,12 @@ Environment variables:
 
 Everything you build is stored in the database itself, so it works
 identically over both connections — craft a form on your laptop
-against the file, and your team sees it over sqld tomorrow.",
-    },
-    HelpTopic {
-        key: "keys",
-        title: "Key reference",
-        body: "\
+against the file, and your team sees it over sqld tomorrow.
+```
+
+## Key reference
+
+```text
 Everywhere
   F1 help · Esc back out · Ctrl-Q quit · . dot prompt
   Tab cycle focus · F10 dbhealth console
@@ -319,53 +305,5 @@ Pager (reports, labels)
   ↑↓ PgUp PgDn scroll · g G ends · w write file
 
 Help
-  ←→ topics · ↑↓ PgUp PgDn scroll · Esc close",
-    },
-];
-
-
-/// Render the whole in-app manual as markdown — `phosphor --manual`.
-/// The web manual is generated FROM the binary, so the two can never
-/// disagree (docs/MANUAL.md is this function's output, committed).
-pub fn manual_markdown() -> String {
-    let mut out = String::from(
-        "# The phosphor manual\n\n\
-         *This file is generated from the in-app help (`phosphor --manual`).\n\
-         Press F1 inside phosphor for the same manual, opened to the topic\n\
-         for whatever screen you are on. Do not edit by hand — edit\n\
-         `src/help.rs` and regenerate.*\n",
-    );
-    for t in TOPICS {
-        out.push_str(&format!("\n## {}\n\n```text\n{}\n```\n", t.title, t.body));
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn manual_covers_every_topic() {
-        let md = manual_markdown();
-        for t in TOPICS {
-            assert!(md.contains(&format!("## {}", t.title)), "{} missing", t.key);
-        }
-        assert!(md.contains("generated from the in-app help"));
-    }
-
-    #[test]
-    fn topics_resolve_and_have_prose() {
-        assert!(TOPICS.len() >= 9);
-        for t in TOPICS {
-            assert!(!t.body.is_empty(), "{} has no body", t.key);
-            assert!(
-                t.body.lines().all(|l| l.chars().count() <= 70),
-                "{} has a line wider than the help pane",
-                t.key
-            );
-        }
-        assert_eq!(topic_index("qbe"), 3);
-        assert_eq!(topic_index("nonsense"), 0, "unknown keys land on welcome");
-    }
-}
+  ←→ topics · ↑↓ PgUp PgDn scroll · Esc close
+```

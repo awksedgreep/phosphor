@@ -163,6 +163,24 @@ Cost of retrofitting them later: the rework we're avoiding.
 Each phase ships usable. The order is deliberate: browsing pays rent
 immediately, and the builder features land on a UI that already feels right.
 
+## Testing
+
+Three layers, one philosophy — the artifact proves itself:
+
+1. **Bus tests** (`cargo test`): the command bus means every user
+   action is a `Command` value, so tests PLAY the app — navigation,
+   editing, designers, app mode — without a terminal.
+2. **The UI sweep** (`python3 tools/demo/uitest.py`): nine scripted
+   pty reels covering every screen, asserted against a reconstructed
+   SCREEN (a small terminal emulator in the harness — stream-grepping
+   is blind to cell-diff rendering). Each reel reseeds its database;
+   add `--render` and a green run regenerates `docs/demo/ui/*.gif`.
+3. **The GIFs are the docs**: demo footage only ever comes from a
+   passing run, so [UI-TOUR.md](docs/UI-TOUR.md) carries an implicit
+   warranty — what you see is what the tests proved. Frame extraction
+   + an actual look (`ffmpeg -i x.gif -vf select=...`) is part of the
+   release ritual; it has caught bugs every layer above missed.
+
 ## Open questions
 
 1. Name: `phosphor` chosen for the founding commit (the glow of a P1
