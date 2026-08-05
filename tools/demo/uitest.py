@@ -29,7 +29,8 @@ OUT = os.path.join(ROOT, "docs/demo/ui")
 WORK = "/tmp/phosphor-uitest-work"  # cwd for the app: report files land here
 
 ESC, ENTER, CTRL_Q, TAB, SPACE = "\x1b", "\r", "\x11", "\t", " "
-F1, F2, F5, F6, F10 = "\x1bOP", "\x1bOQ", "\x1b[15~", "\x1b[17~", "\x1b[21~"
+F1, F2, F3, F4, F5 = "\x1bOP", "\x1bOQ", "\x1bOR", "\x1bOS", "\x1b[15~"
+F6, F7, F8, F9, F10 = "\x1b[17~", "\x1b[18~", "\x1b[19~", "\x1b[20~", "\x1b[21~"
 UP, DOWN, LEFT, RIGHT = "\x1b[A", "\x1b[B", "\x1b[D", "\x1b[C"
 PGDN, PGUP, HOME, END = "\x1b[6~", "\x1b[5~", "\x1b[H", "\x1b[F"
 
@@ -304,12 +305,11 @@ def reels():
     r.key(".", 0.3).type("create gadgets").key(ENTER, 0.7)
     r.expect("TABLE DESIGNER · gadgets")
     r.expect('"id" INTEGER PRIMARY KEY')              # live SQL preview
-    r.key("n", 0.4)                                   # field2
-    r.key(ENTER, 0.3)
-    r.type("label").key(ENTER, 0.4)                   # typing replaces prefill
-    r.key("r", 0.4).expect('"label" TEXT NOT NULL')
-    r.key("n", 0.4).key("t", 0.4)                     # field3 → REAL
-    r.key("d", 0.3).type("1").key(ENTER, 0.5).expect('"field3" REAL DEFAULT 1')
+    r.key(F8, 0.4)                                    # insert a field
+    r.type("label").key(ENTER, 0.4)                   # just TYPE the name
+    r.key(F5, 0.4).expect('"label" TEXT NOT NULL')    # F5 = required
+    r.key(F8, 0.4).key(F3, 0.4)                       # new field → REAL
+    r.key(F7, 0.3).type("1").key(ENTER, 0.5).expect('"field3" REAL DEFAULT 1')
     # [ moves the field up: the SQL preview now shows it right
     # after the pk (the DEFAULT tail wraps, so assert the head).
     r.key("[", 0.5).expect('KEY,  "field3"')
@@ -317,11 +317,11 @@ def reels():
     r.key(F2, 0.8).expect("BROWSE gadgets").expect("created \"gadgets\"")
     r.key("a", 0.6).expect("NEW gadgets record")
     r.key("\t", 0.3)                                  # Tab to the next field
-    r.key(ENTER, 0.3).type("widget").key(ENTER, 0.6)
+    r.type("widget").key(ENTER, 0.6)                  # the form is LIVE: type
     r.expect("inserted rowid 1")
     # Keep typing after the insert: the next Enter UPDATEs, and the
     # form must keep showing the saved value (not a stale NULL).
-    r.key(ENTER, 0.3).type("2.5").key(ENTER, 0.6)
+    r.type("2.5").key(ENTER, 0.6)
     r.expect("saved 1 field(s)").expect("2.5")
     r.key(ESC, 0.5)
     out.append(r)

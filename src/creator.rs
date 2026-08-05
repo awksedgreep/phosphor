@@ -180,7 +180,7 @@ impl TableDraft {
             return Err("the table needs a name (Enter on the NAME row)".into());
         }
         if self.fields.is_empty() {
-            return Err("a table needs at least one field (n adds one)".into());
+            return Err("a table needs at least one field (F8 adds one)".into());
         }
         let mut seen = std::collections::HashSet::new();
         for f in &self.fields {

@@ -19,9 +19,9 @@ phosphor crm.db
 ```
 
 phosphor creates the file and shows an empty table list. Two ways to
-give your CRM bones — press **`C`** for the TABLE DESIGNER (define
-fields as rows while the CREATE TABLE writes itself underneath, `F2`
-builds it), or press `.` and speak SQL directly (paste both, one at a
+give your CRM bones — press **`C`** for the TABLE DESIGNER (type
+field names directly, F-keys set types and constraints, and the
+CREATE TABLE writes itself underneath — `F2` builds it), or press `.` and speak SQL directly (paste both, one at a
 time):
 
 ```sql
@@ -44,8 +44,8 @@ record:
 | keys | what happens |
 |---|---|
 | `a` | a NEW record form opens |
-| `Enter`, type `Ada`, `Enter` | Name filled (it's marked `*` — required) |
-| `↓` `Enter`, type `London`, `Enter` | City filled |
+| type `Ada`, `Enter` | Name filled — the form is live, just type (it's marked `*` — required) |
+| `Tab`, type `London`, `Enter` | City filled |
 | `Enter` again on the last field | commits — and **saves**; Enter is the save key (F10 saves-and-closes) |
 | `PgDn` / `PgUp` (in the form) | flip through records — hold it down and fly; edits save as you page |
 

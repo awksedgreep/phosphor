@@ -139,6 +139,10 @@ pub struct Prompt {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Quit,
+    /// Begin editing the current EDIT-form field with this first char.
+    EditType(char),
+    /// Begin editing the current designer NAME cell with this char.
+    CreateType(char),
     Focus(Focus),
     Back,
     Help,
@@ -386,6 +390,13 @@ impl App {
                 }
                 (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
+                // The form is LIVE, 1988-style: land on a field and
+                // just type — no Enter required to begin.
+                (None, Char(c))
+                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    Command::EditType(c)
+                }
                 _ => return None,
             });
         }
@@ -452,21 +463,28 @@ impl App {
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
                 (Some(_), Char(c)) => Command::DesignerChar(c),
-                (None, Up | Char('k')) => Command::DesignerMove(-1),
-                (None, Down | Char('j')) => Command::DesignerMove(1),
-                (None, Char('n')) => Command::DesignerAdd,
-                (None, Char('x')) => Command::DesignerDelete,
-                (None, Char('t')) => Command::DesignerCycle,
-                (None, Char('p')) => Command::CreatePk,
-                (None, Char('r')) => Command::CreateNull,
-                (None, Char('u')) => Command::CreateUnique,
-                (None, Char('d')) => Command::DesignerEditAlt,
+                (None, Up) => Command::DesignerMove(-1),
+                (None, Down | Tab) => Command::DesignerMove(1),
+                (None, BackTab) => Command::DesignerMove(-1),
+                (None, F(3)) => Command::DesignerCycle,
+                (None, F(4)) => Command::CreatePk,
+                (None, F(5)) => Command::CreateNull,
+                (None, F(6)) => Command::CreateUnique,
+                (None, F(7)) => Command::DesignerEditAlt,
+                (None, F(8) | Insert) => Command::DesignerAdd,
+                (None, F(9) | Delete) => Command::DesignerDelete,
                 (None, Char('[')) => Command::DesignerSwap(-1),
                 (None, Char(']')) => Command::DesignerSwap(1),
                 (None, Enter) => Command::DesignerEditBegin,
-                (None, F(2) | F(6)) => Command::DesignerRun,
+                (None, F(2)) => Command::DesignerRun,
                 (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
+                // Plain letters TYPE the field (or table) name.
+                (None, Char(c))
+                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    Command::CreateType(c)
+                }
                 _ => return None,
             });
         }
@@ -650,6 +668,18 @@ impl App {
         let is_delete = matches!(cmd, Command::DeleteRow);
         match cmd {
             Command::Quit => self.quit = true,
+            Command::EditType(c) => {
+                if matches!(&self.overlay, Overlay::Edit(ed) if ed.editing.is_none()) {
+                    self.apply(Command::EditBegin); // fresh: 1st char replaces
+                }
+                self.apply(Command::EditChar(c));
+            }
+            Command::CreateType(c) => {
+                if matches!(&self.overlay, Overlay::Create(st) if st.editing.is_none()) {
+                    self.apply(Command::DesignerEditBegin); // fresh likewise
+                }
+                self.apply(Command::DesignerChar(c));
+            }
             Command::Focus(f) => self.focus = f,
             Command::Back => self.back(),
             Command::Help => self.open_help(),
@@ -3087,6 +3117,31 @@ mod tests {
         a.apply(Command::OpenInsert);
         a.apply(Command::EditPage(1));
         assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.inserting));
+    }
+
+    #[test]
+    fn forms_and_designer_are_live_typing_begins_the_edit() {
+        // EDIT: no Enter needed — typing replaces the current value.
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // b = "row1"
+        for c in "live".chars() {
+            a.apply(Command::EditType(c));
+        }
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.editing.as_deref(), Some("live"), "typed straight in");
+        a.apply(Command::Back);
+        a.apply(Command::Back);
+        // TABLE DESIGNER: letters name the field the cursor is on.
+        a.apply(Command::OpenCreate(Some("g".into())));
+        a.apply(Command::DesignerAdd);
+        for c in "city".chars() {
+            a.apply(Command::CreateType(c));
+        }
+        a.apply(Command::DesignerCommit);
+        let Overlay::Create(st) = &a.overlay else { panic!() };
+        assert_eq!(st.draft.fields[1].name, "city", "no Enter, no backspacing");
     }
 
     #[test]

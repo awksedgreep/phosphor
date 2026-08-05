@@ -63,7 +63,7 @@ fn draw_create(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " n insert · [ ] move · t type · p pk · r null · u uniq · d default · F2 create ",
+            " F3 type F4 pk F5 null F6 uniq F7 dflt F8 ins F9 del [] move F2 create ",
             th.dim(),
         ));
     let inner = block.inner(area);
@@ -957,7 +957,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
             .style(th.base())
             .title(Span::styled(title, th.bright()))
             .title_bottom(Line::styled(
-                " ↑↓/Tab field · Enter edit/save · PgUp/PgDn record · Esc ",
+                " type to edit · ↑↓/Tab field · Enter save · PgUp/PgDn record · Esc ",
                 th.dim(),
             ));
         let inner = block.inner(area);
@@ -1051,7 +1051,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "Tab next · Enter edit/save · PgUp/PgDn record · Esc cancel",
+        "type to edit · Tab next · Enter save · PgUp/PgDn record · Esc cancel",
         th.dim(),
     ));
     f.render_widget(Paragraph::new(lines), inner);

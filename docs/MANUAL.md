@@ -44,20 +44,23 @@ with it — and press Enter to open one in BROWSE, a grid that loads
 rows as you scroll, so a million-row table opens instantly.
 phosphor's own machinery (shadow tables, _phosphor catalogs, the
 dbhealth views) stays hidden; press i to reveal it. Press C for
-the TABLE DESIGNER — define fields as rows (name, type, pk,
-null, unique, default) while the CREATE TABLE writes itself
-underneath. n inserts a field right AFTER the cursor (forgot
-street_name? stand on street_num and press n), [ and ] move a
-field up and down, x deletes it; F2 builds the table and opens
-the empty BROWSE.
+the TABLE DESIGNER — define fields as rows while the CREATE
+TABLE writes itself underneath. Just TYPE to name the current
+field (Enter commits it); the function keys set everything
+else: F3 cycles the type, F4 primary key, F5 required, F6
+unique, F7 edits the default. F8 (or Ins) inserts a field right
+AFTER the cursor — forgot street_name? stand on street_num and
+press F8 — F9 (or Del) deletes, [ and ] move a field up and
+down; F2 builds the table and opens the empty BROWSE.
 
 In the grid:
 
   · Arrow keys move cell by cell; PgUp/PgDn move a screenful;
     g jumps to the first row and G to the last.
-  · Enter opens the current row in EDIT — a record form. Choose a
-    field, Enter to type a new value, and Enter again to commit it
-    — which also SAVES the record and moves to the next field.
+  · Enter opens the current row in EDIT — a record form. The form
+    is LIVE: land on a field and just start typing (the old value
+    is replaced). Enter commits — which also SAVES the record and
+    moves to the next field.
     F10/Ctrl-S save and close. Empty input means NULL. A ¶ marks
     the primary key; a * marks a required field.
   · Tab moves to the next field (committing anything typed);
