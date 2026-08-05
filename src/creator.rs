@@ -100,6 +100,9 @@ impl TableDraft {
         }
     }
 
+    /// Append a field at the end (tests build drafts this way; the
+    /// designer itself always inserts relative to the cursor).
+    #[cfg(test)]
     pub fn add_field(&mut self) -> usize {
         self.insert_field(self.fields.len().checked_sub(1))
     }
@@ -273,7 +276,7 @@ mod tests {
         // NAME row (None) inserts at the top; placeholders never collide.
         d.insert_field(None);
         assert_eq!(d.fields[0].name, "field5");
-        assert_eq!(d.validate().map_err(|e| e), Ok(()), "no duplicate placeholders");
+        assert_eq!(d.validate(), Ok(()), "no duplicate placeholders");
     }
 
     #[test]
