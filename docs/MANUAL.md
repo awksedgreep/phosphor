@@ -106,6 +106,8 @@ Beyond SQL, the prompt knows a few short commands:
   form [table]      form designer (F2 inside it paints)
   apps / app        application designer / run an application
   run <name>        run a query saved from QBE
+  quit / exit       leave phosphor (q and Ctrl-Q work anywhere
+                    outside the prompt)
   health            the DBHEALTH console
   set theme <name>  green, amber, paper, or blue
 

@@ -2338,7 +2338,7 @@ impl App {
             self.tables.iter().map(|t| t.name.clone()).collect();
         candidates.extend(
             [
-                "select", "help", "tables", "health", "qbe", "report", "labels",
+                "select", "help", "tables", "health", "qbe", "report", "labels", "quit",
                 "form", "apps", "app", "run", "find", "set theme",
             ]
             .map(str::to_owned),
@@ -2536,6 +2536,10 @@ impl App {
         }
         if line == "help" {
             return self.open_help();
+        }
+        // dBASE ended sessions with QUIT; honor it (and friends).
+        if ["quit", "exit", "q"].iter().any(|w| line.eq_ignore_ascii_case(w)) {
+            return self.apply(Command::Quit);
         }
         if line == "health" {
             return self.open_health();
@@ -3083,6 +3087,18 @@ mod tests {
         a.apply(Command::OpenInsert);
         a.apply(Command::EditPage(1));
         assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.inserting));
+    }
+
+    #[test]
+    fn quit_at_the_dot_prompt() {
+        for word in ["quit", "QUIT", "exit", "q"] {
+            let mut a = app();
+            for c in word.chars() {
+                a.apply(Command::PromptChar(c));
+            }
+            a.apply(Command::PromptRun);
+            assert!(a.quit, "{word:?} must quit");
+        }
     }
 
     #[test]
