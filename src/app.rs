@@ -2463,10 +2463,16 @@ impl App {
                         g.cache_start = g.cur_row;
                     }
                     self.ensure_cache();
-                    // The record on screen is clean now.
+                    // The record on screen is clean now — fold the
+                    // committed inputs into the snapshot the form
+                    // displays, or saved values would revert to the
+                    // stale (often NULL) originals on screen.
                     if let Overlay::Edit(ed) = &mut self.overlay {
-                        for input in ed.inputs.iter_mut() {
-                            *input = None;
+                        for (i, input) in ed.inputs.iter_mut().enumerate() {
+                            if let Some(text) = input.take() {
+                                ed.fields[i].1 =
+                                    PValue::parse(&text, &ed.fields[i].0.decl_type);
+                            }
                         }
                     }
                 }
@@ -3179,6 +3185,38 @@ mod tests {
         assert!(ddl.contains("\"label\" TEXT NOT NULL"), "{ddl}");
         assert!(ddl.contains("\"field3\" REAL DEFAULT 1"), "{ddl}");
         assert!(a.db.has_rowid("gadgets"));
+    }
+
+    #[test]
+    fn saved_value_stays_on_the_form_after_insert_then_update() {
+        // The field-by-field NEW flow: first Enter INSERTS the record
+        // (other columns NULL), later Enters UPDATE it. The form must
+        // keep showing what was saved — not revert to the stale NULL
+        // snapshot taken at insert time (grid right, form wrong).
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE people(id INTEGER PRIMARY KEY, first TEXT, last TEXT)")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenInsert);
+        a.apply(Command::EditMove(1)); // skip the auto pk
+        a.apply(Command::EditBegin);
+        for c in "Mark".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField); // advance + INSERT
+        a.apply(Command::EditBegin);
+        for c in "Cotner".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField); // advance + UPDATE
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert!(ed.inputs.iter().all(|i| i.is_none()), "record is clean");
+        let shown: Vec<&PValue> = ed.fields.iter().map(|(_, v)| v).collect();
+        assert!(
+            shown.iter().any(|v| **v == PValue::Text("Cotner".into())),
+            "form reverted a saved value to its stale snapshot: {shown:?}"
+        );
     }
 
     #[test]

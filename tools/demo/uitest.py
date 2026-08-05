@@ -318,6 +318,10 @@ def reels():
     r.key("a", 0.6).expect("NEW gadgets record")
     r.keys([DOWN], gap=0.2).key(ENTER, 0.3).type("widget").key(ENTER, 0.6)
     r.expect("inserted rowid 1")
+    # Keep typing after the insert: the next Enter UPDATEs, and the
+    # form must keep showing the saved value (not a stale NULL).
+    r.key(ENTER, 0.3).type("2.5").key(ENTER, 0.6)
+    r.expect("saved 1 field(s)").expect("2.5")
     r.key(ESC, 0.5)
     out.append(r)
 
