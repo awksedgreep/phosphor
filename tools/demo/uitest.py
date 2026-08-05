@@ -358,6 +358,32 @@ def reels():
     r.key(ESC, 0.4)
     out.append(r)
 
+    # ── R · relations: declared FKs become child panes on the form ───
+    r = Reel("relations", "foreign keys → SET RELATION: child panes on the form")
+    r.key(".", 0.3).type("CREATE TABLE accounts(id INTEGER PRIMARY KEY, name TEXT)")
+    r.key(ENTER, 0.5)
+    r.key(".", 0.3).type("create invoices").key(ENTER, 0.7)
+    r.expect("TABLE DESIGNER · invoices")
+    r.key(F8, 0.3).type("item").key(ENTER, 0.4)
+    r.key(F8, 0.3).type("account_id").key(ENTER, 0.4)
+    r.keys([F3] * 4, gap=0.2, wait=0.4)               # TEXT → INTEGER
+    r.key(F10, 0.3).type("accounts").key(ENTER, 0.5)  # F10 = foreign key
+    r.expect('REFERENCES "accounts"')
+    r.key(F2, 0.8).expect("BROWSE invoices")
+    r.key(ESC, 0.5)
+    r.key(".", 0.3).type("INSERT INTO accounts(name) VALUES ('Ada'),('Grace')")
+    r.key(ENTER, 0.5)
+    r.key(".", 0.3)
+    r.type("INSERT INTO invoices(item, account_id) VALUES ('modem',1),('coax',1),('router',2)")
+    r.key(ENTER, 0.6).key(ESC, 0.4).key(ESC, 0.5)    # prompt → grid → sidebar
+    r.key("a", 0.4).key(ENTER, 0.7).expect("BROWSE accounts")
+    r.key(ENTER, 0.8).expect("EDIT accounts · 1/2")
+    r.expect("invoices (2)").expect("coax")           # Ada's pane, live
+    r.key(PGDN, 0.8).expect("invoices (1)").expect("router")
+    r.key(F4, 0.9).expect("router").expect_absent("modem")  # filtered browse
+    r.key(ESC, 0.5)
+    out.append(r)
+
     # ── I · app mode: the database IS the application ────────────────
     r = Reel("appmode", "--app: menu · report · single-Esc home",
              argv=[BIN, "--app", DB])

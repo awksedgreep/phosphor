@@ -50,7 +50,7 @@ fn draw_create(f: &mut Frame, app: &App) {
     let Overlay::Create(st) = &app.overlay else { return };
     let area = centered(
         f.area(),
-        78,
+        86,
         (st.draft.fields.len() as u16 + 12).min(f.area().height),
     );
     f.render_widget(Clear, area);
@@ -63,7 +63,7 @@ fn draw_create(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " F3 type F4 pk F5 null F6 uniq F7 dflt F8 ins F9 del [] move F2 create ",
+            " F3 type F4 pk F5 null F6 uniq F7 dflt F10 fk F8 ins F9 del [] move F2 create ",
             th.dim(),
         ));
     let inner = block.inner(area);
@@ -72,8 +72,9 @@ fn draw_create(f: &mut Frame, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     // Row 0: the table name.
     let name_selected = st.cursor == 0;
-    let name_span: Span = match (name_selected, st.editing_default, &st.editing) {
-        (true, false, Some(buf)) => editing_span(buf, th),
+    use crate::creator::EditSlot;
+    let name_span: Span = match (name_selected, st.slot, &st.editing) {
+        (true, EditSlot::Name, Some(buf)) => editing_span(buf, th),
         _ => Span::styled(
             st.draft.table.clone(),
             if name_selected { th.cursor() } else { th.bright() },
@@ -85,23 +86,28 @@ fn draw_create(f: &mut Frame, app: &App) {
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled(pad("FIELD", 17), th.dim()),
+        Span::styled(pad("FIELD", 16), th.dim()),
         Span::styled(pad("TYPE", 9), th.dim()),
         Span::styled(pad("PK", 4), th.dim()),
         Span::styled(pad("NULL?", 6), th.dim()),
         Span::styled(pad("UNIQ", 5), th.dim()),
-        Span::styled("DEFAULT", th.dim()),
+        Span::styled(pad("DEFAULT", 13), th.dim()),
+        Span::styled("FK →", th.dim()),
     ]));
     for (i, fld) in st.draft.fields.iter().enumerate() {
         let selected = st.cursor == i + 1;
         let style = if selected { th.cursor() } else { th.base() };
-        let name: Span = match (selected, st.editing_default, &st.editing) {
-            (true, false, Some(buf)) => editing_span(buf, th),
-            _ => Span::styled(pad(&fld.name, 17), style),
+        let name: Span = match (selected, st.slot, &st.editing) {
+            (true, EditSlot::Name, Some(buf)) => editing_span(buf, th),
+            _ => Span::styled(pad(&fld.name, 16), style),
         };
-        let default: Span = match (selected, st.editing_default, &st.editing) {
-            (true, true, Some(buf)) => editing_span(buf, th),
-            _ => Span::styled(fld.default.clone(), style),
+        let default: Span = match (selected, st.slot, &st.editing) {
+            (true, EditSlot::Default, Some(buf)) => editing_span(buf, th),
+            _ => Span::styled(pad(&fld.default, 13), style),
+        };
+        let refs: Span = match (selected, st.slot, &st.editing) {
+            (true, EditSlot::Refs, Some(buf)) => editing_span(buf, th),
+            _ => Span::styled(fld.references.clone(), style),
         };
         lines.push(Line::from(vec![
             name,
@@ -110,6 +116,7 @@ fn draw_create(f: &mut Frame, app: &App) {
             Span::styled(pad(if fld.notnull { "*" } else { " " }, 6), style),
             Span::styled(pad(if fld.unique { "u" } else { " " }, 5), style),
             default,
+            refs,
         ]));
     }
     let rows_h = lines.len() as u16 + 1;
@@ -937,13 +944,68 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Render the SET RELATION panes: one titled mini-list per child link.
+fn link_pane_lines(ed: &crate::app::EditState, th: &crate::theme::Theme) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, link) in ed.links.iter().enumerate() {
+        let key = ["F4", "F5", "F6"].get(i).copied().unwrap_or("");
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled(format!("─ {} ({}) ", link.child, link.total), th.bright()),
+            Span::styled(
+                format!("{key} opens ").to_string() + &"─".repeat(30),
+                th.dim(),
+            ),
+        ]));
+        if link.rows.is_empty() {
+            lines.push(Line::styled("  (none yet)", th.dim()));
+            continue;
+        }
+        lines.push(Line::styled(
+            format!(
+                "  {}",
+                link.header
+                    .iter()
+                    .map(|h| format!("{h:<14.14}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            th.dim(),
+        ));
+        for row in &link.rows {
+            lines.push(Line::styled(
+                format!(
+                    "  {}",
+                    row.iter()
+                        .map(|v| format!("{v:<14.14}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+                th.base(),
+            ));
+        }
+        if link.total > link.rows.len() as i64 {
+            lines.push(Line::styled(
+                format!("  … {} more ({key})", link.total - link.rows.len() as i64),
+                th.dim(),
+            ));
+        }
+    }
+    lines
+}
+
 fn draw_edit(f: &mut Frame, app: &App) {
     let th = app.theme;
     let Overlay::Edit(ed) = &app.overlay else { return };
     // Painted forms render CREATE SCREEN style; unpainted stay a list.
     if let Some(spec) = &ed.painted {
         let (cw, ch) = spec.size;
-        let area = centered(f.area(), cw + 2, ch + 2);
+        let panes = link_pane_lines(ed, th);
+        let area = centered(
+            f.area(),
+            (cw + 2).max(50),
+            (ch + 2 + panes.len() as u16).min(f.area().height),
+        );
         f.render_widget(Clear, area);
         let dirty = if ed.dirty() { " *" } else { "" };
         let title = if ed.inserting {
@@ -987,6 +1049,15 @@ fn draw_edit(f: &mut Frame, app: &App) {
                 }
             })
         });
+        if !panes.is_empty() && inner.height > ch {
+            let below = Rect {
+                x: inner.x,
+                y: inner.y + ch,
+                width: inner.width,
+                height: inner.height - ch,
+            };
+            f.render_widget(Paragraph::new(panes), below);
+        }
         return;
     }
     let label_w = ed
@@ -996,7 +1067,12 @@ fn draw_edit(f: &mut Frame, app: &App) {
         .max()
         .unwrap_or(4)
         .clamp(4, 20);
-    let area = centered(f.area(), 62, (ed.fields.len() as u16 + 4).min(f.area().height));
+    let panes = link_pane_lines(ed, th);
+    let area = centered(
+        f.area(),
+        if panes.is_empty() { 62 } else { 66 },
+        (ed.fields.len() as u16 + 4 + panes.len() as u16).min(f.area().height),
+    );
     f.render_widget(Clear, area);
     let dirty = if ed.dirty() { " *" } else { "" };
     let title = if ed.inserting {
@@ -1049,6 +1125,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
             value_span,
         ]));
     }
+    lines.extend(panes);
     lines.push(Line::raw(""));
     lines.push(Line::styled(
         "type to edit · Tab next · Enter save · PgUp/PgDn record · Esc cancel",

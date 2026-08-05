@@ -25,11 +25,16 @@ CREATE TABLE writes itself underneath — `F2` builds it), or press `.` and spea
 time):
 
 ```sql
-CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT, balance REAL DEFAULT 0)
+CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, city TEXT, balance REAL DEFAULT 0)
 ```
 ```sql
-CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT NOT NULL, product TEXT, qty INTEGER, amount REAL, region TEXT)
+CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT NOT NULL REFERENCES customers(name), product TEXT, qty INTEGER, amount REAL, region TEXT)
 ```
+
+That `REFERENCES` is the good stuff — in the TABLE DESIGNER it's
+`F10` on a field. Declare it and phosphor gives you dBASE's SET
+RELATION for free: open a customer and their orders appear in a
+pane under the form (keep reading).
 
 The tables appear in the sidebar as you create them. *(While you're
 here: if you loaded the extension, `CREATE VIRTUAL TABLE dbhealth USING
@@ -50,7 +55,10 @@ record:
 | `PgDn` / `PgUp` (in the form) | flip through records — hold it down and fly; edits save as you page |
 
 Add two or three more. Try saving one with a blank Name — phosphor
-refuses, politely. That rule came free from `NOT NULL`; you'll add your
+refuses, politely. And once orders exist, notice the **orders pane**
+under each customer: that's the foreign key at work — it refreshes
+live as you page, and `F4` opens it as a filtered BROWSE.
+*(Watch it: [relations.gif](demo/ui/relations.gif))* That rule came free from `NOT NULL`; you'll add your
 own rules next. *(Watch it: [crud.gif](demo/ui/crud.gif))*
 
 ## 3 · Craft the entry form

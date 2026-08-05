@@ -48,7 +48,9 @@ the TABLE DESIGNER — define fields as rows while the CREATE
 TABLE writes itself underneath. Just TYPE to name the current
 field (Enter commits it); the function keys set everything
 else: F3 cycles the type, F4 primary key, F5 required, F6
-unique, F7 edits the default. F8 (or Ins) inserts a field right
+unique, F7 edits the default, F10 sets a FOREIGN KEY (type the
+parent table — a bare name points at its primary key, or
+table(column) to be exact). F8 (or Ins) inserts a field right
 AFTER the cursor — forgot street_name? stand on street_num and
 press F8 — F9 (or Del) deletes, [ and ] move a field up and
 down; F2 builds the table and opens the empty BROWSE.
@@ -65,6 +67,10 @@ In the grid:
     the primary key; a * marks a required field.
   · Tab moves to the next field (committing anything typed);
     Shift-Tab moves back.
+  · Declared FOREIGN KEYS become child panes under the form —
+    open a customer and their orders are right there, refreshed
+    live as you page. F4/F5/F6 opens a pane as a filtered BROWSE
+    of the child table.
   · PgUp/PgDn (or ←/→) in the form flip to the previous/next
     RECORD — and holding the key ACCELERATES, up to ten records a
     stride, so a thousand-row file passes in seconds. Unsaved edits

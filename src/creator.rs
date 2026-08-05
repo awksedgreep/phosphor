@@ -46,6 +46,9 @@ pub struct FieldDef {
     pub notnull: bool,
     pub unique: bool,
     pub default: String,
+    /// Raw REFERENCES target: "customers" or "customers(id)". A bare
+    /// table name points at that table's PRIMARY KEY (SQLite rules).
+    pub references: String,
 }
 
 impl FieldDef {
@@ -57,6 +60,7 @@ impl FieldDef {
             notnull: false,
             unique: false,
             default: String::new(),
+            references: String::new(),
         }
     }
 }
@@ -80,6 +84,21 @@ fn default_sql(raw: &str) -> String {
         v.to_owned()
     } else {
         format!("'{}'", v.replace('\'', "''"))
+    }
+}
+
+/// Render a REFERENCES target: quote the table ident (and column, if
+/// given as `table(col)`); pass already-quoted input through.
+fn references_sql(raw: &str) -> String {
+    if raw.starts_with('"') {
+        return raw.to_owned();
+    }
+    match raw.split_once('(') {
+        Some((table, rest)) => {
+            let col = rest.trim_end_matches(')');
+            format!("{}({})", quote_ident(table.trim()), quote_ident(col.trim()))
+        }
+        None => quote_ident(raw),
     }
 }
 
@@ -157,6 +176,9 @@ impl TableDraft {
             if !f.default.trim().is_empty() {
                 c.push_str(&format!(" DEFAULT {}", default_sql(&f.default)));
             }
+            if !f.references.trim().is_empty() {
+                c.push_str(&format!(" REFERENCES {}", references_sql(f.references.trim())));
+            }
             cols.push(c);
         }
         if !inline_pk && !pks.is_empty() {
@@ -201,12 +223,19 @@ impl TableDraft {
 }
 
 /// Designer state. Cursor row 0 is the table NAME; rows 1.. are fields.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EditSlot {
+    Name,
+    Default,
+    Refs,
+}
+
 pub struct CreateState {
     pub draft: TableDraft,
     pub cursor: usize,
     pub editing: Option<String>,
-    /// true → editing the DEFAULT value, false → the (table/field) name.
-    pub editing_default: bool,
+    /// Which text cell of the row the buffer edits.
+    pub slot: EditSlot,
 }
 
 impl CreateState {
@@ -215,7 +244,7 @@ impl CreateState {
             draft: TableDraft::new(name),
             cursor: 1, // the id field; Enter on row 0 renames the table
             editing: None,
-            editing_default: false,
+            slot: EditSlot::Name,
         }
     }
 
@@ -258,6 +287,30 @@ mod tests {
         assert!(sql.contains("\"region\" TEXT DEFAULT 'east'"), "{sql}");
         assert!(sql.contains("\"score\" REAL UNIQUE DEFAULT 0"), "{sql}");
         assert!(sql.contains("PRIMARY KEY (\"id\", \"region\")"), "{sql}");
+    }
+
+    #[test]
+    fn references_emit_and_enforce() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        let p = TableDraft::new("customers");
+        p.create(&db).unwrap();
+        let mut d = TableDraft::new("orders");
+        let f = d.add_field();
+        d.fields[f].name = "customer_id".into();
+        d.fields[f].ftype = FType::Integer;
+        d.fields[f].references = "customers(id)".into();
+        let g = d.add_field();
+        d.fields[g].name = "note".into();
+        d.fields[g].references = "customers".into(); // bare → pk
+        let sql = d.sql();
+        assert!(sql.contains("REFERENCES \"customers\"(\"id\")"), "{sql}");
+        assert!(sql.contains("\"note\" TEXT REFERENCES \"customers\"\n"), "{sql}");
+        d.create(&db).unwrap();
+        // The declared FK is discoverable — the fuel for linked forms.
+        let q = db
+            .query("SELECT \"table\", \"from\" FROM pragma_foreign_key_list('orders')")
+            .unwrap();
+        assert_eq!(q.rows.len(), 2);
     }
 
     #[test]

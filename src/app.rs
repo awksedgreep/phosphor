@@ -51,6 +51,19 @@ pub struct HealthView {
     pub sparks: Vec<(String, Vec<f64>, String)>,
 }
 
+/// A related-child pane under the EDIT form: the SET RELATION of
+/// 1988, discovered from declared foreign keys.
+pub struct LinkPane {
+    pub child: String,
+    pub child_col: String,
+    /// Rendered preview rows (already stringified, first few columns).
+    pub header: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub total: i64,
+    /// The parent-side value this pane is filtered on, as a SQL literal.
+    pub key_sql: String,
+}
+
 pub struct EditState {
     pub table: String,
     /// true → this is a NEW record (INSERT on save; rowid unused).
@@ -71,6 +84,8 @@ pub struct EditState {
     pub cursor: usize,
     /// Some(buffer) while a field is being typed into.
     pub editing: Option<String>,
+    /// Child panes from declared FKs pointing at this table.
+    pub links: Vec<LinkPane>,
 }
 
 impl EditState {
@@ -143,6 +158,10 @@ pub enum Command {
     EditType(char),
     /// Begin editing the current designer NAME cell with this char.
     CreateType(char),
+    /// Edit the REFERENCES target of the current designer field.
+    CreateRefs,
+    /// Open link pane N as a filtered BROWSE of the child table.
+    EditOpenLink(usize),
     Focus(Focus),
     Back,
     Help,
@@ -389,6 +408,9 @@ impl App {
                     Command::EditSave
                 }
                 (None, F(1)) => Command::Help,
+                (None, F(4)) => Command::EditOpenLink(0),
+                (None, F(5)) => Command::EditOpenLink(1),
+                (None, F(6)) => Command::EditOpenLink(2),
                 (None, Esc) => Command::Back,
                 // The form is LIVE, 1988-style: land on a field and
                 // just type — no Enter required to begin.
@@ -471,6 +493,7 @@ impl App {
                 (None, F(5)) => Command::CreateNull,
                 (None, F(6)) => Command::CreateUnique,
                 (None, F(7)) => Command::DesignerEditAlt,
+                (None, F(10)) => Command::CreateRefs,
                 (None, F(8) | Insert) => Command::DesignerAdd,
                 (None, F(9) | Delete) => Command::DesignerDelete,
                 (None, Char('[')) => Command::DesignerSwap(-1),
@@ -673,6 +696,32 @@ impl App {
                     self.apply(Command::EditBegin); // fresh: 1st char replaces
                 }
                 self.apply(Command::EditChar(c));
+            }
+            Command::CreateRefs => {
+                self.editor_fresh = true;
+                if let Overlay::Create(st) = &mut self.overlay {
+                    if let Some(f) = st.field_idx().and_then(|i| st.draft.fields.get(i)) {
+                        st.slot = crate::creator::EditSlot::Refs;
+                        st.editing = Some(f.references.clone());
+                    }
+                }
+            }
+            Command::EditOpenLink(i) => {
+                let link = match &self.overlay {
+                    Overlay::Edit(ed) => ed.links.get(i).map(|l| {
+                        let qc = l.child.replace('"', "\"\"");
+                        let qk = l.child_col.replace('"', "\"\"");
+                        format!(
+                            "SELECT * FROM \"{qc}\" WHERE \"{qk}\" = {}",
+                            l.key_sql
+                        )
+                    }),
+                    _ => None,
+                };
+                if let Some(sql) = link {
+                    self.overlay = Overlay::None;
+                    self.run_select(&sql);
+                }
             }
             Command::CreateType(c) => {
                 if matches!(&self.overlay, Overlay::Create(st) if st.editing.is_none()) {
@@ -917,7 +966,7 @@ impl App {
             Overlay::Apps(st) if st.editing.is_some() => st.editing = None,
             Overlay::Create(st) if st.editing.is_some() => {
                 st.editing = None;
-                st.editing_default = false;
+                st.slot = crate::creator::EditSlot::Name;
             }
             Overlay::Paint(st) if st.editing.is_some() => st.editing = None,
             Overlay::Paint(st) if st.pending_box.is_some() => st.pending_box = None,
@@ -1366,7 +1415,7 @@ impl App {
                 }
             }
             Overlay::Create(st) => {
-                st.editing_default = false;
+                st.slot = crate::creator::EditSlot::Name;
                 st.editing = Some(match st.field_idx() {
                     None => st.draft.table.clone(),
                     Some(i) => st.draft.fields.get(i).map(|f| f.name.clone()).unwrap_or_default(),
@@ -1388,7 +1437,7 @@ impl App {
             Overlay::Create(st) => {
                 if let Some(i) = st.field_idx() {
                     if let Some(f) = st.draft.fields.get(i) {
-                        st.editing_default = true;
+                        st.slot = crate::creator::EditSlot::Default;
                         st.editing = Some(f.default.clone());
                     }
                 }
@@ -1579,21 +1628,27 @@ impl App {
                 }
             }
             Overlay::Create(st) => {
+                use crate::creator::EditSlot;
                 if let Some(buf) = st.editing.take() {
-                    match (st.field_idx(), st.editing_default) {
+                    match (st.field_idx(), st.slot) {
                         (None, _) => st.draft.table = buf.trim().to_owned(),
-                        (Some(i), false) => {
+                        (Some(i), EditSlot::Name) => {
                             if let Some(f) = st.draft.fields.get_mut(i) {
                                 f.name = buf.trim().to_owned();
                             }
                         }
-                        (Some(i), true) => {
+                        (Some(i), EditSlot::Default) => {
                             if let Some(f) = st.draft.fields.get_mut(i) {
                                 f.default = buf;
                             }
                         }
+                        (Some(i), EditSlot::Refs) => {
+                            if let Some(f) = st.draft.fields.get_mut(i) {
+                                f.references = buf.trim().to_owned();
+                            }
+                        }
                     }
-                    st.editing_default = false;
+                    st.slot = EditSlot::Name;
                 }
             }
             _ => {}
@@ -2109,6 +2164,7 @@ impl App {
         let painted = self.apply_crafted_form(&name, &mut fields, &mut labels, &mut required);
 
         let n = fields.len();
+        let links = self.build_link_panes(&name, &fields, rowid);
         // Preserve the field cursor across a page flip.
         let keep_cursor = match &self.overlay {
             Overlay::Edit(prev) if !prev.inserting => prev.cursor.min(n.saturating_sub(1)),
@@ -2126,7 +2182,79 @@ impl App {
             inputs: vec![None; n],
             cursor: keep_cursor,
             editing: None,
+            links,
         });
+    }
+
+    /// SET RELATION, reborn: one pane per declared FK pointing at this
+    /// table, filtered to the record on screen. Refreshed per page flip.
+    fn build_link_panes(
+        &self,
+        parent: &str,
+        fields: &[(ColumnInfo, PValue)],
+        rowid: i64,
+    ) -> Vec<LinkPane> {
+        const PREVIEW_ROWS: usize = 4;
+        const PREVIEW_COLS: usize = 4;
+        let mut out = Vec::new();
+        for (child, child_col, parent_col) in self.db.child_links(parent) {
+            // The parent-side key: the named column, or the pk (whose
+            // value for an INTEGER PRIMARY KEY is the rowid itself).
+            let key = fields
+                .iter()
+                .find(|(c, _)| {
+                    if parent_col.is_empty() {
+                        c.pk
+                    } else {
+                        c.name.eq_ignore_ascii_case(&parent_col)
+                    }
+                })
+                .map(|(_, v)| v.clone())
+                .unwrap_or(PValue::Int(rowid));
+            let key_sql = match &key {
+                PValue::Null => continue, // unsaved/keyless: no pane
+                PValue::Int(i) => i.to_string(),
+                PValue::Real(r) => r.to_string(),
+                v => format!("'{}'", v.render().replace('\'', "''")),
+            };
+            let qchild = child.replace('"', "\"\"");
+            let qcol = child_col.replace('"', "\"\"");
+            let total = self
+                .db
+                .query(&format!(
+                    "SELECT count(*) FROM \"{qchild}\" WHERE \"{qcol}\" = {key_sql}"
+                ))
+                .ok()
+                .and_then(|q| match q.rows.first().and_then(|r| r.first()) {
+                    Some(PValue::Int(n)) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let Ok(q) = self.db.query(&format!(
+                "SELECT * FROM \"{qchild}\" WHERE \"{qcol}\" = {key_sql} LIMIT {PREVIEW_ROWS}"
+            )) else {
+                continue;
+            };
+            // Preview the first few NON-key columns — the fk value is
+            // already on the parent form; show what's interesting.
+            let keep: Vec<usize> = (0..q.columns.len())
+                .filter(|&i| !q.columns[i].eq_ignore_ascii_case(&child_col))
+                .take(PREVIEW_COLS)
+                .collect();
+            out.push(LinkPane {
+                header: keep.iter().map(|&i| q.columns[i].clone()).collect(),
+                rows: q
+                    .rows
+                    .iter()
+                    .map(|r| keep.iter().map(|&i| r[i].render()).collect())
+                    .collect(),
+                total,
+                key_sql,
+                child,
+                child_col,
+            });
+        }
+        out
     }
 
     /// PgUp/PgDn (or ←→) in EDIT: flip to the previous/next RECORD,
@@ -2220,6 +2348,7 @@ impl App {
             table: name,
             inserting: true,
             painted,
+            links: Vec::new(), // a NEW record has no key to relate on yet
             row_abs: 0,
             rowid: 0,
             fields,
@@ -3142,6 +3271,39 @@ mod tests {
         a.apply(Command::DesignerCommit);
         let Overlay::Create(st) = &a.overlay else { panic!() };
         assert_eq!(st.draft.fields[1].name, "city", "no Enter, no backspacing");
+    }
+
+    #[test]
+    fn declared_fks_become_live_child_panes() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY, product TEXT,
+                                 customer_id INTEGER REFERENCES customers(id));
+             INSERT INTO customers(name) VALUES ('Ada'), ('Grace');
+             INSERT INTO orders(product, customer_id)
+               VALUES ('modem', 1), ('coax', 1), ('router', 2);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected); // customers (alphabetical first)
+        a.apply(Command::OpenEdit);     // Ada
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.links.len(), 1, "the declared FK is discovered");
+        assert_eq!(ed.links[0].child, "orders");
+        assert_eq!(ed.links[0].total, 2, "Ada has two orders");
+        assert!(ed.links[0].rows.iter().any(|r| r.contains(&"coax".into())));
+        // Paging to Grace refreshes the pane.
+        a.apply(Command::EditPage(1));
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.links[0].total, 1, "Grace has one order");
+        // F4 jumps into a filtered BROWSE of the children.
+        a.apply(Command::EditOpenLink(0));
+        let g = a.grid.as_ref().expect("filtered child browse");
+        assert_eq!(g.total, 1, "only Grace's orders");
+        // FKs are ENFORCED on the embedded backend now.
+        let bad = a.db.execute("INSERT INTO orders(product, customer_id) VALUES ('x', 99)");
+        assert!(bad.is_err(), "orphan insert must be rejected");
     }
 
     #[test]

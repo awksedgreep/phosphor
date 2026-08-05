@@ -156,6 +156,45 @@ pub trait DbLink {
     /// Worst dbhealth_report status if the view exists and is readable
     /// ("ok" | "warn" | "attention" | "no data"), else None.
     fn health(&self) -> Option<String>;
+
+    /// Tables whose declared foreign keys point AT `parent`:
+    /// (child_table, child_col, parent_col). parent_col falls back to
+    /// the parent's rowid pk when the FK names no column. Works on any
+    /// backend — it's plain SQL over pragma table-functions.
+    fn child_links(&self, parent: &str) -> Vec<(String, String, String)> {
+        let Ok(tables) = self.tables() else { return Vec::new() };
+        let mut out = Vec::new();
+        for t in &tables {
+            if t.name.eq_ignore_ascii_case(parent) {
+                continue;
+            }
+            let sql = format!(
+                "SELECT \"table\", \"from\", \"to\" FROM pragma_foreign_key_list({})",
+                sql_str(&t.name)
+            );
+            let Ok(q) = self.query(&sql) else { continue };
+            for row in &q.rows {
+                let (PValue::Text(to_table), PValue::Text(from_col)) = (&row[0], &row[1])
+                else {
+                    continue;
+                };
+                if !to_table.eq_ignore_ascii_case(parent) {
+                    continue;
+                }
+                let to_col = match &row[2] {
+                    PValue::Text(c) => c.clone(),
+                    _ => String::new(), // NULL → the parent's pk
+                };
+                out.push((t.name.clone(), from_col.clone(), to_col));
+            }
+        }
+        out
+    }
+}
+
+/// SQL string literal with quotes escaped.
+fn sql_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 pub struct EmbeddedDb {
@@ -169,6 +208,10 @@ impl EmbeddedDb {
     /// failures are reported but the db still opens.
     pub fn open(path: &str) -> DbResult<(Self, Option<String>)> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        // Declared foreign keys should MEAN something: enforce them.
+        // (SQLite defaults to off; existing orphan rows only surface
+        // as errors on writes that would violate a constraint.)
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
         let mut warning = None;
         if let Ok(ext) = std::env::var("PHOSPHOR_EXT") {
             if !ext.is_empty() {
