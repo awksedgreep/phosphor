@@ -310,6 +310,10 @@ def reels():
     r.key("r", 0.4).expect('"label" TEXT NOT NULL')
     r.key("n", 0.4).key("t", 0.4)                     # field3 → REAL
     r.key("d", 0.3).type("1").key(ENTER, 0.5).expect('"field3" REAL DEFAULT 1')
+    # [ moves the field up: the SQL preview now shows it right
+    # after the pk (the DEFAULT tail wraps, so assert the head).
+    r.key("[", 0.5).expect('KEY,  "field3"')
+    r.key("]", 0.5).expect_absent('KEY,  "field3"')   # and back down
     r.key(F2, 0.8).expect("BROWSE gadgets").expect("created \"gadgets\"")
     r.key("a", 0.6).expect("NEW gadgets record")
     r.keys([DOWN], gap=0.2).key(ENTER, 0.3).type("widget").key(ENTER, 0.6)

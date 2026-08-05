@@ -60,7 +60,10 @@ phosphor's own machinery (shadow tables, _phosphor catalogs, the
 dbhealth views) stays hidden; press i to reveal it. Press C for
 the TABLE DESIGNER — define fields as rows (name, type, pk,
 null, unique, default) while the CREATE TABLE writes itself
-underneath; F2 builds it and opens the empty BROWSE.
+underneath. n inserts a field right AFTER the cursor (forgot
+street_name? stand on street_num and press n), [ and ] move a
+field up and down, x deletes it; F2 builds the table and opens
+the empty BROWSE.
 
 In the grid:
 

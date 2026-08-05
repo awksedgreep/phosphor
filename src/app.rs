@@ -1726,7 +1726,8 @@ impl App {
 
     fn designer_add(&mut self) {
         if let Overlay::Create(st) = &mut self.overlay {
-            let i = st.draft.add_field();
+            // Insert AFTER the cursor row, dBASE-style (NAME row → top).
+            let i = st.draft.insert_field(st.field_idx());
             st.cursor = i + 1;
             return;
         }

@@ -101,9 +101,34 @@ impl TableDraft {
     }
 
     pub fn add_field(&mut self) -> usize {
-        let n = self.fields.len() + 1;
-        self.fields.push(FieldDef::new(&format!("field{n}"), FType::Text));
-        self.fields.len() - 1
+        self.insert_field(self.fields.len().checked_sub(1))
+    }
+
+    /// Insert a fresh TEXT field AFTER position `after` (None → at the
+    /// top, i.e. the cursor was on the NAME row) — dBASE-style: the
+    /// field you forgot goes where you're standing, not at the end.
+    pub fn insert_field(&mut self, after: Option<usize>) -> usize {
+        let at = after.map_or(0, |i| i + 1).min(self.fields.len());
+        let name = self.fresh_name();
+        self.fields.insert(at, FieldDef::new(&name, FType::Text));
+        at
+    }
+
+    /// First unused `field{n}` placeholder (inserts + deletes can make
+    /// plain len()+1 collide; validate() rejects duplicates, so don't).
+    fn fresh_name(&self) -> String {
+        let mut n = self.fields.len() + 1;
+        loop {
+            let name = format!("field{n}");
+            if !self
+                .fields
+                .iter()
+                .any(|f| f.name.eq_ignore_ascii_case(&name))
+            {
+                return name;
+            }
+            n += 1;
+        }
     }
 
     /// The CREATE TABLE this draft will run — always on screen.
@@ -230,6 +255,25 @@ mod tests {
         assert!(sql.contains("\"region\" TEXT DEFAULT 'east'"), "{sql}");
         assert!(sql.contains("\"score\" REAL UNIQUE DEFAULT 0"), "{sql}");
         assert!(sql.contains("PRIMARY KEY (\"id\", \"region\")"), "{sql}");
+    }
+
+    #[test]
+    fn insert_lands_after_the_cursor_with_a_fresh_name() {
+        let mut d = TableDraft::new("addr");
+        let a = d.add_field();
+        d.fields[a].name = "street_num".into();
+        let b = d.add_field();
+        d.fields[b].name = "city".into();
+        // Forgot street_name: standing on street_num, insert — it must
+        // land between street_num and city, not at the end.
+        let i = d.insert_field(Some(a));
+        assert_eq!(i, a + 1);
+        let names: Vec<&str> = d.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["id", "street_num", "field4", "city"]);
+        // NAME row (None) inserts at the top; placeholders never collide.
+        d.insert_field(None);
+        assert_eq!(d.fields[0].name, "field5");
+        assert_eq!(d.validate().map_err(|e| e), Ok(()), "no duplicate placeholders");
     }
 
     #[test]

@@ -63,7 +63,7 @@ fn draw_create(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " n field · t type · p pk · r null · u uniq · d default · F2 create ",
+            " n insert · [ ] move · t type · p pk · r null · u uniq · d default · F2 create ",
             th.dim(),
         ));
     let inner = block.inner(area);
