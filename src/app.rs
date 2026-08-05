@@ -370,9 +370,13 @@ impl App {
                 }
                 (Some(_), PageDown) => Command::EditPage(1),
                 (Some(_), PageUp) => Command::EditPage(-1),
+                // Tab commits-and-advances like Enter; Shift-Tab folds
+                // the buffer and steps back a field.
+                (Some(_), Tab) => Command::EditCommitField,
+                (Some(_), BackTab) => Command::EditMove(-1),
                 (Some(_), Char(c)) => Command::EditChar(c),
-                (None, Up) => Command::EditMove(-1),
-                (None, Down) => Command::EditMove(1),
+                (None, Up | BackTab) => Command::EditMove(-1),
+                (None, Down | Tab) => Command::EditMove(1),
                 (None, PageDown | Right) => Command::EditPage(1),
                 (None, PageUp | Left) => Command::EditPage(-1),
                 (None, Enter) => Command::EditBegin,
@@ -685,6 +689,7 @@ impl App {
             }
             Command::OpenEdit => self.open_edit(),
             Command::EditMove(d) => {
+                self.fold_editing_buffer();
                 if let Overlay::Edit(ed) = &mut self.overlay {
                     let n = ed.fields.len() as i64;
                     if n > 0 {
@@ -3078,6 +3083,35 @@ mod tests {
         a.apply(Command::OpenInsert);
         a.apply(Command::EditPage(1));
         assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.inserting));
+    }
+
+    #[test]
+    fn tab_moves_between_fields_and_folds_typing() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent};
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.apply(Command::OpenEdit);
+        // Idle: Tab advances a field, Shift-Tab returns.
+        let cmd = a.map_key(KeyEvent::from(KeyCode::Tab)).unwrap();
+        assert!(matches!(cmd, Command::EditMove(1)), "Tab must move fields");
+        a.apply(cmd);
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.cursor, 1);
+        // Mid-edit: Tab commits-and-advances; Shift-Tab keeps the text.
+        a.apply(Command::EditBegin);
+        for c in "kept".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        let cmd = a.map_key(KeyEvent::from(KeyCode::BackTab)).unwrap();
+        assert!(matches!(cmd, Command::EditMove(-1)));
+        a.apply(cmd);
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.cursor, 0, "Shift-Tab steps back");
+        assert_eq!(ed.inputs[1].as_deref(), Some("kept"), "typing folded, not dropped");
+        let cmd = a.map_key(KeyEvent::from(KeyCode::Tab)).unwrap();
+        a.apply(cmd);
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.cursor, 1, "Tab advances again");
     }
 
     #[test]

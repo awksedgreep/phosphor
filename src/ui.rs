@@ -957,7 +957,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
             .style(th.base())
             .title(Span::styled(title, th.bright()))
             .title_bottom(Line::styled(
-                " ↑↓ field · Enter edit/save · PgUp/PgDn record · Esc ",
+                " ↑↓/Tab field · Enter edit/save · PgUp/PgDn record · Esc ",
                 th.dim(),
             ));
         let inner = block.inner(area);
@@ -1051,7 +1051,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(
-        "Enter edit/save · PgUp/PgDn record · Esc cancel",
+        "Tab next · Enter edit/save · PgUp/PgDn record · Esc cancel",
         th.dim(),
     ));
     f.render_widget(Paragraph::new(lines), inner);

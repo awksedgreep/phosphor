@@ -316,7 +316,8 @@ def reels():
     r.key("]", 0.5).expect_absent('KEY,  "field3"')   # and back down
     r.key(F2, 0.8).expect("BROWSE gadgets").expect("created \"gadgets\"")
     r.key("a", 0.6).expect("NEW gadgets record")
-    r.keys([DOWN], gap=0.2).key(ENTER, 0.3).type("widget").key(ENTER, 0.6)
+    r.key("\t", 0.3)                                  # Tab to the next field
+    r.key(ENTER, 0.3).type("widget").key(ENTER, 0.6)
     r.expect("inserted rowid 1")
     # Keep typing after the insert: the next Enter UPDATEs, and the
     # form must keep showing the saved value (not a stale NULL).

@@ -74,6 +74,8 @@ In the grid:
     — which also SAVES the record and moves to the next field.
     F10/Ctrl-S save and close. Empty input means NULL. A ¶ marks
     the primary key; a * marks a required field.
+  · Tab moves to the next field (committing anything typed);
+    Shift-Tab moves back.
   · PgUp/PgDn (or ←/→) in the form flip to the previous/next
     RECORD — and holding the key ACCELERATES, up to ten records a
     stride, so a thousand-row file passes in seconds. Unsaved edits
@@ -319,7 +321,7 @@ BROWSE grid
   Q qbe · R report · L labels · F form · A applications
 
 EDIT / NEW record
-  ↑↓ field · PgUp/PgDn (or ←→) previous/next record
+  ↑↓/Tab field · PgUp/PgDn (or ←→) previous/next record
   Enter edit value · Enter again commit + SAVE + next field
   F10 / Ctrl-S save and close · Esc cancel value, then close
 
