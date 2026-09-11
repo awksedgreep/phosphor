@@ -29,8 +29,55 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
     let [sidebar, main] =
         Layout::horizontal([Constraint::Length(24), Constraint::Fill(1)]).areas(body);
 
+    // Mouse hit rects (content only, borders excluded).
+    let inner1 = |r: ratatui::layout::Rect| -> Option<ratatui::layout::Rect> {
+        (r.width >= 2 && r.height >= 2).then(|| {
+            ratatui::layout::Rect {
+                x: r.x + 1,
+                y: r.y + 1,
+                width: r.width - 2,
+                height: r.height - 2,
+            }
+        })
+    };
+    let split = app.detail.is_some() && main.width >= 76;
+    let (master_area, detail_area) = if split {
+        let [m, d] =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(main);
+        (m, Some(d))
+    } else {
+        (main, None)
+    };
+    app.hit = crate::app::HitRects {
+        sidebar: inner1(sidebar),
+        master: inner1(master_area),
+        detail: detail_area.and_then(inner1),
+        prompt: Some(prompt_line),
+    };
+
+    let split = app.detail.is_some() && main.width >= 76;
+    let (master_area, detail_area) = if split {
+        let [m, d] =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(main);
+        (m, Some(d))
+    } else {
+        (main, None)
+    };
+    app.hit = crate::app::HitRects {
+        sidebar: inner1(sidebar),
+        master: inner1(master_area),
+        detail: detail_area.and_then(inner1),
+        prompt: Some(prompt_line),
+    };
+
     draw_sidebar(f, app, sidebar);
-    draw_main(f, app, main);
+    draw_main(f, app, master_area);
+    if let (Some(d_area), Some(_)) = (detail_area, &app.detail) {
+        let state = app.detail.as_ref().expect("split checked");
+        draw_detail_panel(f, app, state, d_area);
+    }
     draw_prompt(f, app, prompt_line);
     draw_status(f, app, status_line);
 
@@ -756,19 +803,6 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
-    // Split BROWSE: master left, related child rows right — only when
-    // there's room (narrow terminals keep the single-pane layout).
-    // Matches toggle_split's 74-col inner-width gate (main area = 76).
-    let split = app.detail.is_some() && area.width >= 76;
-    if split {
-        let [m_area, d_area] =
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .areas(area);
-        draw_master_panel(f, app, m_area);
-        let state = app.detail.as_ref().expect("split checked above");
-        draw_detail_panel(f, app, state, d_area);
-        return;
-    }
     draw_master_panel(f, app, area);
 }
 

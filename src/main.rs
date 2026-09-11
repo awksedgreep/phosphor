@@ -114,11 +114,21 @@ fn main() -> std::io::Result<()> {
         _terminal: ratatui::DefaultTerminal,
         r: std::io::Result<()>,
     ) -> std::io::Result<()> {
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            ratatui::crossterm::event::DisableMouseCapture
+        );
         ratatui::restore();
         r
     }
 
     let mut terminal = ratatui::init();
+    // Mouse is tolerated, never required (DESIGN.md): clicks select
+    // and scroll; every mouse action has a keyboard equivalent.
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::EnableMouseCapture
+    );
     let result = loop {
         // Dirty-flag redraw: the screen is static between commands, so
         // idle 250ms ticks skip the full render. A viewport change
@@ -163,6 +173,9 @@ fn main() -> std::io::Result<()> {
                     // next loop draws with the new viewport (previously a
                     // resize sat stale until the next keypress).
                     Ok(Event::Resize(_, _)) => app.dirty = true,
+                    Ok(Event::Mouse(m)) => {
+                        app.on_mouse(&m.kind, m.column, m.row);
+                    }
                     Ok(_) => {}
                     Err(e) => return finish(terminal, Err(e)),
                 },
@@ -177,6 +190,10 @@ fn main() -> std::io::Result<()> {
             break Ok(());
         }
     };
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::event::DisableMouseCapture
+    );
     ratatui::restore();
     result
 }

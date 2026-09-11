@@ -117,6 +117,16 @@ pub enum GridSource {
     },
 }
 
+/// Screen regions for mouse hit-testing (content rects, borders
+/// excluded), refreshed by the renderer every frame.
+#[derive(Default, Clone, Copy)]
+pub struct HitRects {
+    pub sidebar: Option<ratatui::layout::Rect>,
+    pub master: Option<ratatui::layout::Rect>,
+    pub detail: Option<ratatui::layout::Rect>,
+    pub prompt: Option<ratatui::layout::Rect>,
+}
+
 /// The right-hand pane of a split BROWSE: one child table filtered to
 /// the master cursor's record. SET RELATION, on one screen. The pane's
 /// Grid is read-only (GridSource::Detail); child/col/key live in the
@@ -263,6 +273,15 @@ pub enum Command {
     /// Toggle the split-view detail pane (SET RELATION on one screen).
     /// Cycles among a table's related children; 'v' again closes.
     ToggleSplit,
+    // Mouse equivalents (hit-testing happens in App::on_mouse):
+    /// Select the Nth visible sidebar row; clicking the selection
+    /// again opens it.
+    SidebarClick(usize),
+    /// Place the focused pane's cursor on absolute row N; clicking
+    /// the master's selection again opens EDIT.
+    GridClick { row: i64 },
+    /// Scroll the pane under the wheel by N rows.
+    GridScroll(i64),
     /// A worker response arrived (main loop polls, tests pump): the
     /// token routes it to its pending continuation in finish_db().
     DbReady(crate::worker::Token, crate::worker::DbResponse),
@@ -377,6 +396,9 @@ pub struct App {
     pending_page: Option<(crate::worker::Token, String, i64)>,
     /// Latest in-flight detail-pane fetch and the key it was for.
     pending_detail: Option<(crate::worker::Token, String)>,
+    /// Screen regions for mouse hit-testing, written back by the
+    /// renderer every frame (content rects, borders excluded).
+    pub hit: HitRects,
     /// EDIT target parked while its window flies in (built on arrival).
     pending_edit: Option<i64>,
     /// Find-scan generation: a new find supersedes older chains.
@@ -430,6 +452,7 @@ impl App {
             pending_page: None,
             pending_detail: None,
             pending_edit: None,
+            hit: HitRects::default(),
             find_seq: 0,
             status_seq: 0,
         };
@@ -1295,6 +1318,40 @@ impl App {
             }
             Command::OpenSelected => self.open_selected(),
             Command::ToggleSplit => self.toggle_split(),
+            Command::SidebarClick(idx) => {
+                let n = self.visible_tables().len();
+                if idx < n {
+                    if self.sidebar_idx == idx && self.focus == Focus::Sidebar {
+                        self.open_selected(); // same row clicked again: open
+                    } else {
+                        self.sidebar_idx = idx;
+                        self.focus = Focus::Sidebar;
+                    }
+                }
+            }
+            Command::GridClick { row } => {
+                if self.focus == Focus::Detail {
+                    self.detail_jump(row);
+                } else {
+                    let target = self.click_target();
+                    let already = self
+                        .grid
+                        .as_ref()
+                        .is_some_and(|g| g.cur_row == row && target == Some("grid"));
+                    self.focus = Focus::Grid;
+                    self.grid_jump(row);
+                    if already {
+                        self.open_edit(); // same master row clicked again
+                    }
+                }
+            }
+            Command::GridScroll(d) => {
+                if self.focus == Focus::Detail {
+                    self.detail_move(d, 0);
+                } else {
+                    self.grid_move(d, 0);
+                }
+            }
             // Grid commands land on whichever pane has focus; master
             // movement re-links the detail pane inside grid_move itself.
             Command::GridMove { dr, dc } => {
@@ -2973,6 +3030,67 @@ impl App {
         self.detail_move(0, 0);
     }
 
+    // ── mouse: hit-testing → the same bus commands as keys ───────────
+
+    fn contains(r: Option<ratatui::layout::Rect>, col: u16, row: u16) -> bool {
+        r.is_some_and(|r| {
+            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+        })
+    }
+
+    /// Route a left-click / wheel event through the command bus.
+    /// Click selects; clicking the sidebar selection again opens it;
+    /// clicking the master's cursor row again opens EDIT.
+    pub fn on_mouse(&mut self, kind: &ratatui::crossterm::event::MouseEventKind, col: u16, row: u16) {
+        use ratatui::crossterm::event::MouseEventKind as K;
+        match kind {
+            K::ScrollUp | K::ScrollDown => {
+                let d: i64 = if matches!(kind, K::ScrollUp) { -1 } else { 1 };
+                if Self::contains(self.hit.master, col, row)
+                    || Self::contains(self.hit.detail, col, row)
+                {
+                    self.apply(Command::GridScroll(d));
+                }
+            }
+            K::Down(_) => {
+                if Self::contains(self.hit.sidebar, col, row) {
+                    let idx = (row - self.hit.sidebar.unwrap().y) as usize;
+                    self.apply(Command::SidebarClick(idx));
+                } else if Self::contains(self.hit.master, col, row) {
+                    let r = self.hit.master.unwrap();
+                    self.apply(Command::GridClick {
+                        row: self.grid.as_ref().map_or(0, |g| g.row_off) + (row - r.y - 1) as i64,
+                    });
+                } else if Self::contains(self.hit.detail, col, row) {
+                    self.apply(Command::Focus(Focus::Detail));
+                    let r = self.hit.detail.unwrap();
+                    let off = self
+                        .detail
+                        .as_ref()
+                        .map_or(0, |d| d.grid.row_off);
+                    self.apply(Command::GridClick {
+                        row: off + (row - r.y - 1) as i64,
+                    });
+                } else if Self::contains(self.hit.prompt, col, row) {
+                    self.apply(Command::Focus(Focus::Prompt));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn click_target(&self) -> Option<&'static str> {
+        if self.focus == Focus::Detail {
+            Some("detail")
+        } else if self.focus == Focus::Grid {
+            Some("grid")
+        } else if self.focus == Focus::Sidebar {
+            Some("sidebar")
+        } else {
+            None
+        }
+    }
+
     fn open_table(&mut self, name: &str) {
         // Async: columns + rowid-ness + first window + total bundle into
         // ONE worker job (one round-trip, cold or warm). The previous
@@ -4547,6 +4665,61 @@ mod tests {
         assert!(a.detail.is_none(), "pane closed");
         assert!(a.grid.is_some(), "master stays");
         assert_eq!(a.focus, Focus::Grid);
+    }
+
+    /// Mouse clicks route through the bus: sidebar select (re-click
+    /// opens), master row placement, detail focus + row, wheel scroll.
+    #[test]
+    fn mouse_clicks_and_wheel_follow_the_bus() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY, product TEXT,
+                                 customer_id INTEGER REFERENCES customers(id));
+             INSERT INTO customers(name) VALUES ('Ada'), ('Grace');
+             INSERT INTO orders(product, customer_id)
+               VALUES ('modem', 1), ('coax', 1), ('router', 2);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        // Fake the renderer's hit rects: sidebar rows start at y=1,
+        // master content at y=1 (header at y=0).
+        use ratatui::layout::Rect;
+        a.hit = HitRects {
+            sidebar: Some(Rect { x: 0, y: 1, width: 22, height: 10 }),
+            master: Some(Rect { x: 25, y: 1, width: 40, height: 20 }),
+            detail: None,
+            prompt: Some(Rect { x: 0, y: 28, width: 100, height: 1 }),
+        };
+        use ratatui::crossterm::event::MouseEventKind as K;
+        // Click sidebar row 2 (orders): selects, second click opens.
+        a.on_mouse(&K::Down(ratatui::crossterm::event::MouseButton::Left), 3, 2);
+        assert_eq!(a.sidebar_idx, 1);
+        assert_eq!(a.focus, Focus::Sidebar);
+        a.on_mouse(&K::Down(ratatui::crossterm::event::MouseButton::Left), 3, 2);
+        a.sync();
+        assert!(matches!(
+            a.grid.as_ref().unwrap().source,
+            GridSource::Table { .. }
+        ));
+        // Refresh rects (draw would): click master row 0 (Ada, y=2 is
+        // the first data row — y=1 is the header), then row 1 (Grace).
+        a.hit.master = Some(Rect { x: 25, y: 1, width: 40, height: 20 });
+        a.on_mouse(&K::Down(ratatui::crossterm::event::MouseButton::Left), 30, 2);
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 0);
+        assert_eq!(a.focus, Focus::Grid);
+        a.on_mouse(&K::Down(ratatui::crossterm::event::MouseButton::Left), 30, 3);
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 1);
+        // Wheel scrolls the master.
+        a.on_mouse(&K::ScrollDown, 30, 2);
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 2);
+        a.on_mouse(&K::ScrollUp, 30, 2);
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 1);
+        // Click prompt focuses it.
+        a.on_mouse(&K::Down(ratatui::crossterm::event::MouseButton::Left), 50, 28);
+        assert_eq!(a.focus, Focus::Prompt);
     }
 
     #[test]
