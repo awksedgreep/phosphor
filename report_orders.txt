@@ -1,24 +1,26 @@
 orders report  ·  page 1
-id  customer product     qty amount  region customer_id
-───────────────────────────────────────────────────────
+id  customer_id product     qty    amount region
+────────────────────────────────────────────────
+▌ region = ∅
+1   ∅           ∅            120.5      ∅ ∅     
+────────────────────────────────────────────────
+  subtotal (1 rows)
+                            120.50      0       
+
 ▌ region = east
-1   Ada      compiler      1    99.0 east   1          
-2   Grace    linker        2    45.0 east   2          
-3   Barbara  abstraction   3   120.0 east   4          
-7   Ada      engine        1   250.0 east   1          
-8   Margaret apollo        1   400.0 east   8          
-───────────────────────────────────────────────────────
-  subtotal (5 rows)
-                           8     914                   
+2   2           linker          80   45.0 east  
+4   4           abstraction      3  120.0 east  
+────────────────────────────────────────────────
+  subtotal (2 rows)
+                                83    165       
 
 ▌ region = west
-4   Niklaus  pascal        1    80.0 west   6          
-5   Edsger   semaphore     5    25.0 west   3          
-6   Donald   tex           1    7.99 west   5          
-───────────────────────────────────────────────────────
-  subtotal (3 rows)
-                           7  112.99                   
+3   3           semaphore        5   25.0 west  
+5   5           tex              1   7.99 west  
+────────────────────────────────────────────────
+  subtotal (2 rows)
+                                 6  32.99       
 
-───────────────────────────────────────────────────────
-TOTAL (8 rows)
-                          15 1026.99                   
+────────────────────────────────────────────────
+TOTAL (5 rows)
+                            209.50 197.99       

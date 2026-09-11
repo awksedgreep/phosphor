@@ -19,4 +19,8 @@ for c in browse builders health appmode split; do
   [ "$c" = split ] && size=13
   agg -q --font-size "$size" --font-family "$FONT" "$c.cast" "$c.gif"
 done
+# The long-form CRM story lives in its own pipeline (tools/demo/crm.py):
+# it records, verifies, merges, and renders crm.gif itself.
+python3 "$ROOT/tools/demo/crm.py" --merge
+agg -q --font-size 13 --font-family "$FONT" "$ROOT/docs/demo/crm.cast" "$ROOT/docs/demo/crm.gif"
 echo "GIFs regenerated in docs/demo/"

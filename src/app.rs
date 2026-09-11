@@ -139,6 +139,11 @@ pub struct DetailState {
     pub parent_col: String,
     /// Viewport height, reported back by the renderer each frame.
     pub visible_rows: i64,
+    /// The 'v' cycle order, FROZEN when the pane opened (remembered
+    /// link first). Cycling rewrites the pref, so recomputing the
+    /// order per press would bounce between the first two links and
+    /// never reach the rest — caught by the CRM demo.
+    pub cycle: Vec<(String, String, String)>,
 }
 
 pub struct Grid {
@@ -2791,6 +2796,35 @@ impl App {
             },
             None => return self.say("open a table first (Enter in the sidebar)"),
         };
+        // Already open: advance along the FROZEN cycle (stored on the
+        // pane), or close after the last one. The stored order is what
+        // navigation follows — recomputing per press would reorder
+        // under the user (cycling updates the remembered pref).
+        if self.detail.is_some() {
+            let cycle = self.detail.as_ref().unwrap().cycle.clone();
+            let current = self.detail.as_ref().and_then(|d| match &d.grid.source {
+                GridSource::Detail {
+                    child, child_col, ..
+                } => Some((child.clone(), child_col.clone())),
+                _ => None,
+            });
+            let pos = cycle.iter().position(|l| {
+                current.as_ref().is_some_and(|(c, k)| c == &l.0 && k == &l.1)
+            });
+            if let Some(next) = pos.and_then(|i| cycle.get(i + 1)) {
+                let (child, col, pcol) = next.clone();
+                let cyc = cycle.clone();
+                self.open_detail(child, col, pcol, Some(cyc));
+            } else {
+                self.close_detail();
+            }
+            return;
+        }
+        // Opening: the layout needs room for two grids side by side
+        // (visible_cols_width is the master panel's inner width).
+        if self.visible_cols_width < 74 {
+            return self.say("split view needs a wider terminal (100+ cols)");
+        }
         // The cycle: the remembered link fronts it, the rest follow in
         // declaration order — a past choice reorders, never hides. v
         // walks cycle[0] → cycle[1] → … → close → cycle[0]…
@@ -2813,37 +2847,11 @@ impl App {
                 cycle.insert(0, r);
             }
         }
-        if self.detail.is_some() {
-            // Already open: advance to the next related child, or close
-            // after the last one.
-            if cycle.len() > 1 {
-                let current = self.detail.as_ref().and_then(|d| match &d.grid.source {
-                    GridSource::Detail { child, child_col, .. } => {
-                        Some((child.clone(), child_col.clone()))
-                    }
-                    _ => None,
-                });
-                let pos = cycle.iter().position(|l| {
-                    current.as_ref().is_some_and(|(c, k)| c == &l.0 && k == &l.1)
-                });
-                if let Some(next) = pos.and_then(|i| cycle.get(i + 1)) {
-                    let (child, col, pcol) = next.clone();
-                    self.open_detail(child, col, pcol);
-                    return;
-                }
-            }
-            self.close_detail();
-            return;
-        }
-        // Opening: the layout needs room for two grids side by side
-        // (visible_cols_width is the master panel's inner width).
-        if self.visible_cols_width < 74 {
-            return self.say("split view needs a wider terminal (100+ cols)");
-        }
         match cycle.first() {
             Some((child, col, pcol)) => {
                 let (c, k, p) = (child.clone(), col.clone(), pcol.clone());
-                self.open_detail(c, k, p);
+                let cyc = cycle.clone();
+                self.open_detail(c, k, p, Some(cyc));
             }
             None => self.say(format!(
                 "{parent} has no related tables (declared foreign keys)"
@@ -2854,7 +2862,14 @@ impl App {
     /// (Re)target the detail pane at (child, child_col) for the current
     /// master record. Installs a placeholder immediately; rows fly in
     /// async and swap when they match the still-current key.
-    fn open_detail(&mut self, child: String, child_col: String, parent_col: String) {
+    /// `cycle` freezes the 'v' navigation order for this pane's life.
+    fn open_detail(
+        &mut self,
+        child: String,
+        child_col: String,
+        parent_col: String,
+        cycle: Option<Vec<(String, String, String)>>,
+    ) {
         let Some(key_sql) = self.master_key_sql(&parent_col) else {
             return self.say("this record has no key to relate on");
         };
@@ -2887,6 +2902,7 @@ impl App {
             grid,
             parent_col,
             visible_rows: 12,
+            cycle: cycle.unwrap_or_default(),
         });
         // Remember the layout: reopening this table restores its split.
         store::pref_set(
@@ -4810,7 +4826,8 @@ mod tests {
         )
         .unwrap();
         let mut a = App::new(Box::new(db), None);
-        a.apply(Command::OpenSelected); // albums (alphabetical first)
+        a.apply(Command::SidebarSeek('c')); // → customers (aaa/bbb/ccc don't match 'c')
+        a.apply(Command::OpenSelected);
         a.sync();
         a.visible_cols_width = 120;
         a.apply(Command::ToggleSplit);
@@ -4822,6 +4839,51 @@ mod tests {
         assert_eq!(child, "tracks");
         assert_eq!(key_sql, "'Kind of Blue'", "non-pk FK target, quoted text");
         assert_eq!(d.grid.total, 2, "both tracks of the album");
+    }
+
+    /// Three related tables: 'v' must visit ALL of them (fronted by
+    /// the remembered link) before closing — the cycle order is frozen
+    /// at open, so pref rewrites can't reorder it mid-flight.
+    #[test]
+    fn split_cycle_visits_every_link_then_closes() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE aaa(id INTEGER PRIMARY KEY, cid INTEGER REFERENCES customers(id));
+             CREATE TABLE bbb(id INTEGER PRIMARY KEY, cid INTEGER REFERENCES customers(id));
+             CREATE TABLE ccc(id INTEGER PRIMARY KEY, cid INTEGER REFERENCES customers(id));
+             INSERT INTO customers VALUES (1, 'Ada');
+             INSERT INTO aaa(cid) VALUES (1);
+             INSERT INTO bbb(cid) VALUES (1);
+             INSERT INTO ccc(cid) VALUES (1);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.sidebar_idx = a
+            .visible_tables()
+            .iter()
+            .position(|t| t.name == "customers")
+            .unwrap();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.visible_cols_width = 120;
+        let child_of = |a: &App| match &a.detail.as_ref().unwrap().grid.source {
+            GridSource::Detail { child, .. } => child.clone(),
+            _ => panic!("detail"),
+        };
+        a.apply(Command::ToggleSplit); // aaa (alphabetical first)
+        a.sync();
+        assert_eq!(child_of(&a), "aaa");
+        a.apply(Command::ToggleSplit); // bbb (pref rewrite must not reorder)
+        a.sync();
+        a.apply(Command::ToggleSplit); // ccc — reachable!
+        a.sync();
+        assert_eq!(child_of(&a), "ccc");
+        a.apply(Command::ToggleSplit); // close
+        assert!(a.detail.is_none());
+        a.apply(Command::ToggleSplit); // reopen: remembered = ccc fronts
+        a.sync();
+        assert_eq!(child_of(&a), "ccc");
     }
 
     #[test]
@@ -5483,3 +5545,31 @@ mod tests {
         assert_eq!(st.spec.fields[1].pos, None, "field unplaced by x");
     }
 }
+
+#[cfg(test)]
+mod tmp_repro {
+    use super::*;
+    use crate::db::EmbeddedDb;
+    #[test]
+    fn tmp_alter_balance_edit() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+             INSERT INTO customers(name, city) VALUES ('Ada', 'London');
+             ALTER TABLE customers ADD COLUMN balance real default 0;",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(3));
+        a.apply(Command::EditBegin);
+        for c in "120.5".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        assert!(!a.status.as_ref().is_some_and(|(m, e)| *e), "status: {:?}", a.status);
+    }
+}
+

@@ -128,6 +128,7 @@ from the real program.
 
 | | |
 |---|---|
+| **The CRM, from nothing** — an empty database becomes a working CRM entirely through the UI: tables, foreign keys, data, a painted form, split views, queries, reports, labels, schema evolution, then boots as `phosphor --app` (~5 min, [chapter casts](docs/demo/crm/)) | ![the CRM story: empty db to working app](docs/demo/crm.gif) |
 | **Split BROWSE** — `v` splits a related table onto the screen; the cursor drives it, the mouse re-points it, layouts are remembered | ![split browse: customer ↔ orders on one screen](docs/demo/split.gif) |
 | **The builders** — QBE writing its SQL, the banded report with group subtotals, the form painter | ![qbe, reports, painter](docs/demo/builders.gif) |
 | **DBHEALTH, live** — the report and sparklines moving on their own (auto-collection + the live console) | ![dbhealth console](docs/demo/health.gif) |
