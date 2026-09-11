@@ -6,6 +6,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::Frame;
 
+use std::borrow::Cow;
+
 use crate::app::{App, Focus, Grid, GridSource, Overlay};
 use crate::db::PValue;
 
@@ -873,17 +875,21 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
     let dot = Span::styled(" . ", if focused { th.bright() } else { th.dim() });
     let mut spans = vec![dot];
     if focused {
-        let chars: Vec<char> = app.prompt.input.chars().collect();
-        let (before, at_after) = chars.split_at(app.prompt.cursor.min(chars.len()));
-        spans.push(Span::styled(before.iter().collect::<String>(), th.base()));
-        let cursor_char = at_after.first().copied().unwrap_or(' ');
+        // Byte-index cursor, always on a char boundary by construction;
+        // snap defensively so a stale value can never panic split_at.
+        let input = app.prompt.input.as_str();
+        let mut cur = app.prompt.cursor.min(input.len());
+        while cur > 0 && !input.is_char_boundary(cur) {
+            cur -= 1;
+        }
+        let (before, after) = input.split_at(cur);
+        spans.push(Span::styled(before, th.base()));
+        let mut chars = after.chars();
+        let cursor_char = chars.next().unwrap_or(' ');
         spans.push(Span::styled(cursor_char.to_string(), th.cursor()));
-        spans.push(Span::styled(
-            at_after.iter().skip(1).collect::<String>(),
-            th.base(),
-        ));
+        spans.push(Span::styled(chars.as_str(), th.base()));
     } else {
-        spans.push(Span::styled(app.prompt.input.clone(), th.dim()));
+        spans.push(Span::styled(app.prompt.input.as_str(), th.dim()));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -891,18 +897,20 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
     let left = format!(" {} [{}]", app.db.name(), app.db.backend());
-    let mid = match &app.grid {
-        Some(g) if g.total > 0 => format!(
+    // Borrowed mid/message (were format!+clone per frame): the spans
+    // borrow from `app`, which outlives the frame render.
+    let mid: Cow<'_, str> = match &app.grid {
+        Some(g) if g.total > 0 => Cow::Owned(format!(
             "{} · row {}/{} · {}",
             match &g.source {
-                GridSource::Table { name, .. } => name.clone(),
-                GridSource::Query { .. } => "query".into(),
+                GridSource::Table { name, .. } => name.as_str(),
+                GridSource::Query { .. } => "query",
             },
             g.cur_row + 1,
             g.total,
-            g.columns.get(g.cur_col).cloned().unwrap_or_default()
-        ),
-        _ => String::new(),
+            g.columns.get(g.cur_col).map(String::as_str).unwrap_or("")
+        )),
+        _ => Cow::Borrowed(""),
     };
     let ms = app
         .last_ms
@@ -913,11 +921,10 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         None => ("○", th.dim()),
     };
 
-    let status_msg = app.status.clone();
-    let (msg, msg_style) = match &status_msg {
-        Some((m, true)) => (m.clone(), th.error()),
-        Some((m, false)) => (m.clone(), th.dim()),
-        None => (String::new(), th.dim()),
+    let (msg, msg_style) = match &app.status {
+        Some((m, true)) => (m.as_str(), th.error()),
+        Some((m, false)) => (m.as_str(), th.dim()),
+        None => ("", th.dim()),
     };
 
     let line = Line::from(vec![

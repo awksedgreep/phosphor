@@ -879,35 +879,48 @@ impl App {
                 if c == '.' && self.prompt.input.is_empty() {
                     return;
                 }
-                let cur = self.prompt.cursor;
-                self.prompt.input.insert(
-                    self.prompt
-                        .input
-                        .char_indices()
-                        .nth(cur)
-                        .map_or(self.prompt.input.len(), |(i, _)| i),
-                    c,
-                );
-                self.prompt.cursor += 1;
+                // Cursor is a BYTE index, always kept on a char boundary:
+                // insert/move/delete are O(1)-ish, no nth()/count() scans.
+                let cur = self.prompt.cursor.min(self.prompt.input.len());
+                self.prompt.input.insert(cur, c);
+                self.prompt.cursor = cur + c.len_utf8();
             }
             Command::PromptBackspace => {
-                if self.prompt.cursor > 0 {
-                    let idx = self
-                        .prompt
-                        .input
-                        .char_indices()
-                        .nth(self.prompt.cursor - 1)
-                        .map(|(i, _)| i);
-                    if let Some(i) = idx {
-                        self.prompt.input.remove(i);
-                        self.prompt.cursor -= 1;
-                    }
+                let cur = self.prompt.cursor.min(self.prompt.input.len());
+                if cur > 0 {
+                    let prev_len = self.prompt.input[..cur]
+                        .chars()
+                        .next_back()
+                        .map_or(1, |c| c.len_utf8());
+                    let from = cur - prev_len;
+                    self.prompt.input.drain(from..cur);
+                    self.prompt.cursor = from;
                 }
             }
             Command::PromptMove(d) => {
-                let len = self.prompt.input.chars().count();
-                self.prompt.cursor =
-                    (self.prompt.cursor as i64 + d).clamp(0, len as i64) as usize;
+                let len = self.prompt.input.len();
+                let mut byte = self.prompt.cursor.min(len);
+                if d > 0 {
+                    for _ in 0..d {
+                        if byte >= len {
+                            break;
+                        }
+                        byte += self.prompt.input[byte..].chars().next().map_or(1, |c| {
+                            c.len_utf8()
+                        });
+                    }
+                } else {
+                    for _ in 0..-d {
+                        if byte == 0 {
+                            break;
+                        }
+                        byte -= self.prompt.input[..byte]
+                            .chars()
+                            .next_back()
+                            .map_or(1, |c| c.len_utf8());
+                    }
+                }
+                self.prompt.cursor = byte;
             }
             Command::PromptHistory(d) => self.prompt_history(d),
             Command::PromptRun => self.prompt_run(),
@@ -955,19 +968,24 @@ impl App {
                 self.prompt.cursor = 0;
             }
             Command::PromptDeleteWord => {
-                let chars: Vec<char> = self.prompt.input.chars().collect();
-                let mut i = self.prompt.cursor.min(chars.len());
-                while i > 0 && chars[i - 1].is_whitespace() {
-                    i -= 1;
+                // Byte-wise backward word erase over char boundaries.
+                let len = self.prompt.input.len();
+                let mut i = self.prompt.cursor.min(len);
+                let at = |s: &str, j: usize| s[..j].chars().next_back().map_or(' ', |c| c);
+                while i > 0 && at(&self.prompt.input, i).is_whitespace() {
+                    i -= self.prompt.input[..i]
+                        .chars()
+                        .next_back()
+                        .map_or(1, |c| c.len_utf8());
                 }
-                while i > 0 && !chars[i - 1].is_whitespace() {
-                    i -= 1;
+                while i > 0 && !at(&self.prompt.input, i).is_whitespace() {
+                    i -= self.prompt.input[..i]
+                        .chars()
+                        .next_back()
+                        .map_or(1, |c| c.len_utf8());
                 }
-                let removed: String = chars[..i]
-                    .iter()
-                    .chain(&chars[self.prompt.cursor.min(chars.len())..])
-                    .collect();
-                self.prompt.input = removed;
+                let cur = self.prompt.cursor.min(len);
+                self.prompt.input.drain(i..cur);
                 self.prompt.cursor = i;
             }
             Command::PromptComplete => self.prompt_complete(),
@@ -2559,38 +2577,34 @@ impl App {
     }
 
     /// Tab at the prompt: complete the last token against table names
-    /// and prompt commands.
+    /// and prompt commands. Borrows candidates (no per-Tab Vec<String>).
     fn prompt_complete(&mut self) {
-        let input = self.prompt.input.clone();
-        let (head, token) = match input.rfind(char::is_whitespace) {
-            Some(i) => (&input[..=i], &input[i + 1..]),
-            None => ("", input.as_str()),
+        let (head, token) = match self.prompt.input.rfind(char::is_whitespace) {
+            Some(i) => (self.prompt.input[..=i].to_owned(), self.prompt.input[i + 1..].to_owned()),
+            None => (String::new(), self.prompt.input.clone()),
         };
         if token.is_empty() {
             return;
         }
-        let mut candidates: Vec<String> =
-            self.tables.iter().map(|t| t.name.clone()).collect();
-        candidates.extend(
-            [
-                "select", "help", "tables", "health", "qbe", "report", "labels", "quit",
-                "form", "apps", "app", "run", "find", "set theme",
-            ]
-            .map(str::to_owned),
-        );
-        let matches: Vec<&String> = candidates
+        const COMMANDS: &[&str] = &[
+            "select", "help", "tables", "health", "qbe", "report", "labels", "quit", "form",
+            "apps", "app", "run", "find", "set theme",
+        ];
+        let matches: Vec<&str> = self
+            .tables
             .iter()
-            .filter(|c| c.starts_with(token) && c.as_str() != token)
+            .map(|t| t.name.as_str())
+            .chain(COMMANDS.iter().copied())
+            .filter(|c| c.starts_with(token.as_str()) && *c != token.as_str())
             .collect();
         match matches.len() {
             0 => self.say(format!("no completion for {token:?}")),
             1 => {
                 self.prompt.input = format!("{head}{}", matches[0]);
-                self.prompt.cursor = self.prompt.input.chars().count();
+                self.prompt.cursor = self.prompt.input.len();
             }
             _ => {
-                let list: Vec<&str> =
-                    matches.iter().take(6).map(|s| s.as_str()).collect();
+                let list: Vec<&str> = matches.iter().take(6).copied().collect();
                 self.say(list.join(" · "));
             }
         }
@@ -2743,7 +2757,7 @@ impl App {
         self.prompt.input = pos
             .map(|p| self.prompt.history[p].clone())
             .unwrap_or_default();
-        self.prompt.cursor = self.prompt.input.chars().count();
+        self.prompt.cursor = self.prompt.input.len();
     }
 
     fn prompt_run(&mut self) {
@@ -2751,7 +2765,14 @@ impl App {
         if line.is_empty() {
             return;
         }
+        // Cap history: an unbounded Vec<String> grows for the whole
+        // session (every Enter appends). hist_pos resets on run, so
+        // shifting is safe here.
+        const HIST_CAP: usize = 512;
         self.prompt.history.push(line.clone());
+        if self.prompt.history.len() > HIST_CAP {
+            self.prompt.history.remove(0);
+        }
         self.prompt.hist_pos = None;
         self.prompt.input.clear();
         self.prompt.cursor = 0;
@@ -3156,6 +3177,25 @@ mod tests {
         }
         a.apply(Command::PromptDeleteWord);
         assert_eq!(a.prompt.input, "select one ");
+    }
+
+    #[test]
+    fn prompt_cursor_is_boundary_safe_on_multibyte() {
+        let mut a = app();
+        for c in "héllo ∅".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        assert_eq!(a.prompt.input, "héllo ∅");
+        // Byte cursor sits at the end (8 chars, 9 bytes).
+        assert_eq!(a.prompt.cursor, a.prompt.input.len());
+        a.apply(Command::PromptMove(-1));
+        a.apply(Command::PromptBackspace);
+        assert_eq!(a.prompt.input, "héllo∅");
+        assert!(a.prompt.input.is_char_boundary(a.prompt.cursor));
+        a.apply(Command::PromptDeleteWord);
+        // Erases back to whitespace; the ∅ past the cursor survives.
+        assert_eq!(a.prompt.input, "∅");
+        assert_eq!(a.prompt.cursor, 0);
     }
 
     #[test]
