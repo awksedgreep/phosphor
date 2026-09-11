@@ -23,8 +23,32 @@ CREATE TABLE IF NOT EXISTS _phosphor_items (
   id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL,
   label TEXT NOT NULL, action_kind TEXT NOT NULL, action_ref TEXT,
   hotkey TEXT, seq INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS _phosphor_prefs (
+  user TEXT NOT NULL, key TEXT NOT NULL, value TEXT,
+  UNIQUE(user, key));
 CREATE INDEX IF NOT EXISTS idx_phosphor_items_app ON _phosphor_items(app_id);
 ";
+
+/// Per-user preference (DESIGN.md `_phosphor_prefs`): a small
+/// namespaced key/value store. `user` is fixed for now (single-user
+/// desktop, 1988 spirit); the column is here for sqld multi-user later.
+pub fn pref_set(db: &dyn DbLink, key: &str, value: &str) {
+    ensure(db).ok(); // first pref write creates the table
+    let k = q(key);
+    let v = q(value);
+    // Custom conflict target: UNIQUE(user, key), which the generic
+    // upsert helper (single-column key) can't express.
+    let _ = db.execute(&format!(
+        "INSERT INTO _phosphor_prefs(user, key, value) VALUES ('me', {k}, {v}) \
+         ON CONFLICT(user, key) DO UPDATE SET value = {v}"
+    ));
+}
+
+pub fn pref_get(db: &dyn DbLink, key: &str) -> Option<String> {
+    lookup(db, "_phosphor_prefs", "key", key, &["value"])
+        .map(|r| r.into_iter().next().unwrap_or_default())
+        .filter(|v| !v.is_empty())
+}
 
 pub fn ensure(db: &dyn DbLink) -> DbResult<()> {
     db.execute(DDL).map(|_| ())

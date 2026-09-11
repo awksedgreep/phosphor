@@ -11,11 +11,13 @@ use std::collections::{BTreeMap, HashMap};
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::creator::CreateState;
 use crate::db::{ColumnInfo, DbLink, DbResult, PValue, TableInfo};
-use crate::worker::{DbHandle, DbResponse};use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
+use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
 use crate::help::{self, HelpState};
 use crate::qbe::{QbeSpec, QbeState};
 use crate::report::{self, PagerState, ReportSpec, ReportState};
+use crate::store;
 use crate::theme::{self, Theme};
+use crate::worker::{DbHandle, DbResponse};
 
 const OVERSCAN: i64 = 64;
 const WIDTH_SAMPLE: usize = 50;
@@ -2823,14 +2825,24 @@ impl App {
             None => return self.say("open a table first (Enter in the sidebar)"),
         };
         let links = self.cached_links(&parent);
-        match links.first() {
-            Some((child, col, pcol)) => {
-                let (c, k, p) = (child.clone(), col.clone(), pcol.clone());
-                self.open_detail(c, k, p);
-            }
-            None => self.say(format!(
+        if links.is_empty() {
+            return self.say(format!(
                 "{parent} has no related tables (declared foreign keys)"
-            )),
+            ));
+        }
+        // The table's remembered link (a past split) opens first; new
+        // links still cycle with further presses.
+        let remembered = store::pref_get(self.db.link(), &format!("split:{parent}"))
+            .and_then(|v| {
+                let (c, k) = v.split_once('\u{1}')?;
+                links
+                    .iter()
+                    .find(|l| l.0.eq_ignore_ascii_case(c) && l.1.eq_ignore_ascii_case(k))
+                    .cloned()
+            });
+        match remembered.or_else(|| links.first().cloned()) {
+            Some((child, col, pcol)) => self.open_detail(child, col, pcol),
+            None => self.say(format!("{parent} has no related tables")),
         }
     }
 
@@ -2871,6 +2883,12 @@ impl App {
             parent_col,
             visible_rows: 12,
         });
+        // Remember the layout: reopening this table restores its split.
+        store::pref_set(
+            self.db.link(),
+            &format!("split:{parent}"),
+            &format!("{child}\u{1}{child_col}"),
+        );
         self.submit_detail(&child, &child_col, &key_sql);
     }
 
@@ -4720,6 +4738,56 @@ mod tests {
         // Click prompt focuses it.
         a.on_mouse(&K::Down(ratatui::crossterm::event::MouseButton::Left), 50, 28);
         assert_eq!(a.focus, Focus::Prompt);
+    }
+
+    /// Slice C: a split choice is remembered in _phosphor_prefs and
+    /// restored on the next open — even from a whole new App (the
+    /// 1988 "my screen comes back tomorrow" contract). Link order is
+    /// alphabetical (notes < orders), and the test stays order-agnostic.
+    #[test]
+    fn split_layout_is_remembered_across_sessions() {
+        let file = std::env::temp_dir().join(format!("phosphor-split-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap().to_owned();
+        let (db1, _) = EmbeddedDb::open(&path).unwrap();
+        db1.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id));
+             CREATE TABLE notes(id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id));
+             INSERT INTO customers VALUES (1, 'Ada');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db1), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.visible_cols_width = 120;
+        a.apply(Command::ToggleSplit); // opens the FIRST link
+        a.sync();
+        let first_child = match &a.detail.as_ref().unwrap().grid.source {
+            GridSource::Detail { child, .. } => child.clone(),
+            _ => panic!("detail source"),
+        };
+        a.apply(Command::ToggleSplit); // cycles to the SECOND link
+        a.sync();
+        let second_child = match &a.detail.as_ref().unwrap().grid.source {
+            GridSource::Detail { child, .. } => child.clone(),
+            _ => panic!("detail source"),
+        };
+        assert_ne!(first_child, second_child, "two related tables cycle");
+
+        // Session 2: fresh App on the same file — 'v' restores the
+        // remembered (second) link, not the alphabetical default.
+        let (db2, _) = EmbeddedDb::open(&path).unwrap();
+        let mut b = App::new(Box::new(db2), None);
+        b.apply(Command::OpenSelected);
+        b.sync();
+        b.visible_cols_width = 120;
+        b.apply(Command::ToggleSplit);
+        b.sync();
+        let d = b.detail.as_ref().expect("remembered split restored");
+        let GridSource::Detail { child, .. } = &d.grid.source else { panic!() };
+        assert_eq!(child, &second_child, "remembered link wins");
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]
