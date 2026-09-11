@@ -5,3 +5,4 @@
 *.db-shm
 docs/demo/*.cast
 docs/demo/ui/*.cast
+__pycache__/
