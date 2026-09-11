@@ -30,9 +30,8 @@ impl ReportSpec {
 
     fn source_sql(&self) -> String {
         let src = self.source.trim();
-        let base = if src.to_ascii_lowercase().starts_with("select")
-            || src.to_ascii_lowercase().starts_with("with")
-        {
+        let lower = src.to_ascii_lowercase();
+        let base = if lower.starts_with("select") || lower.starts_with("with") {
             format!("({src})")
         } else {
             format!("\"{}\"", src.replace('"', "\"\""))
@@ -88,21 +87,22 @@ fn fmt_num(v: f64) -> String {
 }
 
 fn pad(s: &str, w: usize) -> String {
+    let count = s.chars().count();
     let mut out: String = s.chars().take(w).collect();
-    if s.chars().count() > w && w > 0 {
+    if count > w && w > 0 {
         out.pop();
         out.push('…');
     }
-    while out.chars().count() < w {
+    for _ in count.min(w)..w {
         out.push(' ');
     }
     out
 }
 
 fn rpad(s: &str, w: usize) -> String {
-    let mut out = String::new();
     let len = s.chars().count().min(w);
-    for _ in 0..w.saturating_sub(len) {
+    let mut out = String::with_capacity(w);
+    for _ in len..w {
         out.push(' ');
     }
     out.extend(s.chars().take(w));
@@ -115,12 +115,18 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
     let q = db.query(&spec.source_sql())?;
     let ncols = q.columns.len();
 
-    // Numeric columns (every non-NULL value Int/Real) get totals.
+    // Single pass over PValues: numeric detection + grand totals together
+    // (was two full passes). Non-numeric cells mark the column; numeric
+    // cells accumulate — exclusions below zero out anything disqualified.
     let mut numeric = vec![!q.rows.is_empty(); ncols];
+    let mut grand = vec![0f64; ncols];
     for row in &q.rows {
         for (i, v) in row.iter().enumerate() {
-            if !matches!(v, PValue::Int(_) | PValue::Real(_) | PValue::Null) {
-                numeric[i] = false;
+            match v {
+                PValue::Int(n) => grand[i] += *n as f64,
+                PValue::Real(f) => grand[i] += f,
+                PValue::Null => {}
+                _ => numeric[i] = false,
             }
         }
     }
@@ -152,46 +158,40 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
             numeric[i] = false;
         }
     }
-
-    // Grand totals first: numeric columns must be wide enough for their
-    // own SUM line, not just their data (a column of 3-digit ids has a
-    // 6-digit total — found by test).
-    let mut grand_precalc = vec![0f64; ncols];
-    for row in &q.rows {
-        for (i, v) in row.iter().enumerate() {
-            if numeric[i] {
-                match v {
-                    PValue::Int(n) => grand_precalc[i] += *n as f64,
-                    PValue::Real(f) => grand_precalc[i] += f,
-                    _ => {}
-                }
-            }
+    for (i, n) in numeric.iter().enumerate() {
+        if !n {
+            grand[i] = 0.0;
         }
     }
 
-    // Column widths from header + data + totals (numbers right-aligned).
-    let widths: Vec<usize> = q
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let mut w = name.chars().count();
-            for row in &q.rows {
-                w = w.max(row[i].render().chars().count());
-            }
-            if numeric[i] {
-                w = w.max(fmt_num(grand_precalc[i]).chars().count());
-            }
-            w.clamp(3, 26)
-        })
-        .collect();
-
-    let cell = |v: &PValue, i: usize| -> String {
-        let text = v.render();
+    // Render every cell ONCE into a string cache, measuring widths inline
+    // (was: a widths pass re-rendering every cell + a detail pass
+    // rendering them all again).
+    let mut rendered: Vec<Vec<String>> = Vec::with_capacity(q.rows.len());
+    let mut widths: Vec<usize> = q.columns.iter().map(|c| c.chars().count()).collect();
+    for row in &q.rows {
+        let mut r = Vec::with_capacity(ncols);
+        for (i, v) in row.iter().enumerate() {
+            let s = v.render();
+            widths[i] = widths[i].max(s.chars().count());
+            r.push(s);
+        }
+        rendered.push(r);
+    }
+    // Totals can widen a column beyond its data (a column of 3-digit
+    // amounts has a 6-digit total — found by test).
+    for (i, w) in widths.iter_mut().enumerate() {
         if numeric[i] {
-            rpad(&text, widths[i])
+            *w = (*w).max(fmt_num(grand[i]).chars().count());
+        }
+        *w = (*w).clamp(3, 26);
+    }
+
+    let cell = |s: &str, i: usize| -> String {
+        if numeric[i] {
+            rpad(s, widths[i])
         } else {
-            pad(&text, widths[i])
+            pad(s, widths[i])
         }
     };
     let header_line = q
@@ -204,16 +204,18 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
     let rule = "─".repeat(header_line.chars().count().min(PAGE_WIDTH));
 
     let totals_line = |label: &str, sums: &[f64], count: usize| -> Vec<String> {
-        let cells = (0..ncols)
-            .map(|i| {
-                if numeric[i] {
-                    rpad(&fmt_num(sums[i]), widths[i])
-                } else {
-                    " ".repeat(widths[i])
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        // One reserved String instead of Vec<String> + join per group.
+        let mut cells = String::with_capacity(ncols * 8);
+        for i in 0..ncols {
+            if i > 0 {
+                cells.push(' ');
+            }
+            cells.push_str(&if numeric[i] {
+                rpad(&fmt_num(sums[i]), widths[i])
+            } else {
+                " ".repeat(widths[i])
+            });
+        }
         vec![
             rule.clone(),
             format!("{label} ({count} rows)"),
@@ -244,15 +246,17 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
         line_on_page += 1;
     };
 
-    let mut grand = vec![0f64; ncols];
-    let mut grand_n = 0usize;
     let mut group_sums = vec![0f64; ncols];
     let mut group_n = 0usize;
     let mut current_group: Option<String> = None;
 
-    for row in &q.rows {
+    // Detail pass over the RENDERED cache: no PValue::render() here at
+    // all (group keys and cells are reused strings). `grand` was already
+    // accumulated in pass 1 — only group subtotals accrue here.
+    for (ri, row) in q.rows.iter().enumerate() {
+        let rrow = &rendered[ri];
         if let Some(gi) = group_idx {
-            let g = row[gi].render();
+            let g = &rrow[gi];
             if current_group.as_deref() != Some(g.as_str()) {
                 if current_group.is_some() {
                     for l in totals_line("  subtotal", &group_sums, group_n) {
@@ -261,35 +265,29 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
                     emit(&mut out, String::new());
                 }
                 emit(&mut out, format!("▌ {} = {g}", q.columns[gi]));
-                current_group = Some(g);
-                group_sums = vec![0f64; ncols];
+                current_group = Some(g.clone());
+                group_sums.fill(0.0);
                 group_n = 0;
             }
         }
-        let line = row
-            .iter()
-            .enumerate()
-            .map(|(i, v)| cell(v, i))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let mut line = String::with_capacity(ncols * 8);
+        for (i, s) in rrow.iter().enumerate() {
+            if i > 0 {
+                line.push(' ');
+            }
+            line.push_str(&cell(s, i));
+        }
         emit(&mut out, line);
         for (i, v) in row.iter().enumerate() {
             if numeric[i] {
                 match v {
-                    PValue::Int(n) => {
-                        group_sums[i] += *n as f64;
-                        grand[i] += *n as f64;
-                    }
-                    PValue::Real(f) => {
-                        group_sums[i] += f;
-                        grand[i] += f;
-                    }
+                    PValue::Int(n) => group_sums[i] += *n as f64,
+                    PValue::Real(f) => group_sums[i] += f,
                     _ => {}
                 }
             }
         }
         group_n += 1;
-        grand_n += 1;
     }
     if group_idx.is_some() && current_group.is_some() {
         for l in totals_line("  subtotal", &group_sums, group_n) {
@@ -297,7 +295,7 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
         }
     }
     emit(&mut out, String::new());
-    for l in totals_line("TOTAL", &grand, grand_n) {
+    for l in totals_line("TOTAL", &grand, q.rows.len()) {
         emit(&mut out, l);
     }
     if q.truncated {
@@ -317,7 +315,7 @@ pub fn labels(db: &dyn DbLink, table: &str) -> DbResult<Vec<String>> {
     let mut out = Vec::new();
     for chunk in q.rows.chunks(ACROSS) {
         for line_idx in 0..per_label {
-            let mut line = String::new();
+            let mut line = String::with_capacity(ACROSS * LABEL_W);
             for row in chunk {
                 let text = if line_idx < q.columns.len() {
                     row[line_idx].render()
@@ -327,7 +325,9 @@ pub fn labels(db: &dyn DbLink, table: &str) -> DbResult<Vec<String>> {
                 line.push_str(&pad(&text, LABEL_W - 2));
                 line.push_str("  ");
             }
-            out.push(line.trim_end().to_owned());
+            // Trim in place instead of trim_end().to_owned() (one copy saved per line).
+            line.truncate(line.trim_end().len());
+            out.push(line);
         }
     }
     Ok(out)
@@ -343,8 +343,18 @@ pub struct PagerState {
 
 impl PagerState {
     pub fn write_file(&self) -> Result<String, String> {
+        use std::io::Write as _;
         let path = format!("{}.txt", self.file_stem);
-        std::fs::write(&path, self.lines.join("\n")).map_err(|e| e.to_string())?;
+        let f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        // Stream line-by-line: join() would spike 2x memory on big reports.
+        let mut w = std::io::BufWriter::new(f);
+        for (i, line) in self.lines.iter().enumerate() {
+            if i > 0 {
+                w.write_all(b"\n").map_err(|e| e.to_string())?;
+            }
+            w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        }
+        w.flush().map_err(|e| e.to_string())?;
         Ok(path)
     }
 }

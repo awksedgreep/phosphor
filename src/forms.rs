@@ -47,11 +47,7 @@ pub struct FormSpec {
 
 impl FormSpec {
     /// A default form mirroring the table's columns (unpainted).
-    pub fn new(db: &dyn DbLink, table: &str) -> DbResult<FormSpec> {
-        Ok(Self::from_columns(table, db.columns(table)?))
-    }
-
-    /// Same, from already-fetched columns (lets callers reuse a cache).
+    /// Takes already-fetched columns so callers can reuse a cache.
     pub fn from_columns(table: &str, cols: Vec<crate::db::ColumnInfo>) -> FormSpec {
         let fields = cols
             .into_iter()
@@ -273,7 +269,7 @@ mod tests {
     #[test]
     fn round_trip_and_defaults() {
         let db = db();
-        let mut spec = FormSpec::new(&db, "c").unwrap();
+        let mut spec = FormSpec::from_columns("c", db.columns("c").unwrap());
         assert_eq!(spec.fields.len(), 3);
         assert!(!spec.painted());
         spec.fields[1].label = "E-Mail".into();
@@ -293,7 +289,7 @@ mod tests {
     #[test]
     fn painted_layout_round_trips() {
         let db = db();
-        let mut spec = FormSpec::new(&db, "c").unwrap();
+        let mut spec = FormSpec::from_columns("c", db.columns("c").unwrap());
         spec.fields[0].pos = Some((4, 2));
         spec.fields[1].pos = Some((4, 5));
         spec.fields[1].width = 32;
@@ -336,7 +332,7 @@ mod tests {
     #[test]
     fn auto_place_fills_a_column() {
         let db = db();
-        let mut spec = FormSpec::new(&db, "c").unwrap();
+        let mut spec = FormSpec::from_columns("c", db.columns("c").unwrap());
         spec.fields[1].include = false;
         spec.auto_place();
         assert_eq!(spec.fields[0].pos, Some((2, 1)));

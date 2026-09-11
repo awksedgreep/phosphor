@@ -61,6 +61,30 @@ impl PValue {
         }
     }
 
+    /// Case-insensitive substring match for `find` (ASCII folding —
+    /// same semantics as the old render()+to_lowercase path, but with
+    /// zero allocation on the common Text/Int/Real/Null cases).
+    /// `needle_lc` must already be lowercased.
+    pub fn contains_ci(&self, needle_lc: &str, needle_has_alpha: bool) -> bool {
+        if needle_lc.is_empty() {
+            return true;
+        }
+        match self {
+            PValue::Text(t) => {
+                let (h, n) = (t.as_bytes(), needle_lc.as_bytes());
+                n.len() <= h.len()
+                    && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+            }
+            // Numeric renders contain no letters: an alpha needle can
+            // never match, so skip rendering entirely.
+            PValue::Int(i) => !needle_has_alpha && i.to_string().contains(needle_lc),
+            PValue::Real(_) => !needle_has_alpha && self.render().contains(needle_lc),
+            PValue::Null => "∅".contains(needle_lc),
+            // Rare + mixed-case render ("(5B)"): keep the slow path.
+            PValue::Blob(_) => self.render().to_ascii_lowercase().contains(needle_lc),
+        }
+    }
+
     /// Parse an edited text back into a value, guided by the column's
     /// declared type. Empty input means NULL (dBASE would approve).
     pub fn parse(input: &str, decl_type: &str) -> PValue {
@@ -646,6 +670,30 @@ mod tests {
         assert_eq!(q.columns, ["id", "name", "score"]);
         assert_eq!(q.rows.len(), 3);
         assert!(!q.truncated);
+    }
+
+    #[test]
+    fn contains_ci_matches_lowercased_render() {
+        // New zero-alloc matcher must agree with the old
+        // render().to_ascii_lowercase().contains() path.
+        let cases = vec![
+            PValue::Text("Ada Lovelace".into()),
+            PValue::Text("héllo".into()),
+            PValue::Int(42),
+            PValue::Int(-7),
+            PValue::Real(100.0),
+            PValue::Real(4.5),
+            PValue::Null,
+            PValue::Blob(vec![0xab, 0x12]),
+        ];
+        for needle in ["ada", "LACE", "42", "100", "∅", "x'ab", "zzz", ""] {
+            let lc = needle.to_ascii_lowercase();
+            let has_alpha = lc.bytes().any(|b| b.is_ascii_alphabetic());
+            for v in &cases {
+                let old = v.render().to_ascii_lowercase().contains(&lc);
+                assert_eq!(v.contains_ci(&lc, has_alpha), old, "{v:?} vs {needle:?}");
+            }
+        }
     }
 
     #[test]

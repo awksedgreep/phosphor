@@ -2489,9 +2489,18 @@ impl App {
     /// `find <text>` / 'n': scan forward from the cursor for a row with
     /// any cell containing the needle (case-insensitive). Client-side
     /// scan in pages; capped so a miss on a huge table stays bounded.
+    /// (Pushed to SQL per-cell would shift OFFSET windows — positions
+    /// must come from the same scan order the grid pages in — so the
+    /// win here is zero-alloc matching instead of render()+lowercase
+    /// temporaries per cell.)
     fn find(&mut self, needle: &str) {
         const SCAN_CAP: i64 = 100_000;
         let needle_lc = needle.to_ascii_lowercase();
+        let needle_has_alpha = needle_lc.bytes().any(|b| b.is_ascii_alphabetic());
+        let matches = |row: &[PValue]| {
+            row.iter()
+                .any(|v| v.contains_ci(&needle_lc, needle_has_alpha))
+        };
         let Some(g) = &self.grid else {
             return self.say("find works in a grid");
         };
@@ -2503,12 +2512,7 @@ impl App {
         let hit = match table {
             None => {
                 let g = self.grid.as_ref().unwrap();
-                (start..total).find(|&abs| {
-                    g.row(abs).is_some_and(|row| {
-                        row.iter()
-                            .any(|v| v.render().to_ascii_lowercase().contains(&needle_lc))
-                    })
-                })
+                (start..total).find(|&abs| g.row(abs).is_some_and(|row| matches(row)))
             }
             Some(name) => {
                 let mut found = None;
@@ -2519,9 +2523,7 @@ impl App {
                     match self.db.page(&name, offset, limit) {
                         Ok(page) => {
                             for (i, row) in page.rows.iter().enumerate() {
-                                if row.iter().any(|v| {
-                                    v.render().to_ascii_lowercase().contains(&needle_lc)
-                                }) {
+                                if matches(row) {
                                     found = Some(offset + i as i64);
                                     break 'scan;
                                 }
@@ -2549,9 +2551,10 @@ impl App {
     }
 
     fn find_next(&mut self) {
-        match self.last_find.clone() {
-            Some(n) => self.find(&n),
-            None => self.say("no previous find (use: find <text>)"),
+        if let Some(n) = self.last_find.clone() {
+            self.find(&n);
+        } else {
+            self.say("no previous find (use: find <text>)");
         }
     }
 
