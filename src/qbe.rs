@@ -50,14 +50,23 @@ fn quote_ident(ident: &str) -> String {
 }
 
 /// Does the fragment already start with a SQL operator/keyword?
+/// Allocation-free: single-char ops by byte, keywords by ASCII-folded
+/// prefix compare (no to_lowercase temporary per filter per frame).
 fn starts_with_op(f: &str) -> bool {
-    let lower = f.to_ascii_lowercase();
-    ["=", "!", "<", ">"]
-        .iter()
-        .any(|op| lower.starts_with(op))
-        || ["like ", "not ", "in ", "in(", "between ", "is ", "glob "]
-            .iter()
-            .any(|kw| lower.starts_with(kw))
+    let b = f.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    if matches!(b[0], b'=' | b'!' | b'<' | b'>') {
+        return true;
+    }
+    for kw in ["like ", "not ", "in ", "in(", "between ", "is ", "glob "] {
+        let kb = kw.as_bytes();
+        if b.len() >= kb.len() && b[..kb.len()].eq_ignore_ascii_case(kb) {
+            return true;
+        }
+    }
+    false
 }
 
 impl QbeSpec {

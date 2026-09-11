@@ -24,7 +24,7 @@ pub struct RemoteDb {
     agent: ureq::Agent,
     pipeline_url: String,
     display: String,
-    token: Option<String>,
+    auth: Option<String>,
     rowid_cache: RefCell<HashMap<String, bool>>,
 }
 
@@ -45,7 +45,11 @@ impl RemoteDb {
             agent,
             pipeline_url: format!("{base}/v3/pipeline"),
             display: base.to_owned(),
-            token: std::env::var("PHOSPHOR_TOKEN").ok().filter(|t| !t.is_empty()),
+            // Preformatted once (was format! per HTTP request).
+            auth: std::env::var("PHOSPHOR_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("Bearer {t}")),
             rowid_cache: RefCell::new(HashMap::new()),
         };
         // Fail at open, not at first keystroke.
@@ -63,8 +67,8 @@ impl RemoteDb {
         requests.push(json!({"type": "close"}));
 
         let mut req = self.agent.post(&self.pipeline_url);
-        if let Some(t) = &self.token {
-            req = req.set("Authorization", &format!("Bearer {t}"));
+        if let Some(a) = &self.auth {
+            req = req.set("Authorization", a);
         }
         let body: Json = req
             .send_json(json!({"requests": requests}))

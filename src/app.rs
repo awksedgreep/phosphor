@@ -134,10 +134,11 @@ impl Grid {
             .iter()
             .enumerate()
             .map(|(c, name)| {
-                let mut w = name.len();
+                let mut w = name.chars().count();
                 for row in self.cache.iter().take(WIDTH_SAMPLE) {
                     if let Some(v) = row.get(c) {
-                        w = w.max(v.render().chars().count());
+                        // render_len, not render: no String per cell.
+                        w = w.max(v.render_len());
                     }
                 }
                 w.clamp(4, 24) as u16
@@ -2129,7 +2130,7 @@ impl App {
 
     fn open_table(&mut self, name: &str) {
         let start = std::time::Instant::now();
-        let cols = match self.db.columns(name) {
+        let cols = match self.cached_columns(name) {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
@@ -2593,21 +2594,33 @@ impl App {
     }
 
     /// Refresh the current table grid without losing the cursor.
+    /// After a write: re-count + re-page the current window, keeping
+    /// columns/widths/editable (was: full open_table = columns+count+
+    /// rowid+page+widths+health on every delete/insert/save).
     fn refresh_grid_keep_position(&mut self) {
-        if let Some(Grid {
-            source: GridSource::Table { name, .. },
-            cur_row,
-            cur_col,
-            ..
-        }) = &self.grid
-        {
-            let (name, row, col) = (name.clone(), *cur_row, *cur_col);
-            self.open_table(&name);
-            if let Some(g) = &mut self.grid {
-                g.cur_col = col.min(g.columns.len().saturating_sub(1));
+        let (name, row, col) = match &self.grid {
+            Some(g) => match &g.source {
+                GridSource::Table { name, .. } => (name.clone(), g.cur_row, g.cur_col),
+                _ => return,
+            },
+            None => return,
+        };
+        match self.db.count(&name) {
+            Ok(n) => {
+                if let Some(g) = &mut self.grid {
+                    g.total = n;
+                }
             }
-            self.grid_jump(row);
+            Err(e) => return self.err(e),
         }
+        if let Some(g) = &mut self.grid {
+            g.cur_col = col.min(g.columns.len().saturating_sub(1));
+            // Force ensure_cache to re-page around the clamped cursor.
+            g.cache.clear();
+            g.cache_start = row;
+            g.rowids = None;
+        }
+        self.grid_move(0, 0);
     }
 
     /// `find <text>` / 'n': scan forward from the cursor for a row with

@@ -85,6 +85,34 @@ impl PValue {
         }
     }
 
+    /// Length of render() in chars, WITHOUT building the String:
+    /// grid width sampling calls this 50×cols per open.
+    pub fn render_len(&self) -> usize {
+        match self {
+            PValue::Null => 1, // "∅"
+            PValue::Int(mut i) => {
+                if i == 0 {
+                    return 1;
+                }
+                let mut n = 0;
+                if i < 0 {
+                    n += 1; // '-'
+                    i = i.checked_abs().unwrap_or(i64::MAX);
+                }
+                while i > 0 {
+                    n += 1;
+                    i /= 10;
+                }
+                n
+            }
+            // replace('\n', "␤") is char-count neutral.
+            PValue::Text(t) => t.chars().count(),
+            // Formatting-dependent (e.g. integral reals gain ".0"):
+            // fall back to rendering (rare in width sampling).
+            _ => self.render().chars().count(),
+        }
+    }
+
     /// Parse an edited text back into a value, guided by the column's
     /// declared type. Empty input means NULL (dBASE would approve).
     pub fn parse(input: &str, decl_type: &str) -> PValue {
@@ -670,6 +698,26 @@ mod tests {
         assert_eq!(q.columns, ["id", "name", "score"]);
         assert_eq!(q.rows.len(), 3);
         assert!(!q.truncated);
+    }
+
+    #[test]
+    fn render_len_matches_render() {
+        for v in [
+            PValue::Null,
+            PValue::Int(0),
+            PValue::Int(42),
+            PValue::Int(-987654321),
+            PValue::Int(i64::MIN),
+            PValue::Int(i64::MAX),
+            PValue::Real(100.0),
+            PValue::Real(4.5),
+            PValue::Text("héllo\nworld".into()),
+            PValue::Text(String::new()),
+            PValue::Blob(vec![0xab, 0x12]),
+            PValue::Blob(vec![0; 20]),
+        ] {
+            assert_eq!(v.render_len(), v.render().chars().count(), "{v:?}");
+        }
     }
 
     #[test]

@@ -73,12 +73,13 @@ fn quote_ident(ident: &str) -> String {
 /// parenthesized expressions pass through; everything else is quoted.
 fn default_sql(raw: &str) -> String {
     let v = raw.trim();
-    let upper = v.to_ascii_uppercase();
+    // No uppercased temporary per field per frame: exact and prefix
+    // comparisons fold ASCII case in place.
     if v.parse::<f64>().is_ok()
-        || upper == "NULL"
-        || upper == "TRUE"
-        || upper == "FALSE"
-        || upper.starts_with("CURRENT_")
+        || v.eq_ignore_ascii_case("NULL")
+        || v.eq_ignore_ascii_case("TRUE")
+        || v.eq_ignore_ascii_case("FALSE")
+        || (v.len() >= 8 && v.as_bytes()[..8].eq_ignore_ascii_case(b"CURRENT_"))
         || (v.starts_with('(') && v.ends_with(')'))
     {
         v.to_owned()
