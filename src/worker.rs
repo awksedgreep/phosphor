@@ -43,6 +43,18 @@ pub enum DbResponse {
     Insert(DbResult<i64>),
     Health(Option<String>),
     Links(Vec<(String, String, String)>),
+    /// Bundled table open: columns + rowid-ness + first window + total,
+    /// fetched as one job so cold opens cost a single round-trip.
+    Opened(DbResult<OpenedGrid>),
+}
+
+/// Everything open_table needs to build a Grid, from one worker job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenedGrid {
+    pub columns: Vec<ColumnInfo>,
+    pub editable: bool,
+    pub page: Page,
+    pub total: i64,
 }
 
 impl DbResponse {

@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::creator::CreateState;
-use crate::db::{ColumnInfo, DbLink, PValue, TableInfo};
-use crate::worker::DbHandle;
+use crate::db::{ColumnInfo, DbLink, DbResult, PValue, TableInfo};
+use crate::worker::{DbHandle, DbResponse};
 use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
 use crate::help::{self, HelpState};
 use crate::qbe::{QbeSpec, QbeState};
@@ -239,6 +239,21 @@ pub enum Command {
     SidebarSeek(char),
     /// Show/hide internal tables (shadow, _phosphor, dbhealth views).
     ToggleInternals,
+    /// A worker response arrived (main loop polls, tests pump): the
+    /// token routes it to its pending continuation in finish_db().
+    DbReady(crate::worker::Token, crate::worker::DbResponse),
+}
+
+/// An outstanding async worker job and what to do with its answer.
+/// The single worker answers FIFO, so arrivals install in submit
+/// order and converge on the latest state without generation guards.
+enum PendingOp {
+    /// Table open: build + swap in a fresh grid on arrival.
+    Open { name: String, seq: u64, at: std::time::Instant },
+    /// Ad-hoc SELECT: build a query grid on arrival.
+    Select { seq: u64, at: std::time::Instant },
+    /// Refresh: total + window into the live grid, then re-seek.
+    Refill { name: String, row: i64, col: usize, want_start: i64, at: std::time::Instant },
 }
 
 pub struct App {
@@ -298,6 +313,11 @@ pub struct App {
     /// back across records reuses them instead of re-querying.
     /// Cleared on writes (counts/previews may change) and capped.
     pane_cache: HashMap<(String, String, String), LinkPane>,
+    /// Outstanding async worker jobs by token (finish_db routes answers).
+    pending: HashMap<crate::worker::Token, PendingOp>,
+    /// Status epoch: async completions only touch the status line when
+    /// no newer message has landed since they were submitted.
+    status_seq: u64,
 }
 
 impl App {
@@ -339,6 +359,8 @@ impl App {
             form_cache: HashMap::new(),
             links_cache: HashMap::new(),
             pane_cache: HashMap::new(),
+            pending: HashMap::new(),
+            status_seq: 0,
         };
         app.reload_tables();
         app.health = app.db.health();
@@ -346,11 +368,151 @@ impl App {
     }
 
     fn say(&mut self, msg: impl Into<String>) {
+        self.status_seq += 1;
         self.status = Some((msg.into(), false));
     }
 
     fn err(&mut self, msg: impl Into<String>) {
+        self.status_seq += 1;
         self.status = Some((msg.into(), true));
+    }
+
+    /// Poll the worker for arrived async responses and apply each as a
+    /// DbReady command. Non-blocking: the main loop calls this every
+    /// iteration (unarrived responses apply on a later tick). Tests
+    /// needing determinism use sync() instead.
+    pub fn pump(&mut self) {
+        for (tag, resp) in self.db.poll() {
+            self.apply(Command::DbReady(tag, resp));
+        }
+    }
+
+    /// Blocking drain for tests: parks (briefly) until every pending
+    /// job has been answered and applied. Panics on timeout — a test
+    /// must never outrun the worker silently.
+    #[cfg(test)]
+    pub fn sync(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !self.pending.is_empty() {
+            self.pump();
+            if self.pending.is_empty() {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("db worker did not answer {} pending job(s)", self.pending.len());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Route an arrived worker response to its pending continuation.
+    /// Unknown tags are ignored (already handled — each tag resolves
+    /// exactly once and is removed here).
+    fn finish_db(&mut self, tag: crate::worker::Token, resp: DbResponse) {
+        if matches!(resp, DbResponse::Gone) {
+            self.pending.remove(&tag);
+            self.err("database worker is gone");
+            return;
+        }
+        let Some(op) = self.pending.remove(&tag) else {
+            return;
+        };
+        match (op, resp) {
+            (PendingOp::Open { name, seq, at }, DbResponse::Opened(r)) => match r {
+                Ok(g) => {
+                    // Refresh the schema caches the job already paid for.
+                    self.columns_cache.insert(name.clone(), g.columns.clone());
+                    let mut grid = Grid {
+                        source: GridSource::Table {
+                            name,
+                            editable: g.editable,
+                        },
+                        columns: g.columns.iter().map(|c| c.name.clone()).collect(),
+                        total: g.total,
+                        cache: g.page.rows,
+                        cache_start: 0,
+                        rowids: g.page.rowids,
+                        cur_row: 0,
+                        cur_col: 0,
+                        row_off: 0,
+                        col_off: 0,
+                        widths: Vec::new(),
+                    };
+                    grid.compute_widths();
+                    self.grid = Some(grid);
+                    self.focus = Focus::Grid;
+                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.refresh_health();
+                    // Clear only our own (silent) open — a newer message wins.
+                    if self.status_seq == seq {
+                        self.status = None;
+                    }
+                }
+                Err(e) => self.err(e),
+            },
+            (PendingOp::Select { seq, at }, DbResponse::Query(r)) => match r {
+                Ok(q) => {
+                    let n = q.rows.len();
+                    let truncated = q.truncated;
+                    let mut grid = Grid {
+                        source: GridSource::Query { truncated },
+                        columns: q.columns,
+                        total: n as i64,
+                        cache: q.rows,
+                        cache_start: 0,
+                        rowids: None,
+                        cur_row: 0,
+                        cur_col: 0,
+                        row_off: 0,
+                        col_off: 0,
+                        widths: Vec::new(),
+                    };
+                    grid.compute_widths();
+                    self.grid = Some(grid);
+                    self.focus = Focus::Grid;
+                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    if self.status_seq == seq {
+                        self.say(if truncated {
+                            format!("{n} rows (capped) — add a WHERE or LIMIT")
+                        } else {
+                            format!("{n} row(s)")
+                        });
+                    }
+                }
+                Err(e) => self.err(e),
+            },
+            (
+                PendingOp::Refill {
+                    name,
+                    row,
+                    col,
+                    want_start,
+                    at,
+                },
+                DbResponse::Window(r),
+            ) => match r {
+                Ok((page, total)) => {
+                    let current = matches!(
+                        &self.grid,
+                        Some(g) if matches!(&g.source, GridSource::Table { name: n, .. } if n == &name)
+                    );
+                    if !current {
+                        return; // user moved on; drop the stale window
+                    }
+                    if let Some(g) = &mut self.grid {
+                        g.total = total;
+                        g.cache = page.rows;
+                        g.rowids = page.rowids;
+                        g.cache_start = want_start;
+                        g.cur_col = col.min(g.columns.len().saturating_sub(1));
+                    }
+                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.grid_jump(row);
+                }
+                Err(e) => self.err(e),
+            },
+            (_, _) => self.err("db worker protocol mismatch"),
+        }
     }
 
     /// Internal machinery a user did not create: phosphor's own
@@ -1018,6 +1180,7 @@ impl App {
             Command::EditPage(d) => self.edit_page(d),
             Command::DeleteRow => self.delete_row(),
             Command::FindNext => self.find_next(),
+            Command::DbReady(tag, resp) => self.finish_db(tag, resp),
             Command::PromptClear => {
                 self.prompt.input.clear();
                 self.prompt.cursor = 0;
@@ -1140,19 +1303,42 @@ impl App {
 
     fn refresh(&mut self) {
         self.reload_tables();
-        if let Some(Grid {
-            source: GridSource::Table { name, .. },
-            cur_row,
-            cur_col,
-            ..
-        }) = &self.grid
-        {
-            let (name, row, col) = (name.clone(), *cur_row, *cur_col);
-            self.open_table(&name);
-            if let Some(g) = &mut self.grid {
-                g.cur_col = col.min(g.columns.len().saturating_sub(1));
+        // Async refill of the live window (columns/widths stay put);
+        // the grid re-seeks when the window arrives.
+        let target = match &self.grid {
+            Some(g) => match &g.source {
+                GridSource::Table { name, .. } => Some((
+                    name.clone(),
+                    g.cur_row,
+                    g.cur_col,
+                    g.cache_start,
+                    (g.cache.len() as i64).max(1),
+                )),
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some((name, row, col, want_start, limit)) = target {
+            let at = std::time::Instant::now();
+            let job_name = name.clone();
+            let submitted = self.db.submit(Box::new(move |db| {
+                DbResponse::Window(db.open_window(&job_name, want_start, limit))
+            }));
+            match submitted {
+                Some(tag) => {
+                    self.pending.insert(
+                        tag,
+                        PendingOp::Refill {
+                            name,
+                            row,
+                            col,
+                            want_start,
+                            at,
+                        },
+                    );
+                }
+                None => self.err("database worker is gone"),
             }
-            self.grid_jump(row);
         }
         // Explicit user refresh: force a fresh dot, not the cache.
         self.invalidate_health();
@@ -2141,34 +2327,20 @@ impl App {
 
     /// Run a SELECT into the query grid (shared by prompt + QBE + apps).
     fn run_select(&mut self, sql: &str) {
-        match self.db.query(sql) {
-            Ok(q) => {
-                self.last_ms = Some(q.elapsed.as_secs_f64() * 1000.0);
-                let n = q.rows.len();
-                let truncated = q.truncated;
-                let mut grid = Grid {
-                    source: GridSource::Query { truncated },
-                    columns: q.columns,
-                    total: n as i64,
-                    cache: q.rows,
-                    cache_start: 0,
-                    rowids: None,
-                    cur_row: 0,
-                    cur_col: 0,
-                    row_off: 0,
-                    col_off: 0,
-                    widths: Vec::new(),
-                };
-                grid.compute_widths();
-                self.grid = Some(grid);
-                self.focus = Focus::Grid;
-                self.say(if truncated {
-                    format!("{n} rows (capped) — add a WHERE or LIMIT")
-                } else {
-                    format!("{n} row(s)")
-                });
+        // Async: arbitrary user SQL can take arbitrarily long (remote
+        // analytical queries especially). The grid swaps in on arrival;
+        // until then the previous screen stays put.
+        let seq = self.status_seq;
+        let at = std::time::Instant::now();
+        let query = sql.to_owned();
+        match self
+            .db
+            .submit(Box::new(move |db| DbResponse::Query(db.query(&query))))
+        {
+            Some(tag) => {
+                self.pending.insert(tag, PendingOp::Select { seq, at });
             }
-            Err(e) => self.err(e),
+            None => self.err("database worker is gone"),
         }
     }
 
@@ -2180,42 +2352,34 @@ impl App {
     }
 
     fn open_table(&mut self, name: &str) {
-        let start = std::time::Instant::now();
-        let cols = match self.cached_columns(name) {
-            Ok(c) => c,
-            Err(e) => return self.err(e),
-        };
-        let editable = self.db.has_rowid(name);
-        let mut grid = Grid {
-            source: GridSource::Table {
-                name: name.to_owned(),
-                editable,
-            },
-            columns: cols.iter().map(|c| c.name.clone()).collect(),
-            total: 0,
-            cache: Vec::new(),
-            cache_start: 0,
-            rowids: None,
-            cur_row: 0,
-            cur_col: 0,
-            row_off: 0,
-            col_off: 0,
-            widths: Vec::new(),
-        };
-        // First window + total in one round-trip (was count + page).
-        match self.db.open_window(name, 0, self.visible_rows + OVERSCAN) {
-            Ok((page, total)) => {
-                grid.total = total;
-                grid.cache = page.rows;
-                grid.rowids = page.rowids;
+        // Async: columns + rowid-ness + first window + total bundle into
+        // ONE worker job (one round-trip, cold or warm). The previous
+        // grid stays on screen until the new one swaps in — no flash,
+        // and failures leave the old view intact.
+        let table = name.to_owned();
+        let limit = self.visible_rows + OVERSCAN;
+        let seq = self.status_seq;
+        let at = std::time::Instant::now();
+        let submitted = self.db.submit(Box::new(move |db| {
+            let res = (|| -> DbResult<crate::worker::OpenedGrid> {
+                let columns = db.columns(&table)?;
+                let editable = db.has_rowid(&table);
+                let (page, total) = db.open_window(&table, 0, limit)?;
+                Ok(crate::worker::OpenedGrid {
+                    columns,
+                    editable,
+                    page,
+                    total,
+                })
+            })();
+            DbResponse::Opened(res)
+        }));
+        match submitted {
+            Some(tag) => {
+                self.pending.insert(tag, PendingOp::Open { name: name.to_owned(), seq, at });
             }
-            Err(e) => return self.err(e),
+            None => self.err("database worker is gone"),
         }
-        grid.compute_widths();
-        self.last_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-        self.grid = Some(grid);
-        self.focus = Focus::Grid;
-        self.refresh_health();
     }
 
     fn grid_jump(&mut self, row: i64) {
@@ -3084,6 +3248,7 @@ mod tests {
     fn open_browse_navigate_virtualized() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         assert_eq!(a.focus, Focus::Grid);
         let g = a.grid.as_ref().unwrap();
         assert_eq!(g.total, 500);
@@ -3102,6 +3267,7 @@ mod tests {
             a.apply(Command::PromptChar(c));
         }
         a.apply(Command::PromptRun);
+        a.sync();
         let g = a.grid.as_ref().unwrap();
         assert!(matches!(g.source, GridSource::Query { .. }));
         assert_eq!(g.row(0).unwrap()[0], PValue::Int(500));
@@ -3111,6 +3277,7 @@ mod tests {
     fn edit_round_trip_through_the_bus() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::GridMove { dr: 0, dc: 1 });
         a.apply(Command::OpenEdit);
         assert!(matches!(a.overlay, Overlay::Edit(_)));
@@ -3235,6 +3402,7 @@ mod tests {
         }
         a.apply(Command::DesignerCommit);
         a.apply(Command::DesignerRun);
+        a.sync();
         let g = a.grid.as_ref().unwrap();
         assert_eq!(g.total, 1, "exactly row42 matches");
         assert_eq!(g.row(0).unwrap()[1], PValue::Text("row42".into()));
@@ -3243,6 +3411,7 @@ mod tests {
             a.apply(Command::PromptChar(c));
         }
         a.apply(Command::PromptRun);
+        a.sync();
         assert_eq!(a.grid.as_ref().unwrap().total, 1);
     }
 
@@ -3279,6 +3448,7 @@ mod tests {
 
         // EDIT now shows one field, custom label, and enforces required.
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenEdit);
         let Overlay::Edit(ed) = &a.overlay else {
             panic!("edit did not open");
@@ -3322,6 +3492,7 @@ mod tests {
         assert!(matches!(a.overlay, Overlay::AppMenu(_)));
         // Hotkey 'r' (first letter of "Rows") runs the browse action.
         a.apply(Command::DesignerChar('r'));
+        a.sync();
         assert!(matches!(a.overlay, Overlay::None));
         assert!(matches!(
             a.grid.as_ref().unwrap().source,
@@ -3339,6 +3510,7 @@ mod tests {
     fn insert_and_delete_rows_through_the_bus() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         assert_eq!(a.grid.as_ref().unwrap().total, 500);
 
         // INSERT: 'a' opens a NEW form; type into b; save.
@@ -3374,10 +3546,12 @@ mod tests {
     fn find_scans_forward_and_repeats() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         for c in "find row437".chars() {
             a.apply(Command::PromptChar(c));
         }
         a.apply(Command::PromptRun);
+        a.sync();
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 436);
         // 'n' finds nothing further (unique value) and says so politely.
         a.apply(Command::FindNext);
@@ -3426,6 +3600,43 @@ mod tests {
         assert_eq!(a.prompt.cursor, 0);
     }
 
+    /// Async machinery, manually reconciled (no sync()): two rapid
+    /// opens converge on the latest table; unknown tags are ignored.
+    #[test]
+    fn rapid_reopens_converge_on_latest() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE one(x); INSERT INTO one VALUES (1);")
+            .unwrap();
+        db.execute("CREATE TABLE two(x); INSERT INTO two VALUES (2);")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.open_table("one");
+        a.open_table("two");
+        assert_eq!(a.pending.len(), 2, "both jobs queued");
+        // Main-loop style: non-blocking pumps until drained.
+        for _ in 0..100 {
+            a.pump();
+            if a.pending.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(a.pending.is_empty(), "worker answered everything");
+        let g = a.grid.as_ref().expect("grid installed");
+        match &g.source {
+            GridSource::Table { name, .. } => assert_eq!(name, "two"),
+            _ => panic!("wrong grid source"),
+        }
+        assert_eq!(g.total, 1);
+        // Unknown tags (superseded/already handled) are ignored.
+        let before = a.status.clone();
+        a.apply(Command::DbReady(
+            999_999,
+            crate::worker::DbResponse::Query(Err("stale".into())),
+        ));
+        assert_eq!(a.status, before);
+    }
+
     #[test]
     fn fresh_app_needs_first_draw_and_commands_dirty_it() {
         let mut a = app();
@@ -3442,6 +3653,7 @@ mod tests {
             a.apply(Command::PromptChar(c));
         }
         a.apply(Command::PromptRun);
+        a.sync();
         assert_eq!(a.theme.name, "amber");
     }
 
@@ -3557,6 +3769,7 @@ mod tests {
     fn edit_pages_through_records_and_commits_dirty_edits() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenEdit);
         let Overlay::Edit(ed) = &a.overlay else { panic!() };
         assert_eq!(ed.row_abs, 0);
@@ -3606,6 +3819,7 @@ mod tests {
         // EDIT: no Enter needed — typing replaces the current value.
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenEdit);
         a.apply(Command::EditMove(1)); // b = "row1"
         for c in "live".chars() {
@@ -3640,6 +3854,7 @@ mod tests {
         .unwrap();
         let mut a = App::new(Box::new(db), None);
         a.apply(Command::OpenSelected); // customers (alphabetical first)
+        a.sync();
         a.apply(Command::OpenEdit);     // Ada
         let Overlay::Edit(ed) = &a.overlay else { panic!() };
         assert_eq!(ed.links.len(), 1, "the declared FK is discovered");
@@ -3657,6 +3872,7 @@ mod tests {
         assert!(ed.links[0].rows.iter().any(|r| r.contains(&"modem".into())));
         // F4 jumps into a filtered BROWSE of the children.
         a.apply(Command::EditOpenLink(0));
+        a.sync();
         let g = a.grid.as_ref().expect("filtered child browse");
         assert_eq!(g.total, 2, "only Ada's orders");
         // FKs are ENFORCED on the embedded backend now.
@@ -3672,6 +3888,7 @@ mod tests {
                 a.apply(Command::PromptChar(c));
             }
             a.apply(Command::PromptRun);
+        a.sync();
             assert!(a.quit, "{word:?} must quit");
         }
     }
@@ -3681,6 +3898,7 @@ mod tests {
         use ratatui::crossterm::event::{KeyCode, KeyEvent};
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenEdit);
         // Idle: Tab advances a field, Shift-Tab returns.
         let cmd = a.map_key(KeyEvent::from(KeyCode::Tab)).unwrap();
@@ -3709,6 +3927,7 @@ mod tests {
     fn f10_saves_while_still_typing_in_a_field() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenEdit);
         a.apply(Command::EditMove(1)); // column b
         a.apply(Command::EditBegin);
@@ -3729,6 +3948,7 @@ mod tests {
     fn enter_saves_the_record_and_advances() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenEdit);
         a.apply(Command::EditMove(1));
         a.apply(Command::EditBegin);
@@ -3751,6 +3971,7 @@ mod tests {
     fn enter_on_new_record_inserts_once_then_updates() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenInsert);
         a.apply(Command::EditMove(1));
         a.apply(Command::EditBegin);
@@ -3796,6 +4017,7 @@ mod tests {
         }
         a.apply(Command::DesignerCommit); // default 1
         a.apply(Command::DesignerRun);
+        a.sync();
         assert!(matches!(a.overlay, Overlay::None), "designer closed");
         assert!(matches!(
             &a.grid,
@@ -3823,6 +4045,7 @@ mod tests {
             .unwrap();
         let mut a = App::new(Box::new(db), None);
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenInsert);
         a.apply(Command::EditMove(1)); // skip the auto pk
         a.apply(Command::EditBegin);
@@ -3848,6 +4071,7 @@ mod tests {
     fn typing_replaces_prefilled_values_backspace_edits_them() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenEdit);
         a.apply(Command::EditMove(1)); // b = "row1"
         a.apply(Command::EditBegin);   // prefilled with "row1"
@@ -3886,6 +4110,7 @@ mod tests {
     fn paging_accelerates_while_held() {
         let mut a = app();
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenEdit);
         // 30 rapid presses: streak k gives stride min(1 + k/6, 10) —
         // 6·1 + 6·2 + 6·3 + 6·4 + 6·5 = 90 records covered.
@@ -3952,6 +4177,7 @@ mod tests {
         a.apply(Command::Back); // painter → list designer
         a.apply(Command::Back); // close
         a.apply(Command::OpenSelected);
+        a.sync();
         a.apply(Command::OpenEdit);
         let Overlay::Edit(ed) = &a.overlay else {
             panic!("edit did not open");

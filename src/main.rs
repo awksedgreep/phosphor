@@ -171,6 +171,8 @@ fn main() -> std::io::Result<()> {
             }
         }
         app.tick();
+        // Reconcile arrived worker responses (async opens/selects).
+        app.pump();
         if app.quit {
             break Ok(());
         }
