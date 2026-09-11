@@ -275,6 +275,10 @@ pub struct App {
     /// Held-key acceleration state for record paging.
     last_edit_page: Option<std::time::Instant>,
     page_streak: u32,
+    /// Dirty-flag redraw (main.rs): set by apply()/tick(), cleared by
+    /// the main loop after drawing. The terminal is static between
+    /// commands, so idle ticks skip the full redraw.
+    pub dirty: bool,
     /// Per-table caches so EDIT record flips don't re-query schema,
     /// re-parse the saved form, or re-run FK introspection per record.
     /// Cleared in reload_tables() (every schema-changing path funnels
@@ -319,6 +323,7 @@ impl App {
             last_edit_page: None,
             page_streak: 0,
             last_auto_sample: std::time::Instant::now(),
+            dirty: true, // first frame must paint
             columns_cache: HashMap::new(),
             form_cache: HashMap::new(),
             links_cache: HashMap::new(),
@@ -744,6 +749,9 @@ impl App {
     // ── the bus ──────────────────────────────────────────────────────
 
     pub fn apply(&mut self, cmd: Command) {
+        // The command bus is the ONLY place state changes, so one flag
+        // here drives the main loop's dirty-flag redraw (main.rs).
+        self.dirty = true;
         let is_delete = matches!(cmd, Command::DeleteRow);
         match cmd {
             Command::Quit => self.quit = true,
@@ -1164,6 +1172,7 @@ impl App {
         {
             self.last_auto_sample = std::time::Instant::now();
             self.health_sample();
+            self.dirty = true;
         }
     }
 
@@ -3343,6 +3352,15 @@ mod tests {
         // Erases back to whitespace; the ∅ past the cursor survives.
         assert_eq!(a.prompt.input, "∅");
         assert_eq!(a.prompt.cursor, 0);
+    }
+
+    #[test]
+    fn fresh_app_needs_first_draw_and_commands_dirty_it() {
+        let mut a = app();
+        assert!(a.dirty, "first frame must paint");
+        a.dirty = false;
+        a.apply(Command::PromptClear);
+        assert!(a.dirty, "apply() always dirties (main.rs redraw contract)");
     }
 
     #[test]

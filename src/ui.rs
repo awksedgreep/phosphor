@@ -11,7 +11,10 @@ use std::borrow::Cow;
 use crate::app::{App, Focus, Grid, GridSource, Overlay};
 use crate::db::PValue;
 
-pub fn draw(f: &mut Frame, app: &mut App) {
+pub fn draw(f: &mut Frame, app: &mut App) -> bool {
+    // Returns true when the measured viewport changed: paging math
+    // follows the new size, so the main loop redraws once more.
+    let (old_rows, old_cols) = (app.visible_rows, app.visible_cols_width);
     let th = app.theme;
     // Paint the whole screen in theme colors first (paper needs the bg).
     f.render_widget(Block::default().style(th.base()), f.area());
@@ -45,6 +48,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Overlay::Create(_) => draw_create(f, app),
         Overlay::None => {}
     }
+    app.visible_rows != old_rows || app.visible_cols_width != old_cols
 }
 
 fn draw_create(f: &mut Frame, app: &App) {

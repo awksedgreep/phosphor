@@ -119,8 +119,17 @@ fn main() -> std::io::Result<()> {
 
     let mut terminal = ratatui::init();
     let result = loop {
-        if let Err(e) = terminal.draw(|f| ui::draw(f, &mut app)) {
-            break Err(e);
+        // Dirty-flag redraw: the screen is static between commands, so
+        // idle 250ms ticks skip the full render. A viewport change
+        // repaints once more so paging math matches the new size.
+        if app.dirty {
+            let mut viewport_changed = false;
+            if let Err(e) = terminal.draw(|f| {
+                viewport_changed = ui::draw(f, &mut app);
+            }) {
+                break Err(e);
+            }
+            app.dirty = viewport_changed;
         }
         // Poll instead of block so time-based behavior (the live health
         // console) can tick between keystrokes.
@@ -149,6 +158,10 @@ fn main() -> std::io::Result<()> {
                             break;
                         }
                     }
+                    // A resize paints nothing by itself — flag it so the
+                    // next loop draws with the new viewport (previously a
+                    // resize sat stale until the next keypress).
+                    Ok(Event::Resize(_, _)) => app.dirty = true,
                     Ok(_) => {}
                     Err(e) => return finish(terminal, Err(e)),
                 },
