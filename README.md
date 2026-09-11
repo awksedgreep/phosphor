@@ -79,7 +79,9 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
 ```
 
 - **Browse** — schema sidebar (tables ▪, views ◇), virtualized **BROWSE**
-  grid that pages through millions of rows, **EDIT** record form on Enter
+  grid that pages through millions of rows, **split view** (`v`) that
+  puts a related table beside the master — cursor-linked, mouse-clickable,
+  remembered — **EDIT** record form on Enter
   (PICTURE-style ¶ pk / * not-null markers, typed parsing), `a`dd and
   `x`-twice-delete rows, `find <text>` + `n` to seek, a live **dot
   prompt** (`.`) running real SQL with history, Tab completion, and
@@ -126,6 +128,7 @@ from the real program.
 
 | | |
 |---|---|
+| **Split BROWSE** — `v` splits a related table onto the screen; the cursor drives it, the mouse re-points it, layouts are remembered | ![split browse: customer ↔ orders on one screen](docs/demo/split.gif) |
 | **The builders** — QBE writing its SQL, the banded report with group subtotals, the form painter | ![qbe, reports, painter](docs/demo/builders.gif) |
 | **DBHEALTH, live** — the report and sparklines moving on their own (auto-collection + the live console) | ![dbhealth console](docs/demo/health.gif) |
 | **`--app` mode** — the ▓▓ CRM ▓▓ menu; hotkeys run reports and browses; the database IS the application | ![app mode](docs/demo/appmode.gif) |

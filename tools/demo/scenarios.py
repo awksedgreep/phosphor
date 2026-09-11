@@ -108,6 +108,34 @@ def appmode():
     record([BIN, "--app", DB], steps, f"{OUT}/appmode.cast", env=ENV,
            title="phosphor · --app: the database IS the application")
 
+def split():
+    # SET RELATION on one screen: 'v' splits (remembered link first),
+    # the cursor drives the detail pane, Tab reaches it, 'v' cycles to
+    # the next related table, and a MOUSE CLICK re-points it. Recorded
+    # at 140x40 — the showcase canvas.
+    steps = [(0.9, ENTER)]                                  # BROWSE customers
+    steps += [(2.0, "v")]                                   # split: remembered = orders
+    s2, t = taps(4.4, ["j", "j"])                          # pane chases the cursor
+    steps += s2
+    steps += [(t + 0.9, "g"), (t + 1.6, "G"), (t + 2.4, "g")]  # fly; pane follows
+    t += 3.4
+    steps += [(t, "\t")]                                   # Tab into the pane
+    s2, t = taps(t + 0.8, ["j", "k"])                     # wander Ada's orders
+    steps += s2
+    steps += [(t + 0.7, "\t")]                             # back to the master
+    t += 1.0
+    steps += [(t, "v"), (t + 1.0, "v")]                   # cycle: notes → orders
+    t += 2.0
+    # A real click (SGR mouse sequence): press + release on Grace's row.
+    steps += [(t, "\x1b[<0;60;4M"), (t + 0.15, "\x1b[<0;60;4m")]
+    t += 1.6
+    steps += [(t, "\x1b[6~")]                              # PgDn: pane chases Edsger
+    t += 1.8
+    steps += [(t, CTRL_Q)]
+    record([BIN, DB], steps, f"{OUT}/split.cast", env=ENV,
+           title="phosphor · split BROWSE: customer ↔ orders on one screen",
+           cols=140, rows=40)
+
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
     if not HAS_EXT:
@@ -117,3 +145,4 @@ if __name__ == "__main__":
     if HAS_EXT:
         health()
     appmode()
+    split()

@@ -12,12 +12,18 @@ INSERT INTO customers(name,city,balance) VALUES
  ('Ada','London',120.50),('Grace','Arlington',80.00),('Edsger','Austin',200.00),
  ('Barbara','London',310.00),('Donald','Austin',45.50),('Niklaus','Zurich',520.00),
  ('John','Cambridge',89.90),('Margaret','Arlington',150.00);
-CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT NOT NULL, product TEXT, qty INTEGER, amount REAL, region TEXT);
-INSERT INTO orders(customer,product,qty,amount,region) VALUES
- ('Ada','compiler',1,99.00,'east'),('Grace','linker',2,45.00,'east'),
- ('Barbara','abstraction',3,120.00,'east'),('Niklaus','pascal',1,80.00,'west'),
- ('Edsger','semaphore',5,25.00,'west'),('Donald','tex',1,7.99,'west'),
- ('Ada','engine',1,250.00,'east'),('Margaret','apollo',1,400.00,'east');
+CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT NOT NULL, product TEXT, qty INTEGER, amount REAL, region TEXT, customer_id INTEGER REFERENCES customers(id));
+INSERT INTO orders(customer,product,qty,amount,region,customer_id) VALUES
+ ('Ada','compiler',1,99.00,'east',1),('Grace','linker',2,45.00,'east',2),
+ ('Barbara','abstraction',3,120.00,'east',4),('Niklaus','pascal',1,80.00,'west',6),
+ ('Edsger','semaphore',5,25.00,'west',3),('Donald','tex',1,7.99,'west',5),
+ ('Ada','engine',1,250.00,'east',1),('Margaret','apollo',1,400.00,'east',8);
+
+-- A second related table: 'v' cycling and the remembered split have
+-- more than one link to work with.
+CREATE TABLE notes(id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id), note TEXT);
+INSERT INTO notes(customer_id, note) VALUES
+ (1,'Prefers email'),(1,'Renews in Q3'),(2,'Invoice resent');
 
 CREATE TABLE _phosphor_apps (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT);
 CREATE TABLE _phosphor_items (id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL, label TEXT NOT NULL,
@@ -30,6 +36,11 @@ INSERT INTO _phosphor_items(app_id,label,action_kind,action_ref,seq) VALUES
 
 CREATE TABLE _phosphor_forms (id INTEGER PRIMARY KEY, table_ref TEXT UNIQUE NOT NULL,
   layout_json TEXT NOT NULL, version INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS _phosphor_prefs (user TEXT NOT NULL, key TEXT NOT NULL, value TEXT, UNIQUE(user, key));
+-- The remembered split for customers (slice C): 'v' opens orders first
+-- (char(1) is the child/col separator byte the app writes).
+INSERT INTO _phosphor_prefs(user, key, value)
+  VALUES ('me', 'split:customers', 'orders' || char(1) || 'customer_id');
 INSERT INTO _phosphor_forms(table_ref, layout_json) VALUES ('customers',
 '{"v":2,"size":{"w":56,"h":14},"texts":[{"x":18,"y":0,"text":"CUSTOMER CARD"}],"boxes":[{"x":1,"y":1,"w":52,"h":11}],"fields":[
  {"column":"name","label":"Name","include":true,"required":true,"x":4,"y":3,"width":28},

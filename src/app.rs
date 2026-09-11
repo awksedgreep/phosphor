@@ -2782,28 +2782,51 @@ impl App {
     /// same discovery as the EDIT link panes). Needs a wide terminal —
     /// narrow screens keep the single-pane layout they're good at.
     fn toggle_split(&mut self) {
+        let parent = match &self.grid {
+            Some(g) => match &g.source {
+                GridSource::Table { name, .. } => name.clone(),
+                _ => {
+                    return self.say("split works on a table BROWSE");
+                }
+            },
+            None => return self.say("open a table first (Enter in the sidebar)"),
+        };
+        // The cycle: the remembered link fronts it, the rest follow in
+        // declaration order — a past choice reorders, never hides. v
+        // walks cycle[0] → cycle[1] → … → close → cycle[0]…
+        let links = self.cached_links(&parent);
+        let remembered = store::pref_get(self.db.link(), &format!("split:{parent}"))
+            .and_then(|v| {
+                let (c, k) = v.split_once('\u{1}')?;
+                links
+                    .iter()
+                    .find(|l| l.0.eq_ignore_ascii_case(c) && l.1.eq_ignore_ascii_case(k))
+                    .cloned()
+            });
+        let mut cycle = links.clone();
+        if let Some(r) = &remembered {
+            if let Some(i) = cycle
+                .iter()
+                .position(|l| l.0.eq_ignore_ascii_case(&r.0) && l.1.eq_ignore_ascii_case(&r.1))
+            {
+                let r = cycle.remove(i);
+                cycle.insert(0, r);
+            }
+        }
         if self.detail.is_some() {
             // Already open: advance to the next related child, or close
             // after the last one.
-            let parent = match &self.grid {
-                Some(g) => match &g.source {
-                    GridSource::Table { name, .. } => name.clone(),
-                    _ => return,
-                },
-                None => return,
-            };
-            let links = self.cached_links(&parent);
-            if links.len() > 1 {
+            if cycle.len() > 1 {
                 let current = self.detail.as_ref().and_then(|d| match &d.grid.source {
                     GridSource::Detail { child, child_col, .. } => {
                         Some((child.clone(), child_col.clone()))
                     }
                     _ => None,
                 });
-                let pos = links.iter().position(|l| {
+                let pos = cycle.iter().position(|l| {
                     current.as_ref().is_some_and(|(c, k)| c == &l.0 && k == &l.1)
                 });
-                if let Some(next) = pos.and_then(|i| links.get(i + 1)) {
+                if let Some(next) = pos.and_then(|i| cycle.get(i + 1)) {
                     let (child, col, pcol) = next.clone();
                     self.open_detail(child, col, pcol);
                     return;
@@ -2817,32 +2840,14 @@ impl App {
         if self.visible_cols_width < 74 {
             return self.say("split view needs a wider terminal (100+ cols)");
         }
-        let parent = match &self.grid {
-            Some(g) => match &g.source {
-                GridSource::Table { name, .. } => name.clone(),
-                _ => return self.say("split works on a table BROWSE"),
-            },
-            None => return self.say("open a table first (Enter in the sidebar)"),
-        };
-        let links = self.cached_links(&parent);
-        if links.is_empty() {
-            return self.say(format!(
+        match cycle.first() {
+            Some((child, col, pcol)) => {
+                let (c, k, p) = (child.clone(), col.clone(), pcol.clone());
+                self.open_detail(c, k, p);
+            }
+            None => self.say(format!(
                 "{parent} has no related tables (declared foreign keys)"
-            ));
-        }
-        // The table's remembered link (a past split) opens first; new
-        // links still cycle with further presses.
-        let remembered = store::pref_get(self.db.link(), &format!("split:{parent}"))
-            .and_then(|v| {
-                let (c, k) = v.split_once('\u{1}')?;
-                links
-                    .iter()
-                    .find(|l| l.0.eq_ignore_ascii_case(c) && l.1.eq_ignore_ascii_case(k))
-                    .cloned()
-            });
-        match remembered.or_else(|| links.first().cloned()) {
-            Some((child, col, pcol)) => self.open_detail(child, col, pcol),
-            None => self.say(format!("{parent} has no related tables")),
+            )),
         }
     }
 
