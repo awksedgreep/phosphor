@@ -4795,6 +4795,35 @@ mod tests {
         let _ = std::fs::remove_file(&file);
     }
 
+    /// Generality check: nothing about the split is customer/order
+    /// specific. Different domain, FK targeting a NON-pk UNIQUE column,
+    /// no "id" column anywhere.
+    #[test]
+    fn split_works_on_any_declared_fk_pair() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE albums(name TEXT UNIQUE NOT NULL, artist TEXT);
+             CREATE TABLE tracks(title TEXT, album_name TEXT REFERENCES albums(name), seconds INTEGER);
+             INSERT INTO albums VALUES ('Kind of Blue', 'Miles Davis');
+             INSERT INTO tracks VALUES ('So What', 'Kind of Blue', 545),
+               ('Freddie Freeloader', 'Kind of Blue', 589);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected); // albums (alphabetical first)
+        a.sync();
+        a.visible_cols_width = 120;
+        a.apply(Command::ToggleSplit);
+        a.sync();
+        let d = a.detail.as_ref().expect("detail on albums");
+        let GridSource::Detail { child, key_sql, .. } = &d.grid.source else {
+            panic!("detail source");
+        };
+        assert_eq!(child, "tracks");
+        assert_eq!(key_sql, "'Kind of Blue'", "non-pk FK target, quoted text");
+        assert_eq!(d.grid.total, 2, "both tracks of the album");
+    }
+
     #[test]
     fn prompt_completion_and_line_editing() {
         let mut a = app();
