@@ -9,8 +9,8 @@
 //! PHOSPHOR_TOKEN adds `Authorization: Bearer …` — the only difference
 //! between self-hosted sqld and Turso-hosted URLs.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -25,7 +25,7 @@ pub struct RemoteDb {
     pipeline_url: String,
     display: String,
     auth: Option<String>,
-    rowid_cache: RefCell<HashMap<String, bool>>,
+    rowid_cache: Mutex<HashMap<String, bool>>,
 }
 
 struct StmtOut {
@@ -50,7 +50,7 @@ impl RemoteDb {
                 .ok()
                 .filter(|t| !t.is_empty())
                 .map(|t| format!("Bearer {t}")),
-            rowid_cache: RefCell::new(HashMap::new()),
+            rowid_cache: Mutex::new(HashMap::new()),
         };
         // Fail at open, not at first keystroke.
         db.pipeline(&[("SELECT 1", vec![])])?;
@@ -252,7 +252,7 @@ impl DbLink for RemoteDb {
     }
 
     fn has_rowid(&self, table: &str) -> bool {
-        if let Some(&known) = self.rowid_cache.borrow().get(table) {
+        if let Some(&known) = self.rowid_cache.lock().unwrap().get(table) {
             return known;
         }
         let ok = self
@@ -261,7 +261,7 @@ impl DbLink for RemoteDb {
                 vec![],
             )
             .is_ok();
-        self.rowid_cache.borrow_mut().insert(table.to_owned(), ok);
+        self.rowid_cache.lock().unwrap().insert(table.to_owned(), ok);
         ok
     }
 
@@ -371,7 +371,7 @@ impl DbLink for RemoteDb {
             -1
         };
         // Any statement may have changed schema/rowid-ness.
-        self.rowid_cache.borrow_mut().clear();
+        self.rowid_cache.lock().unwrap().clear();
         Ok((n, start.elapsed()))
     }
 

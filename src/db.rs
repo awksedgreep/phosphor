@@ -4,8 +4,8 @@
 //! adds the sqld/Hrana backend behind the same trait; nothing above this
 //! module may name rusqlite.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use rusqlite::types::ValueRef;
@@ -168,13 +168,13 @@ impl rusqlite::ToSql for PValue {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableInfo {
     pub name: String,
     pub is_view: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColumnInfo {
     pub name: String,
     pub decl_type: String,
@@ -182,14 +182,14 @@ pub struct ColumnInfo {
     pub pk: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Page {
     pub rows: Vec<Vec<PValue>>,
     /// rowid per row when the table has one (enables EDIT).
     pub rowids: Option<Vec<i64>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<PValue>>,
@@ -201,7 +201,7 @@ pub struct QueryResult {
 /// stays interactive; the grid says so when it bites.
 pub const QUERY_CAP: usize = 10_000;
 
-pub trait DbLink {
+pub trait DbLink: Send {
     fn backend(&self) -> &'static str;
     fn name(&self) -> &str;
     fn tables(&self) -> DbResult<Vec<TableInfo>>;
@@ -279,8 +279,12 @@ fn sql_str(s: &str) -> String {
 pub struct EmbeddedDb {
     conn: Connection,
     name: String,
-    rowid_cache: RefCell<HashMap<String, bool>>,
-    anchors: RefCell<HashMap<String, AnchorIndex>>,
+    // Mutexes, not RefCells: the whole backend moves to the worker
+    // thread (worker.rs), which needs Send. They are never contended —
+    // one thread owns the backend — so lock().unwrap() never blocks
+    // and poisoning would require a panic inside a HashMap op.
+    rowid_cache: Mutex<HashMap<String, bool>>,
+    anchors: Mutex<HashMap<String, AnchorIndex>>,
 }
 
 /// Split a `SELECT ..., count(*) OVER () AS _total` result back into a
@@ -414,8 +418,8 @@ impl EmbeddedDb {
             EmbeddedDb {
                 conn,
                 name: path.to_owned(),
-                rowid_cache: RefCell::new(HashMap::new()),
-                anchors: RefCell::new(HashMap::new()),
+                rowid_cache: Mutex::new(HashMap::new()),
+                anchors: Mutex::new(HashMap::new()),
             },
             warning,
         ))
@@ -452,13 +456,13 @@ impl EmbeddedDb {
 
     /// Nearest anchor at/before `offset`, if any.
     fn anchor_plan(&self, table: &str, offset: i64) -> Option<(i64, i64)> {
-        self.anchors.borrow().get(table).and_then(|a| a.plan(offset))
+        self.anchors.lock().unwrap().get(table).and_then(|a| a.plan(offset))
     }
 
     /// Record a fetched window's rowids (absolute positions).
     fn anchor_observe(&self, table: &str, offset: i64, rowids: &[i64]) {
         self.anchors
-            .borrow_mut()
+            .lock().unwrap()
             .entry(table.to_owned())
             .or_default()
             .observe(offset, rowids);
@@ -466,7 +470,7 @@ impl EmbeddedDb {
 
     /// Positions moved: anchors for this table are void.
     fn anchor_clear(&self, table: &str) {
-        self.anchors.borrow_mut().remove(table);
+        self.anchors.lock().unwrap().remove(table);
     }
 
     /// Fetch `limit` rows from `offset` via a rowid anchor, skipping
@@ -591,14 +595,14 @@ impl DbLink for EmbeddedDb {
     }
 
     fn has_rowid(&self, table: &str) -> bool {
-        if let Some(&known) = self.rowid_cache.borrow().get(table) {
+        if let Some(&known) = self.rowid_cache.lock().unwrap().get(table) {
             return known;
         }
         let ok = self
             .conn
             .prepare_cached(&format!("SELECT rowid FROM {} LIMIT 0", Self::quote(table)))
             .is_ok();
-        self.rowid_cache.borrow_mut().insert(table.to_owned(), ok);
+        self.rowid_cache.lock().unwrap().insert(table.to_owned(), ok);
         ok
     }
 
@@ -708,9 +712,9 @@ impl DbLink for EmbeddedDb {
             || lower.contains("alter")
             || lower.contains("vacuum")
         {
-            self.rowid_cache.borrow_mut().clear();
+            self.rowid_cache.lock().unwrap().clear();
         }
-        self.anchors.borrow_mut().clear();
+        self.anchors.lock().unwrap().clear();
         if body.contains(';') {
             self.conn.execute_batch(sql).map_err(|e| e.to_string())?;
             return Ok((-1, start.elapsed()));
@@ -1014,7 +1018,7 @@ mod tests {
             db.page("k", off, 50).unwrap();
             off += 50;
         }
-        let anchors = db.anchors.borrow();
+        let anchors = db.anchors.lock().unwrap();
         let idx = anchors.get("k").expect("flight records anchors");
         assert!(!idx.map.is_empty());
         // 128 is stride-aligned: exact anchor, skip 0, rowid 129.
@@ -1031,19 +1035,19 @@ mod tests {
         db.execute("INSERT INTO k(v) VALUES ('a'), ('b')").unwrap();
         db.execute("CREATE VIEW v AS SELECT v AS letter FROM k").unwrap();
         db.page("k", 0, 10).unwrap();
-        assert!(db.anchors.borrow().contains_key("k"));
+        assert!(db.anchors.lock().unwrap().contains_key("k"));
         // A view page records nothing (no rowids to anchor on).
         db.page("v", 0, 10).unwrap();
-        assert!(!db.anchors.borrow().contains_key("v"));
+        assert!(!db.anchors.lock().unwrap().contains_key("v"));
         db.delete_row("k", 1).unwrap();
-        assert!(!db.anchors.borrow().contains_key("k"), "delete voids");
+        assert!(!db.anchors.lock().unwrap().contains_key("k"), "delete voids");
         // Content after the gap: positions shift, rowids show the hole.
         let page = db.page("k", 0, 10).unwrap();
         assert_eq!(page.rowids, Some(vec![2]));
         assert_eq!(page.rows.len(), 1);
         db.page("k", 0, 10).unwrap();
         db.execute("INSERT INTO k(v) VALUES ('z')").unwrap();
-        assert!(!db.anchors.borrow().contains_key("k"), "execute voids");
+        assert!(!db.anchors.lock().unwrap().contains_key("k"), "execute voids");
     }
 
     /// Anchor memory stays bounded no matter how far the flight goes.
@@ -1127,6 +1131,20 @@ mod tests {
                 assert_eq!(v.contains_ci(&lc, has_alpha), old, "{v:?} vs {needle:?}");
             }
         }
+    }
+
+    /// Both backends (and every response shape) cross the worker
+    /// thread boundary: prove Send at compile time.
+    #[test]
+    fn backends_and_responses_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<EmbeddedDb>();
+        assert_send::<crate::remote::RemoteDb>();
+        assert_send::<PValue>();
+        assert_send::<TableInfo>();
+        assert_send::<ColumnInfo>();
+        assert_send::<Page>();
+        assert_send::<QueryResult>();
     }
 
     #[test]

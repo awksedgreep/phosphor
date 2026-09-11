@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::creator::CreateState;
 use crate::db::{ColumnInfo, DbLink, PValue, TableInfo};
+use crate::worker::DbHandle;
 use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
 use crate::help::{self, HelpState};
 use crate::qbe::{QbeSpec, QbeState};
@@ -241,7 +242,10 @@ pub enum Command {
 }
 
 pub struct App {
-    pub db: Box<dyn DbLink>,
+    /// The database, behind the worker thread (worker.rs). All calls
+    /// round-trip and block in slice 1 — identical behavior, and the
+    /// façade keeps every call site unchanged for later async slices.
+    pub db: DbHandle,
     /// Set by `--app`: Esc at top level returns to this app's menu.
     pub app_home: Option<String>,
     pub theme: &'static Theme,
@@ -299,7 +303,9 @@ pub struct App {
 impl App {
     pub fn new(db: Box<dyn DbLink>, warning: Option<String>) -> Self {
         let mut app = App {
-            db,
+            // The worker takes ownership of the connection here; every
+            // db call below round-trips to it (slice 1: blocking parity).
+            db: crate::worker::spawn(db),
             app_home: None,
             theme: &theme::GREEN,
             focus: Focus::Sidebar,
@@ -451,7 +457,7 @@ impl App {
         if let Some(s) = self.form_cache.get(table) {
             return s.clone();
         }
-        let spec = FormSpec::load(self.db.as_ref(), table);
+        let spec = FormSpec::load(self.db.link(), table);
         self.form_cache.insert(table.to_owned(), spec.clone());
         spec
     }
@@ -1294,7 +1300,7 @@ impl App {
             Err(_) => {
                 // Old SQLite / quirky vtab without window support:
                 // fall back to the per-series loop (slower, same picture).
-                for name in Self::series_names(self.db.as_ref(), &base) {
+                for name in Self::series_names(self.db.link(), &base) {
                     let safe = name.replace('\'', "''");
                     if let Ok(q) = self.db.query(&format!(
                         "SELECT value FROM {} WHERE name = '{safe}' ORDER BY ts DESC LIMIT 64",
@@ -1418,7 +1424,7 @@ impl App {
         let Some(table) = self.target_table(table) else {
             return self.err("qbe: no table selected (qbe <table>)");
         };
-        match QbeSpec::new(self.db.as_ref(), &table) {
+        match QbeSpec::new(self.db.link(), &table) {
             Ok(spec) => self.overlay = Overlay::Qbe(QbeState::new(spec)),
             Err(e) => self.err(e),
         }
@@ -1429,7 +1435,7 @@ impl App {
             return self.err("report: no table selected (report <table-or-saved-name>)");
         };
         // A saved report by this name wins; otherwise start from the table.
-        let spec = ReportSpec::load(self.db.as_ref(), &name)
+        let spec = ReportSpec::load(self.db.link(), &name)
             .unwrap_or_else(|| ReportSpec::for_table(&name));
         let columns = self.source_columns(&spec);
         self.overlay = Overlay::Report(ReportState {
@@ -1456,7 +1462,7 @@ impl App {
         let Some(table) = self.target_table(table) else {
             return self.err("labels: no table selected (labels <table>)");
         };
-        match report::labels(self.db.as_ref(), &table) {
+        match report::labels(self.db.link(), &table) {
             Ok(lines) => {
                 self.overlay = Overlay::Pager(PagerState {
                     title: format!("LABELS · {table}"),
@@ -1532,7 +1538,7 @@ impl App {
                 if let Some(item) = st.items.get_mut(st.cursor) {
                     item.kind = item.kind.cycle();
                     let item = item.clone();
-                    let _ = appsgen::update_item(self.db.as_ref(), &item);
+                    let _ = appsgen::update_item(self.db.link(), &item);
                 }
             }
             Overlay::Paint(st) => st.select_next(),
@@ -1772,7 +1778,7 @@ impl App {
                             item.label = buf;
                         }
                         let item = item.clone();
-                        let _ = appsgen::update_item(self.db.as_ref(), &item);
+                        let _ = appsgen::update_item(self.db.link(), &item);
                     }
                 }
             }
@@ -1812,7 +1818,7 @@ impl App {
             _ => {}
         }
         if let (Some(name), Overlay::Qbe(st)) = (&save_as, &self.overlay) {
-            match st.spec.save(self.db.as_ref(), name) {
+            match st.spec.save(self.db.link(), name) {
                 Ok(()) => self.say(format!("saved query {name:?} (run {name})")),
                 Err(e) => self.err(e),
             }
@@ -1835,7 +1841,7 @@ impl App {
             }
             Overlay::Report(st) => {
                 let spec = st.spec.clone();
-                match report::render(self.db.as_ref(), &spec) {
+                match report::render(self.db.link(), &spec) {
                     Ok(lines) => {
                         self.overlay = Overlay::Pager(PagerState {
                             title: format!("REPORT · {}", spec.title),
@@ -1858,7 +1864,7 @@ impl App {
             }
             Overlay::Create(st) => {
                 let draft = st.draft.clone();
-                match draft.create(self.db.as_ref()) {
+                match draft.create(self.db.link()) {
                     Ok(()) => {
                         self.overlay = Overlay::None;
                         self.reload_tables();
@@ -1893,7 +1899,7 @@ impl App {
                 self.open_table(&table);
             }
             ActionKind::Query => {
-                match QbeSpec::saved_sql(self.db.as_ref(), &item.action_ref) {
+                match QbeSpec::saved_sql(self.db.link(), &item.action_ref) {
                     Some(sql) => {
                         self.overlay = Overlay::None;
                         self.run_select(&sql);
@@ -1905,9 +1911,9 @@ impl App {
                 }
             }
             ActionKind::Report => {
-                let spec = ReportSpec::load(self.db.as_ref(), &item.action_ref)
+                let spec = ReportSpec::load(self.db.link(), &item.action_ref)
                     .unwrap_or_else(|| ReportSpec::for_table(&item.action_ref));
-                match report::render(self.db.as_ref(), &spec) {
+                match report::render(self.db.link(), &spec) {
                     Ok(lines) => {
                         self.overlay = Overlay::Pager(PagerState {
                             title: format!("REPORT · {}", spec.title),
@@ -1941,7 +1947,7 @@ impl App {
             }
             Overlay::Report(st) => {
                 let spec = st.spec.clone();
-                match spec.save(self.db.as_ref()) {
+                match spec.save(self.db.link()) {
                     Ok(()) => {
                         self.say(format!("saved report {:?} (report {})", spec.name, spec.name))
                     }
@@ -1950,7 +1956,7 @@ impl App {
             }
             Overlay::Form(st) => {
                 let spec = st.spec.clone();
-                match spec.save(self.db.as_ref()) {
+                match spec.save(self.db.link()) {
                     Ok(()) => {
                         self.form_cache.remove(&spec.table);
                         self.say(format!(
@@ -1963,7 +1969,7 @@ impl App {
             }
             Overlay::Paint(st) => {
                 let spec = st.spec.clone();
-                match spec.save(self.db.as_ref()) {
+                match spec.save(self.db.link()) {
                     Ok(()) => {
                         self.form_cache.remove(&spec.table);
                         self.say(format!(
@@ -1987,7 +1993,7 @@ impl App {
         }
         if let Overlay::Apps(st) = &self.overlay {
             let app = st.app.clone();
-            match appsgen::add_item(self.db.as_ref(), &app, "New item") {
+            match appsgen::add_item(self.db.link(), &app, "New item") {
                 Ok(()) => {
                     self.apps_reload(&app);
                     // Select the item just added: the next Enter must
@@ -2014,7 +2020,7 @@ impl App {
         if let Overlay::Apps(st) = &self.overlay {
             let app = st.app.clone();
             if let Some(item) = st.items.get(st.cursor) {
-                match appsgen::delete_item(self.db.as_ref(), item.id) {
+                match appsgen::delete_item(self.db.link(), item.id) {
                     Ok(()) => self.apps_reload(&app),
                     Err(e) => self.err(e),
                 }
@@ -2053,7 +2059,7 @@ impl App {
                     let (a, b) = (st.items[st.cursor].clone(), st.items[to as usize].clone());
                     let app = st.app.clone();
                     let cursor_to = to as usize;
-                    match appsgen::swap_items(self.db.as_ref(), &a, &b) {
+                    match appsgen::swap_items(self.db.link(), &a, &b) {
                         Ok(()) => {
                             self.apps_reload(&app);
                             if let Overlay::Apps(st) = &mut self.overlay {
@@ -2069,7 +2075,7 @@ impl App {
     }
 
     fn apps_reload(&mut self, app: &str) {
-        let items = appsgen::items(self.db.as_ref(), app);
+        let items = appsgen::items(self.db.link(), app);
         if let Overlay::Apps(st) = &mut self.overlay {
             st.items = items;
             st.cursor = st.cursor.min(st.items.len().saturating_sub(1));
@@ -2103,11 +2109,11 @@ impl App {
 
     fn open_apps(&mut self, name: Option<String>) {
         let name = name
-            .or_else(|| appsgen::list_apps(self.db.as_ref()).into_iter().next())
+            .or_else(|| appsgen::list_apps(self.db.link()).into_iter().next())
             .unwrap_or_else(|| "app".to_owned());
         // Deliberately no ensure here: opening the designer is a READ.
         // The first DesignerAdd creates the app (and its tables).
-        let items = appsgen::items(self.db.as_ref(), &name);
+        let items = appsgen::items(self.db.link(), &name);
         self.overlay = Overlay::Apps(AppDesignState {
             app: name,
             items,
@@ -2118,11 +2124,11 @@ impl App {
     }
 
     fn open_app_menu(&mut self, name: Option<String>) {
-        let Some(name) = name.or_else(|| appsgen::list_apps(self.db.as_ref()).into_iter().next())
+        let Some(name) = name.or_else(|| appsgen::list_apps(self.db.link()).into_iter().next())
         else {
             return self.err("no apps in this database yet — press A to craft one");
         };
-        let items = appsgen::items(self.db.as_ref(), &name);
+        let items = appsgen::items(self.db.link(), &name);
         if items.is_empty() {
             return self.err(format!("app {name:?} has no items yet — A to design"));
         }
@@ -2985,7 +2991,7 @@ impl App {
         }
         if let Some(rest) = line.strip_prefix("run ") {
             let name = rest.trim();
-            return match QbeSpec::saved_sql(self.db.as_ref(), name) {
+            return match QbeSpec::saved_sql(self.db.link(), name) {
                 Some(sql) => self.run_select(&sql),
                 None => self.err(format!("no saved query named {name:?}")),
             };
@@ -3529,12 +3535,12 @@ mod tests {
     #[test]
     fn app_mode_pager_closes_back_to_the_menu() {
         let mut a = app();
-        appsgen::ensure_app(a.db.as_ref(), "demo").unwrap();
-        appsgen::add_item(a.db.as_ref(), "demo", "Totals").unwrap();
-        let mut items = appsgen::items(a.db.as_ref(), "demo");
+        appsgen::ensure_app(a.db.link(), "demo").unwrap();
+        appsgen::add_item(a.db.link(), "demo", "Totals").unwrap();
+        let mut items = appsgen::items(a.db.link(), "demo");
         items[0].kind = ActionKind::Report;
         items[0].action_ref = "t".into();
-        appsgen::update_item(a.db.as_ref(), &items[0]).unwrap();
+        appsgen::update_item(a.db.link(), &items[0]).unwrap();
 
         a.app_home = Some("demo".into());
         a.apply(Command::OpenAppMenu(Some("demo".into())));
@@ -3933,7 +3939,7 @@ mod tests {
         a.apply(Command::DesignerSave);
 
         // Reload from storage: painted, with everything in place.
-        let spec = crate::forms::FormSpec::load(a.db.as_ref(), "t").unwrap();
+        let spec = crate::forms::FormSpec::load(a.db.link(), "t").unwrap();
         assert!(spec.painted());
         assert_eq!(spec.fields[1].pos, Some((10, 5)));
         assert_eq!(spec.texts.len(), 1);

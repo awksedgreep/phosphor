@@ -9,7 +9,7 @@ use ratatui::Frame;
 use std::borrow::Cow;
 
 use crate::app::{App, Focus, Grid, GridSource, Overlay};
-use crate::db::PValue;
+use crate::db::{DbLink, PValue};
 
 pub fn draw(f: &mut Frame, app: &mut App) -> bool {
     // Returns true when the measured viewport changed: paging math

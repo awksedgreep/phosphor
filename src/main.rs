@@ -18,6 +18,7 @@ mod report;
 mod store;
 mod theme;
 mod ui;
+mod worker;
 
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
@@ -104,7 +105,7 @@ fn main() -> std::io::Result<()> {
     if app_mode {
         // The database IS the application (DESIGN.md phase 5).
         app.app_home = app_name.clone().or_else(|| {
-            crate::appsgen::list_apps(app.db.as_ref()).into_iter().next()
+            crate::appsgen::list_apps(app.db.link()).into_iter().next()
         });
         app.apply(app::Command::OpenAppMenu(app.app_home.clone()));
     }
