@@ -280,6 +280,7 @@ pub struct EmbeddedDb {
     conn: Connection,
     name: String,
     rowid_cache: RefCell<HashMap<String, bool>>,
+    anchors: RefCell<HashMap<String, AnchorIndex>>,
 }
 
 /// Split a `SELECT ..., count(*) OVER () AS _total` result back into a
@@ -317,6 +318,52 @@ pub(crate) fn strip_window_total(
         Ok((Page { rows, rowids: Some(rowids) }, total))
     } else {
         Ok((Page { rows, rowids: None }, total))
+    }
+}
+
+/// Sparse absolute-position → rowid anchors for keyset paging.
+///
+/// OFFSET windows rescan from row 0 on every PgDn (linear in depth);
+/// once a window's rowids are known, later windows can start FROM the
+/// nearest anchor (`WHERE rowid >= ? ORDER BY rowid`) and skip a bounded
+/// remainder instead. Anchors are only valid while positions are stable,
+/// so backends drop them on any write to the table.
+///
+/// Embedded-only: the remote backend keeps OFFSET (another sqld client
+/// may move positions under us — correctness first).
+#[derive(Debug, Default)]
+pub(crate) struct AnchorIndex {
+    map: std::collections::BTreeMap<i64, i64>,
+}
+
+impl AnchorIndex {
+    /// Anchor every Nth position; cap total anchors (memory bound).
+    const STRIDE: i64 = 64;
+    const CAP: usize = 4096;
+    /// Nearest anchor at/before `offset` → (start_rowid, rows_to_skip).
+    /// Skip is bounded by STRIDE when flight is sequential.
+    fn plan(&self, offset: i64) -> Option<(i64, i64)> {
+        self.map
+            .range(..=offset)
+            .next_back()
+            .map(|(a_off, a_row)| (*a_row, offset - a_off))
+    }
+
+    /// Record anchors for a fetched window: `rowids[i]` sits at
+    /// absolute position `offset + i` (caller guarantees rowid order).
+    fn observe(&mut self, offset: i64, rowids: &[i64]) {
+        if rowids.is_empty() {
+            return;
+        }
+        for (i, r) in rowids.iter().enumerate() {
+            let pos = offset + i as i64;
+            if pos % Self::STRIDE == 0 {
+                self.map.insert(pos, *r);
+            }
+        }
+        while self.map.len() > Self::CAP {
+            self.map.pop_first();
+        }
     }
 }
 
@@ -368,6 +415,7 @@ impl EmbeddedDb {
                 conn,
                 name: path.to_owned(),
                 rowid_cache: RefCell::new(HashMap::new()),
+                anchors: RefCell::new(HashMap::new()),
             },
             warning,
         ))
@@ -379,12 +427,13 @@ impl EmbeddedDb {
 
     fn collect_rows(
         stmt: &mut rusqlite::Statement<'_>,
+        params: &[&dyn rusqlite::ToSql],
         cap: usize,
     ) -> DbResult<(Vec<Vec<PValue>>, bool)> {
         let ncols = stmt.column_count();
         let mut rows_out = Vec::new();
         let mut truncated = false;
-        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        let mut rows = stmt.query(params).map_err(|e| e.to_string())?;
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             if rows_out.len() >= cap {
                 truncated = true;
@@ -399,6 +448,88 @@ impl EmbeddedDb {
             rows_out.push(out);
         }
         Ok((rows_out, truncated))
+    }
+
+    /// Nearest anchor at/before `offset`, if any.
+    fn anchor_plan(&self, table: &str, offset: i64) -> Option<(i64, i64)> {
+        self.anchors.borrow().get(table).and_then(|a| a.plan(offset))
+    }
+
+    /// Record a fetched window's rowids (absolute positions).
+    fn anchor_observe(&self, table: &str, offset: i64, rowids: &[i64]) {
+        self.anchors
+            .borrow_mut()
+            .entry(table.to_owned())
+            .or_default()
+            .observe(offset, rowids);
+    }
+
+    /// Positions moved: anchors for this table are void.
+    fn anchor_clear(&self, table: &str) {
+        self.anchors.borrow_mut().remove(table);
+    }
+
+    /// Fetch `limit` rows from `offset` via a rowid anchor, skipping
+    /// the `skip` rows between the anchor and the window.
+    fn keyset_page(
+        &self,
+        table: &str,
+        q: &str,
+        start_rowid: i64,
+        skip: i64,
+        offset: i64,
+        limit: i64,
+    ) -> DbResult<Page> {
+        let fetch = skip + limit;
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT rowid, * FROM {q} WHERE rowid >= ?1 ORDER BY rowid LIMIT ?2"
+            ))
+            .map_err(|e| e.to_string())?;
+        let (all, _) = Self::collect_rows(
+            &mut stmt,
+            &[&start_rowid, &fetch],
+            fetch.max(0) as usize,
+        )?;
+        if (all.len() as i64) < skip {
+            return Err("anchor overshot: table shrank under us".into());
+        }
+        let mut rows: Vec<Vec<PValue>> = all
+            .into_iter()
+            .skip(skip as usize)
+            .take(limit.max(0) as usize)
+            .collect();
+        let mut rowids = Vec::with_capacity(rows.len());
+        for row in &mut rows {
+            match row.remove(0) {
+                PValue::Int(id) => rowids.push(id),
+                _ => return Err("rowid was not an integer".into()),
+            }
+        }
+        self.anchor_observe(table, offset, &rowids);
+        Ok(Page { rows, rowids: Some(rowids) })
+    }
+
+    /// Plain OFFSET fetch in pinned rowid order; observes anchors.
+    fn offset_page(&self, table: &str, q: &str, offset: i64, limit: i64) -> DbResult<Page> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT rowid, * FROM {q} ORDER BY rowid LIMIT ?1 OFFSET ?2"
+            ))
+            .map_err(|e| e.to_string())?;
+        let (mut rows, _) =
+            Self::collect_rows(&mut stmt, &[&limit, &offset], limit.max(0) as usize)?;
+        let mut rowids = Vec::with_capacity(rows.len());
+        for row in &mut rows {
+            match row.remove(0) {
+                PValue::Int(id) => rowids.push(id),
+                _ => return Err("rowid was not an integer".into()),
+            }
+        }
+        self.anchor_observe(table, offset, &rowids);
+        Ok(Page { rows, rowids: Some(rowids) })
     }
 }
 
@@ -473,33 +604,27 @@ impl DbLink for EmbeddedDb {
 
     fn page(&self, table: &str, offset: i64, limit: i64) -> DbResult<Page> {
         let q = Self::quote(table);
-        if self.has_rowid(table) {
+        if !self.has_rowid(table) {
+            // Views and WITHOUT ROWID tables: plain OFFSET (unchanged).
             let mut stmt = self
                 .conn
-                .prepare_cached(&format!(
-                    "SELECT rowid, * FROM {q} LIMIT {limit} OFFSET {offset}"
-                ))
+                .prepare_cached(&format!("SELECT * FROM {q} LIMIT ?1 OFFSET ?2"))
                 .map_err(|e| e.to_string())?;
-            let (mut rows, _) = Self::collect_rows(&mut stmt, limit as usize)?;
-            let mut rowids = Vec::with_capacity(rows.len());
-            for row in &mut rows {
-                match row.remove(0) {
-                    PValue::Int(id) => rowids.push(id),
-                    _ => return Err("rowid was not an integer".into()),
-                }
-            }
-            Ok(Page {
-                rows,
-                rowids: Some(rowids),
-            })
-        } else {
-            let mut stmt = self
-                .conn
-                .prepare_cached(&format!("SELECT * FROM {q} LIMIT {limit} OFFSET {offset}"))
-                .map_err(|e| e.to_string())?;
-            let (rows, _) = Self::collect_rows(&mut stmt, limit as usize)?;
-            Ok(Page { rows, rowids: None })
+            let (rows, _) =
+                Self::collect_rows(&mut stmt, &[&limit, &offset], limit.max(0) as usize)?;
+            return Ok(Page { rows, rowids: None });
         }
+        // Keyset fast path: resume from the nearest anchor at/before
+        // the wanted offset (sequential flight reuses the previous
+        // window's tail anchor with a bounded skip).
+        if let Some((start_rowid, skip)) = self.anchor_plan(table, offset) {
+            if let Ok(page) = self.keyset_page(table, &q, start_rowid, skip, offset, limit) {
+                return Ok(page);
+            }
+        }
+        // OFFSET fallback (also seeds anchors for the flight ahead).
+        // ORDER BY rowid pins grid order so anchors stay coherent.
+        self.offset_page(table, &q, offset, limit)
     }
 
     /// Single-query open_window: the total rides along as a trailing
@@ -524,7 +649,7 @@ impl DbLink for EmbeddedDb {
             Ok(s) => s,
             Err(_) => return fallback(),
         };
-        let (rows, _) = match Self::collect_rows(&mut stmt, limit.max(0) as usize) {
+        let (rows, _) = match Self::collect_rows(&mut stmt, &[], limit.max(0) as usize) {
             Ok(r) => r,
             Err(_) => return fallback(),
         };
@@ -554,7 +679,7 @@ impl DbLink for EmbeddedDb {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        let (mut rows, _) = Self::collect_rows(&mut stmt, QUERY_CAP + 1)?;
+        let (mut rows, _) = Self::collect_rows(&mut stmt, &[], QUERY_CAP + 1)?;
         let truncated = rows.len() > QUERY_CAP;
         rows.truncate(QUERY_CAP);
         Ok(QueryResult {
@@ -574,6 +699,9 @@ impl DbLink for EmbeddedDb {
         // false-positives into batch — harmless, just loses the count.
         let body = sql.trim().trim_end_matches(';');
         // DDL may change rowid-ness; drop cached probes (cheap: only on write/DDL path).
+        // Any execute may move positions: drop all paging anchors too
+        // (they rebuild within a few windows; prompt SELECTs never
+        // reach here — they go through query()).
         let lower = sql.to_ascii_lowercase();
         if lower.contains("create")
             || lower.contains("drop")
@@ -582,6 +710,7 @@ impl DbLink for EmbeddedDb {
         {
             self.rowid_cache.borrow_mut().clear();
         }
+        self.anchors.borrow_mut().clear();
         if body.contains(';') {
             self.conn.execute_batch(sql).map_err(|e| e.to_string())?;
             return Ok((-1, start.elapsed()));
@@ -620,6 +749,7 @@ impl DbLink for EmbeddedDb {
             .map_err(|e| e.to_string())?;
         let n = stmt.raw_execute().map_err(|e| e.to_string())?;
         if n == 1 {
+            self.anchor_clear(table); // positions below may have shifted
             Ok(())
         } else {
             Err(format!("expected to update 1 row, updated {n}"))
@@ -645,6 +775,7 @@ impl DbLink for EmbeddedDb {
             stmt.raw_bind_parameter(i + 1, v).map_err(|e| e.to_string())?;
         }
         stmt.raw_execute().map_err(|e| e.to_string())?;
+        self.anchor_clear(table); // appended row shifts the tail
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -657,6 +788,7 @@ impl DbLink for EmbeddedDb {
             )
             .map_err(|e| e.to_string())?;
         if n == 1 {
+            self.anchor_clear(table); // positions below the gap shift up
             Ok(())
         } else {
             Err(format!("expected to delete 1 row, deleted {n}"))
@@ -787,9 +919,148 @@ mod tests {
         assert!(!q.truncated);
     }
 
+    /// End-to-end proof at depth: a cold deep page rescans (OFFSET),
+    /// then sequential flight makes the same region keyset-fast.
+    /// Asserts warm < cold (100x+ apart — structural, not a flaky bound).
     #[test]
-    fn open_window_matches_page_plus_count() {
+    fn deep_flight_is_keyset_fast() {
         let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE big(v TEXT)").unwrap();
+        db.execute("BEGIN").unwrap();
+        for chunk in 0..200 {
+            let mut ins = String::from("INSERT INTO big(v) VALUES ");
+            ins.push_str(&(0..1000).map(|i| format!("('r{}')", chunk * 1000 + i)).collect::<Vec<_>>().join(","));
+            db.execute(&ins).unwrap();
+        }
+        db.execute("COMMIT").unwrap();
+        // Cold: no anchors → OFFSET rescan.
+        let t0 = std::time::Instant::now();
+        let p1 = db.page("big", 190_000, 150).unwrap();
+        let cold = t0.elapsed();
+        assert_eq!(p1.rows.len(), 150);
+        // Sequential flight to build anchors, then a deep keyset page.
+        let mut off = 0;
+        while off < 190_000 {
+            db.page("big", off, 150).unwrap();
+            off += 150;
+        }
+        let t0 = std::time::Instant::now();
+        let p2 = db.page("big", 190_080, 150).unwrap();
+        let warm = t0.elapsed();
+        assert_eq!(p2.rows.len(), 150);
+        assert_eq!(p2.rows[0], vec![PValue::Text("r190080".into())]);
+        assert_eq!(p2.rowids.unwrap()[0], 190081);
+        assert!(warm < cold, "keyset {warm:?} should beat OFFSET rescan {cold:?}");
+        eprintln!("deep page: cold OFFSET {cold:?} vs warm keyset {warm:?}");
+    }
+
+    /// Keyset pages must return exactly what OFFSET truth says —
+    /// at every depth, including stride boundaries and past-the-end.
+    #[test]
+    fn keyset_pages_match_offset_truth() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE k(v TEXT)").unwrap();
+        let mut ins = String::from("INSERT INTO k(v) VALUES ");
+        ins.push_str(
+            &(0..300)
+                .map(|i| format!("('r{i}')"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        db.execute(&ins).unwrap();
+
+        // Raw OFFSET truth via the (anchor-free) query path.
+        let truth = |offset: i64, limit: i64| -> (Vec<i64>, Vec<String>) {
+            let q = db
+                .query(&format!(
+                    "SELECT rowid, v FROM k ORDER BY rowid LIMIT {limit} OFFSET {offset}"
+                ))
+                .unwrap();
+            (
+                q.rows.iter().map(|r| match r[0] {
+                    PValue::Int(id) => id,
+                    _ => panic!(),
+                }).collect(),
+                q.rows.iter().map(|r| match &r[1] {
+                    PValue::Text(t) => t.clone(),
+                    _ => panic!(),
+                }).collect(),
+            )
+        };
+        for offset in [0, 1, 63, 64, 65, 100, 150, 200, 299, 300, 999] {
+            let page = db.page("k", offset, 50).unwrap();
+            let (ids, vals) = truth(offset, 50);
+            assert_eq!(page.rowids, Some(ids), "rowids at {offset}");
+            let got: Vec<String> = page.rows.iter().map(|r| match &r[0] {
+                PValue::Text(t) => t.clone(),
+                _ => panic!(),
+            }).collect();
+            assert_eq!(got, vals, "rows at {offset}");
+        }
+    }
+
+    /// Sequential flight populates anchors; an exact-stride offset
+    /// then plans with zero skip (pure keyset, no rescan).
+    #[test]
+    fn anchors_populate_and_plan_exact() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE k(v TEXT)").unwrap();
+        let mut ins = String::from("INSERT INTO k(v) VALUES ");
+        ins.push_str(&(0..300).map(|i| format!("('r{i}')")).collect::<Vec<_>>().join(","));
+        db.execute(&ins).unwrap();
+        // Fly forward in windows like PgDn-hold does.
+        let mut off = 0;
+        while off < 300 {
+            db.page("k", off, 50).unwrap();
+            off += 50;
+        }
+        let anchors = db.anchors.borrow();
+        let idx = anchors.get("k").expect("flight records anchors");
+        assert!(!idx.map.is_empty());
+        // 128 is stride-aligned: exact anchor, skip 0, rowid 129.
+        assert_eq!(idx.plan(128), Some((129, 0)));
+        // Unaligned: bounded skip to the previous stride anchor.
+        assert_eq!(idx.plan(100), Some((65, 36)));
+    }
+
+    /// Writes void anchors (positions move); views never anchor.
+    #[test]
+    fn anchors_invalidate_on_write() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE k(v TEXT)").unwrap();
+        db.execute("INSERT INTO k(v) VALUES ('a'), ('b')").unwrap();
+        db.execute("CREATE VIEW v AS SELECT v AS letter FROM k").unwrap();
+        db.page("k", 0, 10).unwrap();
+        assert!(db.anchors.borrow().contains_key("k"));
+        // A view page records nothing (no rowids to anchor on).
+        db.page("v", 0, 10).unwrap();
+        assert!(!db.anchors.borrow().contains_key("v"));
+        db.delete_row("k", 1).unwrap();
+        assert!(!db.anchors.borrow().contains_key("k"), "delete voids");
+        // Content after the gap: positions shift, rowids show the hole.
+        let page = db.page("k", 0, 10).unwrap();
+        assert_eq!(page.rowids, Some(vec![2]));
+        assert_eq!(page.rows.len(), 1);
+        db.page("k", 0, 10).unwrap();
+        db.execute("INSERT INTO k(v) VALUES ('z')").unwrap();
+        assert!(!db.anchors.borrow().contains_key("k"), "execute voids");
+    }
+
+    /// Anchor memory stays bounded no matter how far the flight goes.
+    #[test]
+    fn anchor_index_memory_bounded() {
+        let mut idx = AnchorIndex::default();
+        // 300k positions → 4688 stride anchors → evicted down to CAP.
+        let rowids: Vec<i64> = (1..=300_000).collect();
+        idx.observe(0, &rowids);
+        assert_eq!(idx.map.len(), AnchorIndex::CAP);
+        // Oldest survivors still plan exactly; evicted head is gone.
+        assert_eq!(idx.plan(37_888), Some((37_889, 0)));
+        assert_eq!(idx.plan(0), None);
+    }
+
+    #[test]
+    fn open_window_matches_page_plus_count() {        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
         db.execute(
             "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
              INSERT INTO t(v) VALUES ('a'), ('b'), ('c');",
