@@ -254,6 +254,8 @@ enum PendingOp {
     Select { seq: u64, at: std::time::Instant },
     /// Refresh: total + window into the live grid, then re-seek.
     Refill { name: String, row: i64, col: usize, want_start: i64, at: std::time::Instant },
+    /// Scroll window: installs into the live grid when still wanted.
+    Page { table: String, want_start: i64, at: std::time::Instant },
     /// Find scan: one table window per response; hits jump, misses
     /// chain the next window until the cap. Superseded scans die by seq.
     Find {
@@ -334,6 +336,11 @@ pub struct App {
     pane_cache: HashMap<(String, String, String), LinkPane>,
     /// Outstanding async worker jobs by token (finish_db routes answers).
     pending: HashMap<crate::worker::Token, PendingOp>,
+    /// Latest in-flight scroll window (token, table, want_start): older
+    /// arrivals drop, so hold-to-fly converges on the newest window.
+    pending_page: Option<(crate::worker::Token, String, i64)>,
+    /// EDIT target parked while its window flies in (built on arrival).
+    pending_edit: Option<i64>,
     /// Find-scan generation: a new find supersedes older chains.
     find_seq: u64,
     /// Status epoch: async completions only touch the status line when
@@ -381,6 +388,8 @@ impl App {
             links_cache: HashMap::new(),
             pane_cache: HashMap::new(),
             pending: HashMap::new(),
+            pending_page: None,
+            pending_edit: None,
             find_seq: 0,
             status_seq: 0,
         };
@@ -463,6 +472,7 @@ impl App {
                     grid.compute_widths();
                     self.grid = Some(grid);
                     self.focus = Focus::Grid;
+                    self.pending_edit = None; // new table: parked rows are void
                     self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
                     self.refresh_health();
                     // Clear only our own (silent) open — a newer message wins.
@@ -492,6 +502,7 @@ impl App {
                     grid.compute_widths();
                     self.grid = Some(grid);
                     self.focus = Focus::Grid;
+                    self.pending_edit = None; // new result: parked rows are void
                     self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
                     if self.status_seq == seq {
                         self.say(if truncated {
@@ -530,35 +541,41 @@ impl App {
                     }
                     self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
                     self.grid_jump(row);
+                    self.try_pending_edit();
                 }
                 Err(e) => self.err(e),
             },
             (
-                PendingOp::Health {
-                    sampled,
-                    seq,
+                PendingOp::Page {
+                    table,
+                    want_start,
                     at,
-                    overlay,
                 },
-                DbResponse::HealthConsole(r),
+                DbResponse::Page(r),
             ) => match r {
-                Ok(h) => {
-                    if std::mem::discriminant(&self.overlay) != overlay {
-                        return; // user moved on; silent drop, no yank
+                Ok(page) => {
+                    // Latest window wins; older arrivals drop.
+                    if self.pending_page != Some((tag, table.clone(), want_start)) {
+                        return;
                     }
-                    self.health = h.health.clone();
-                    self.health_cache =
-                        Some((h.health, std::time::Instant::now()));
-                    self.last_auto_sample = std::time::Instant::now();
+                    self.pending_page = None;
+                    let current = matches!(
+                        &self.grid,
+                        Some(g) if matches!(&g.source, GridSource::Table { name: n, .. } if n == &table)
+                    );
+                    if !current {
+                        return; // grid moved on; drop the stale window
+                    }
+                    if let Some(g) = &mut self.grid {
+                        g.cache = page.rows;
+                        g.rowids = page.rowids;
+                        g.cache_start = want_start;
+                        if g.widths.is_empty() {
+                            g.compute_widths();
+                        }
+                    }
                     self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
-                    self.overlay = Overlay::Health(HealthView {
-                        table: h.base,
-                        report: h.report,
-                        sparks: h.sparks,
-                    });
-                    if sampled && self.status_seq == seq {
-                        self.say("sampled");
-                    }
+                    self.try_pending_edit();
                 }
                 Err(e) => self.err(e),
             },
@@ -619,6 +636,35 @@ impl App {
                             self.pending.insert(tag, op);
                         }
                         None => self.err("database worker is gone"),
+                    }
+                }
+                Err(e) => self.err(e),
+            },
+            (
+                PendingOp::Health {
+                    sampled,
+                    seq,
+                    at,
+                    overlay,
+                },
+                DbResponse::HealthConsole(r),
+            ) => match r {
+                Ok(h) => {
+                    if std::mem::discriminant(&self.overlay) != overlay {
+                        return; // user moved on; silent drop, no yank
+                    }
+                    self.health = h.health.clone();
+                    self.health_cache =
+                        Some((h.health, std::time::Instant::now()));
+                    self.last_auto_sample = std::time::Instant::now();
+                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.overlay = Overlay::Health(HealthView {
+                        table: h.base,
+                        report: h.report,
+                        sparks: h.sparks,
+                    });
+                    if sampled && self.status_seq == seq {
+                        self.say("sampled");
                     }
                 }
                 Err(e) => self.err(e),
@@ -2585,9 +2631,12 @@ impl App {
 
     /// Virtualization: keep [row_off-OVERSCAN, row_off+visible+OVERSCAN)
     /// cached for Table sources. Query sources are fully materialized.
+    /// Async: a missing window submits one Page job and returns; the
+    /// renderer shows "…" placeholders until it installs. Rapid scrolls
+    /// supersede (latest token wins), duplicates never re-submit.
     fn ensure_cache(&mut self) {
         let visible = self.visible_rows.max(1);
-        let Some(g) = &mut self.grid else { return };
+        let Some(g) = &self.grid else { return };
         let GridSource::Table { name, .. } = &g.source else {
             return;
         };
@@ -2600,20 +2649,61 @@ impl App {
         }
         let name = name.clone();
         let limit = want_end - want_start;
-        let start = std::time::Instant::now();
-        match self.db.page(&name, want_start, limit) {
-            Ok(page) => {
-                if let Some(g) = &mut self.grid {
-                    g.cache = page.rows;
-                    g.rowids = page.rowids;
-                    g.cache_start = want_start;
-                    if g.widths.is_empty() {
-                        g.compute_widths();
-                    }
-                }
-                self.last_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+        if let Some((_, t, s)) = &self.pending_page {
+            if *t == name && *s == want_start {
+                return; // already flying; its arrival installs it
             }
-            Err(e) => self.err(e),
+        }
+        let at = std::time::Instant::now();
+        let job_name = name.clone();
+        match self.db.submit(Box::new(move |db| {
+            DbResponse::Page(db.page(&job_name, want_start, limit))
+        })) {
+            Some(tag) => {
+                self.pending.insert(
+                    tag,
+                    PendingOp::Page {
+                        table: name.clone(),
+                        want_start,
+                        at,
+                    },
+                );
+                self.pending_page = Some((tag, name, want_start));
+            }
+            None => self.err("database worker is gone"),
+        }
+    }
+
+    /// Force-submit the live window (post-write truth): like ensure
+    /// but bypasses coverage (values changed) and supersedes any
+    /// pre-write window still flying. The stale grid stays until swap.
+    fn refresh_window(&mut self) {
+        let visible = self.visible_rows.max(1);
+        let Some(g) = &self.grid else { return };
+        let GridSource::Table { name, .. } = &g.source else {
+            return;
+        };
+        let want_start = (g.row_off - OVERSCAN).max(0);
+        let want_end = (g.row_off + visible + OVERSCAN).min(g.total);
+        let name = name.clone();
+        let limit = (want_end - want_start).max(1);
+        let at = std::time::Instant::now();
+        let job_name = name.clone();
+        match self.db.submit(Box::new(move |db| {
+            DbResponse::Page(db.page(&job_name, want_start, limit))
+        })) {
+            Some(tag) => {
+                self.pending.insert(
+                    tag,
+                    PendingOp::Page {
+                        table: name.clone(),
+                        want_start,
+                        at,
+                    },
+                );
+                self.pending_page = Some((tag, name, want_start));
+            }
+            None => self.err("database worker is gone"),
         }
     }
 
@@ -2634,8 +2724,75 @@ impl App {
         self.build_edit_for(abs);
     }
 
+    /// Build a parked EDIT target once a window install covers it.
+    /// Called after every cache install (Page/Refill arrivals).
+    fn try_pending_edit(&mut self) {
+        let Some(abs) = self.pending_edit.take() else {
+            return;
+        };
+        // The table may have shrunk under the parked row: clamp first
+        // so a stale target can't re-park forever.
+        let abs = match &self.grid {
+            Some(g) => abs.clamp(0, g.total.saturating_sub(1).max(0)),
+            None => return, // grid gone; forget the parked edit
+        };
+        self.build_edit_for(abs); // re-parks itself if still uncovered
+    }
+
+    /// Synchronous flip onto the tail record after an INSERT:
+    /// positions the cursor, fetches the tail window blocking, installs
+    /// it, and builds the form — all before returning, so a second save
+    /// cannot insert twins. Rare path (explicit save keypress); bulk
+    /// flight stays async.
+    fn flip_to_tail(&mut self, last: i64) {
+        let visible = self.visible_rows.max(1);
+        let name = match &self.grid {
+            Some(g) => match &g.source {
+                GridSource::Table { name, .. } => name.clone(),
+                _ => return,
+            },
+            None => return,
+        };
+        if let Some(g) = &mut self.grid {
+            g.cur_row = last.clamp(0, g.total.saturating_sub(1).max(0));
+            if g.cur_row < g.row_off {
+                g.row_off = g.cur_row;
+            }
+            if g.cur_row >= g.row_off + visible {
+                g.row_off = g.cur_row - visible + 1;
+            }
+        }
+        let (want_start, limit) = match &self.grid {
+            Some(g) => {
+                let s = (g.row_off - OVERSCAN).max(0);
+                (s, (g.row_off + visible + OVERSCAN).min(g.total) - s)
+            }
+            None => return,
+        };
+        match self.db.page(&name, want_start, limit.max(1)) {
+            Ok(page) => {
+                if let Some(g) = &mut self.grid {
+                    g.cache = page.rows;
+                    g.rowids = page.rowids;
+                    g.cache_start = want_start;
+                    if g.widths.is_empty() {
+                        g.compute_widths();
+                    }
+                }
+                // Void in-flight windows: their data predates the insert.
+                self.pending_page = None;
+            }
+            Err(e) => return self.err(e),
+        }
+        let abs = self.grid.as_ref().map(|g| g.cur_row).unwrap_or(0);
+        self.build_edit_for(abs);
+    }
+
     /// Build (or rebuild) the EDIT overlay for the record at absolute
     /// grid row `abs` — used by open_edit and by record PAGING.
+    /// Async-aware: grid_jump submits a missing window; if its rows
+    /// aren't here yet the target parks in pending_edit and the form
+    /// builds when a window install covers it (try_pending_edit).
     fn build_edit_for(&mut self, abs: i64) {
         // Make sure the cache covers the target row, and move the grid
         // cursor with the form so context follows the flip.
@@ -2644,11 +2801,13 @@ impl App {
         let GridSource::Table { name, .. } = &g.source else { return };
         let idx = abs - g.cache_start;
         let (Some(row), Some(rowids)) = (g.row(abs), &g.rowids) else {
+            self.pending_edit = Some(abs);
             return;
         };
         let Some(rowid) = rowids.get(idx as usize).copied() else {
             return;
         };
+        self.pending_edit = None; // rows present: any parked target is served
         let name = name.clone();
         let row: Vec<PValue> = row.clone();
         let cols = match self.cached_columns(&name) {
@@ -2836,6 +2995,10 @@ impl App {
         if inserting {
             return self.say("save the new record first (F10), then page");
         }
+        // Sequence from the parked target when a flip is still flying
+        // in: rapid holds would otherwise recompute from the stale form
+        // and skip the parked record.
+        let from = self.pending_edit.unwrap_or(from);
         // Held-key acceleration: rapid repeats stretch the stride, so
         // holding PgDn goes from record-at-a-time to 10-at-a-time —
         // key autorepeat (~25/s) stops being the speed limit.
@@ -3201,23 +3364,23 @@ impl App {
                     // Total changed: full refresh, then flip the open
                     // form onto the newly inserted record so further
                     // Enters UPDATE it instead of inserting twins.
+                    // Synchronous tail fetch (NOT parked): a second
+                    // save before arrival would otherwise insert twins
+                    // — the flip must land on the new record NOW.
                     self.refresh_grid_keep_position();
                     let last = self.grid.as_ref().map(|g| g.total - 1).unwrap_or(0);
                     let cursor = match &self.overlay {
                         Overlay::Edit(ed) => ed.cursor,
                         _ => 0,
                     };
-                    self.build_edit_for(last.max(0));
+                    self.flip_to_tail(last.max(0));
                     if let Overlay::Edit(ed) = &mut self.overlay {
                         ed.cursor = cursor.min(ed.fields.len().saturating_sub(1));
                     }
                 } else {
-                    // Invalidate the cache so the grid shows the new truth.
-                    if let Some(g) = &mut self.grid {
-                        g.cache.clear();
-                        g.cache_start = g.cur_row;
-                    }
-                    self.ensure_cache();
+                    // Re-fetch the live window async (stale rows stay
+                    // until swap); a parked edit builds on arrival.
+                    self.refresh_window();
                     // The record on screen is clean now — fold the
                     // committed inputs into the snapshot the form
                     // displays, or saved values would revert to the
@@ -3413,6 +3576,7 @@ mod tests {
         let g = a.grid.as_ref().unwrap();
         assert_eq!(g.total, 500);
         a.apply(Command::GridBottom);
+        a.sync();
         let g = a.grid.as_ref().unwrap();
         assert_eq!(g.cur_row, 499);
         assert!(g.row(499).is_some(), "cache must follow the cursor");
@@ -3451,6 +3615,7 @@ mod tests {
         }
         a.apply(Command::EditCommitField);
         a.apply(Command::EditSave);
+        a.sync(); // update path re-fetches the live window async
         assert!(matches!(a.overlay, Overlay::None));
         let g = a.grid.as_ref().unwrap();
         assert_eq!(g.row(0).unwrap()[1], PValue::Text("edited!".into()));
@@ -3799,6 +3964,51 @@ mod tests {
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 8999);
     }
 
+    /// Parked EDIT builds when its window arrives: cursor deep with a
+    /// cold cache parks the form; the install triggers the build.
+    #[test]
+    fn parked_edit_builds_on_window_arrival() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        // Move the cursor deep WITHOUT fetching (bypass ensure): the
+        // rows genuinely aren't here, so the form must park.
+        if let Some(g) = &mut a.grid {
+            g.cur_row = 499;
+            g.row_off = 450;
+        }
+        a.build_edit_for(499);
+        assert!(!matches!(a.overlay, Overlay::Edit(_)), "form parks");
+        assert_eq!(a.pending_edit, Some(499));
+        a.sync();
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("parked form never built");
+        };
+        assert_eq!(ed.row_abs, 499);
+        assert_eq!(a.pending_edit, None);
+    }
+
+    /// Rapid page flight converges: ten big jumps queue/overwrite
+    /// windows, the last one wins and the cache matches the cursor.
+    #[test]
+    fn rapid_page_flight_converges() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        for _ in 0..10 {
+            a.apply(Command::GridPage(1));
+        }
+        a.sync();
+        assert!(a.pending_page.is_none(), "windows settled");
+        let g = a.grid.as_ref().unwrap();
+        assert!(
+            g.row(g.cur_row).is_some(),
+            "cache coherent with cursor at {}",
+            g.cur_row
+        );
+        assert_eq!(g.total, 500);
+    }
+
     #[test]
     fn prompt_completion_and_line_editing() {
         let mut a = app();
@@ -4040,6 +4250,7 @@ mod tests {
         for _ in 0..600 {
             a.apply(Command::EditPage(1));
         }
+        a.sync();
         let Overlay::Edit(ed) = &a.overlay else { panic!() };
         assert_eq!(ed.row_abs, 499);
         a.apply(Command::EditPage(1));
@@ -4355,6 +4566,7 @@ mod tests {
         for _ in 0..30 {
             a.apply(Command::EditPage(1));
         }
+        a.sync();
         let Overlay::Edit(ed) = &a.overlay else { panic!() };
         assert_eq!(ed.row_abs, 90, "held paging must accelerate");
         // A pause resets the streak back to single-stepping.
@@ -4362,6 +4574,7 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_millis(400),
         );
         a.apply(Command::EditPage(1));
+        a.sync();
         let Overlay::Edit(ed) = &a.overlay else { panic!() };
         assert_eq!(ed.row_abs, 91, "a pause resets to stride 1");
     }
