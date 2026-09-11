@@ -163,9 +163,14 @@ fn decode_result(result: &Json) -> DbResult<StmtOut> {
         .unwrap_or_default();
     let mut rows = Vec::new();
     if let Some(json_rows) = result["rows"].as_array() {
+        rows.reserve(json_rows.len());
         for row in json_rows {
             let cells = row.as_array().ok_or("row is not an array")?;
-            rows.push(cells.iter().map(decode).collect::<DbResult<Vec<_>>>()?);
+            let mut out = Vec::with_capacity(cells.len());
+            for c in cells {
+                out.push(decode(c)?);
+            }
+            rows.push(out);
         }
     }
     let affected = result["affected_row_count"].as_i64().unwrap_or(0);
@@ -285,7 +290,11 @@ impl DbLink for RemoteDb {
 
     fn query(&self, sql: &str) -> DbResult<QueryResult> {
         let start = Instant::now();
-        let out = self.one(sql, vec![])?;
+        // Push the cap server-side: without this a bare
+        // `SELECT * FROM big` downloads the whole table over HTTP
+        // before we truncate locally.
+        let capped = crate::db::apply_cap(sql, QUERY_CAP + 1);
+        let out = self.one(&capped, vec![])?;
         let truncated = out.rows.len() > QUERY_CAP;
         let mut rows = out.rows;
         rows.truncate(QUERY_CAP);

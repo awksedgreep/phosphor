@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS _phosphor_items (
   id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL,
   label TEXT NOT NULL, action_kind TEXT NOT NULL, action_ref TEXT,
   hotkey TEXT, seq INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS idx_phosphor_items_app ON _phosphor_items(app_id);
 ";
 
 pub fn ensure(db: &dyn DbLink) -> DbResult<()> {
@@ -59,16 +60,17 @@ pub fn upsert(
     cols: &[(&str, String)],
 ) -> DbResult<()> {
     ensure(db)?;
-    let mut names: Vec<&str> = vec![key_col];
-    let mut vals: Vec<String> = vec![q(key)];
+    let mut names: Vec<&str> = Vec::with_capacity(cols.len() + 1);
+    let mut vals: Vec<String> = Vec::with_capacity(cols.len() + 1);
+    names.push(key_col);
+    vals.push(q(key));
+    let mut sets: Vec<String> = Vec::with_capacity(cols.len());
     for (c, v) in cols {
+        let escaped = q(v);
         names.push(c);
-        vals.push(q(v));
+        sets.push(format!("{c} = {escaped}"));
+        vals.push(escaped);
     }
-    let sets: Vec<String> = cols
-        .iter()
-        .map(|(c, v)| format!("{c} = {}", q(v)))
-        .collect();
     db.execute(&format!(
         "INSERT INTO {table} ({}) VALUES ({}) \
          ON CONFLICT({key_col}) DO UPDATE SET {}",
@@ -100,8 +102,12 @@ pub fn lookup(
 }
 
 /// READ path: never creates anything (missing table = no names).
+/// Capped at 1000 so a huge catalog can't full-scan+sort+transfer
+/// into the UI on every designer open.
 pub fn names(db: &dyn DbLink, table: &str, name_col: &str) -> Vec<String> {
-    db.query(&format!("SELECT {name_col} FROM {table} ORDER BY {name_col}"))
+    db.query(&format!(
+        "SELECT {name_col} FROM {table} ORDER BY {name_col} LIMIT 1000"
+    ))
         .map(|out| {
             out.rows
                 .into_iter()

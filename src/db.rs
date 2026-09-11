@@ -4,6 +4,8 @@
 //! adds the sqld/Hrana backend behind the same trait; nothing above this
 //! module may name rusqlite.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use rusqlite::types::ValueRef;
@@ -48,7 +50,11 @@ impl PValue {
             }
             PValue::Text(t) => t.replace('\n', "␤"),
             PValue::Blob(b) => {
-                let head: String = b.iter().take(8).map(|x| format!("{x:02x}")).collect();
+                use std::fmt::Write as _;
+                let mut head = String::with_capacity(16);
+                for x in b.iter().take(8) {
+                    let _ = write!(head, "{x:02x}");
+                }
                 let ell = if b.len() > 8 { "…" } else { "" };
                 format!("x'{head}{ell}' ({}B)", b.len())
             }
@@ -61,19 +67,31 @@ impl PValue {
         if input.is_empty() {
             return PValue::Null;
         }
-        let decl = decl_type.to_ascii_uppercase();
-        if decl.contains("INT") {
+        // Case-insensitive substring checks without allocating an
+        // uppercased copy per keystroke/edit.
+        fn contains_ci(hay: &str, needle: &str) -> bool {
+            if needle.is_empty() || hay.len() < needle.len() {
+                return false;
+            }
+            hay.as_bytes()
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+        }
+        if contains_ci(decl_type, "INT") {
             if let Ok(i) = input.parse::<i64>() {
                 return PValue::Int(i);
             }
         }
-        if decl.contains("REAL") || decl.contains("FLOA") || decl.contains("DOUB") {
+        if contains_ci(decl_type, "REAL")
+            || contains_ci(decl_type, "FLOA")
+            || contains_ci(decl_type, "DOUB")
+        {
             if let Ok(f) = input.parse::<f64>() {
                 return PValue::Real(f);
             }
         }
         // NUMERIC affinity: numbers if they look like numbers.
-        if decl.contains("NUM") || decl.contains("DEC") || decl.is_empty() {
+        if contains_ci(decl_type, "NUM") || contains_ci(decl_type, "DEC") || decl_type.is_empty() {
             if let Ok(i) = input.parse::<i64>() {
                 return PValue::Int(i);
             }
@@ -200,6 +218,27 @@ fn sql_str(s: &str) -> String {
 pub struct EmbeddedDb {
     conn: Connection,
     name: String,
+    rowid_cache: RefCell<HashMap<String, bool>>,
+}
+
+/// True when `sql` already constrains its row count (conservative
+/// substring check — a false positive inside a string literal just
+/// skips the optimization, never changes semantics).
+pub(crate) fn sql_has_limit(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    lower.contains("limit")
+}
+
+/// Append a server-side cap so a stray `SELECT * FROM million_rows`
+/// doesn't plan/execute a full scan+sort client-truncated later.
+/// Caller must pass QUERY_CAP+1 so `truncated` stays accurate.
+pub(crate) fn apply_cap(sql: &str, cap_plus_one: usize) -> String {
+    let t = sql.trim().trim_end_matches(';').trim_end();
+    if sql_has_limit(t) {
+        t.to_owned()
+    } else {
+        format!("{t} LIMIT {cap_plus_one}")
+    }
 }
 
 impl EmbeddedDb {
@@ -229,6 +268,7 @@ impl EmbeddedDb {
             EmbeddedDb {
                 conn,
                 name: path.to_owned(),
+                rowid_cache: RefCell::new(HashMap::new()),
             },
             warning,
         ))
@@ -275,7 +315,7 @@ impl DbLink for EmbeddedDb {
     fn tables(&self) -> DbResult<Vec<TableInfo>> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT name, type FROM sqlite_master \
                  WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' \
                  ORDER BY type = 'view', name",
@@ -295,7 +335,7 @@ impl DbLink for EmbeddedDb {
     fn columns(&self, table: &str) -> DbResult<Vec<ColumnInfo>> {
         let mut stmt = self
             .conn
-            .prepare(&format!("PRAGMA table_info({})", Self::quote(table)))
+            .prepare_cached(&format!("PRAGMA table_info({})", Self::quote(table)))
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
@@ -321,9 +361,15 @@ impl DbLink for EmbeddedDb {
     }
 
     fn has_rowid(&self, table: &str) -> bool {
-        self.conn
-            .prepare(&format!("SELECT rowid FROM {} LIMIT 0", Self::quote(table)))
-            .is_ok()
+        if let Some(&known) = self.rowid_cache.borrow().get(table) {
+            return known;
+        }
+        let ok = self
+            .conn
+            .prepare_cached(&format!("SELECT rowid FROM {} LIMIT 0", Self::quote(table)))
+            .is_ok();
+        self.rowid_cache.borrow_mut().insert(table.to_owned(), ok);
+        ok
     }
 
     fn page(&self, table: &str, offset: i64, limit: i64) -> DbResult<Page> {
@@ -331,7 +377,7 @@ impl DbLink for EmbeddedDb {
         if self.has_rowid(table) {
             let mut stmt = self
                 .conn
-                .prepare(&format!(
+                .prepare_cached(&format!(
                     "SELECT rowid, * FROM {q} LIMIT {limit} OFFSET {offset}"
                 ))
                 .map_err(|e| e.to_string())?;
@@ -350,7 +396,7 @@ impl DbLink for EmbeddedDb {
         } else {
             let mut stmt = self
                 .conn
-                .prepare(&format!("SELECT * FROM {q} LIMIT {limit} OFFSET {offset}"))
+                .prepare_cached(&format!("SELECT * FROM {q} LIMIT {limit} OFFSET {offset}"))
                 .map_err(|e| e.to_string())?;
             let (rows, _) = Self::collect_rows(&mut stmt, limit as usize)?;
             Ok(Page { rows, rowids: None })
@@ -359,13 +405,19 @@ impl DbLink for EmbeddedDb {
 
     fn query(&self, sql: &str) -> DbResult<QueryResult> {
         let start = Instant::now();
-        let mut stmt = self.conn.prepare(sql).map_err(|e| e.to_string())?;
+        // Push the cap into SQLite so the engine can stop early instead
+        // of planning/executing a full scan we truncate client-side.
+        // QUERY_CAP+1 rows => truncated flag stays exact.
+        let capped = apply_cap(sql, QUERY_CAP + 1);
+        let mut stmt = self.conn.prepare(&capped).map_err(|e| e.to_string())?;
         let columns: Vec<String> = stmt
             .column_names()
             .into_iter()
             .map(str::to_owned)
             .collect();
-        let (rows, truncated) = Self::collect_rows(&mut stmt, QUERY_CAP)?;
+        let (mut rows, _) = Self::collect_rows(&mut stmt, QUERY_CAP + 1)?;
+        let truncated = rows.len() > QUERY_CAP;
+        rows.truncate(QUERY_CAP);
         Ok(QueryResult {
             columns,
             rows,
@@ -382,6 +434,15 @@ impl DbLink for EmbeddedDb {
         // the earlier statements create. A ';' inside a string literal
         // false-positives into batch — harmless, just loses the count.
         let body = sql.trim().trim_end_matches(';');
+        // DDL may change rowid-ness; drop cached probes (cheap: only on write/DDL path).
+        let lower = sql.to_ascii_lowercase();
+        if lower.contains("create")
+            || lower.contains("drop")
+            || lower.contains("alter")
+            || lower.contains("vacuum")
+        {
+            self.rowid_cache.borrow_mut().clear();
+        }
         if body.contains(';') {
             self.conn.execute_batch(sql).map_err(|e| e.to_string())?;
             return Ok((-1, start.elapsed()));
@@ -412,7 +473,7 @@ impl DbLink for EmbeddedDb {
             sets.join(", "),
             changes.len() + 1
         );
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
         for (i, (_, v)) in changes.iter().enumerate() {
             stmt.raw_bind_parameter(i + 1, v).map_err(|e| e.to_string())?;
         }
@@ -440,7 +501,7 @@ impl DbLink for EmbeddedDb {
                 marks.join(", ")
             )
         };
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
         for (i, (_, v)) in changes.iter().enumerate() {
             stmt.raw_bind_parameter(i + 1, v).map_err(|e| e.to_string())?;
         }
@@ -465,18 +526,7 @@ impl DbLink for EmbeddedDb {
 
     fn health(&self) -> Option<String> {
         // Worst-first ordering is part of the dbhealth_report contract.
-        let exists: i64 = self
-            .conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master \
-                 WHERE type = 'view' AND name LIKE '%\\_report' ESCAPE '\\'",
-                [],
-                |r| r.get(0),
-            )
-            .ok()?;
-        if exists == 0 {
-            return None;
-        }
+        // Single sqlite_master probe (was count(*) + pick = 2 trips).
         let view: String = self
             .conn
             .query_row(
