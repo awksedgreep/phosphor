@@ -22,6 +22,9 @@ fn main() {
         .unwrap_or(2000);
 
     let conn = rusqlite::Connection::open(&path).expect("open db");
+    // Fast-load PRAGMAs: this is a throwaway bulk fill, not a ledger.
+    conn.execute_batch("PRAGMA journal_mode = MEMORY; PRAGMA synchronous = OFF;")
+        .expect("pragmas");
     conn.execute_batch(
         "DROP TABLE IF EXISTS customers; DROP TABLE IF EXISTS orders;
          CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL,
@@ -34,6 +37,7 @@ fn main() {
 
     let mut rng = rand::thread_rng();
     let regions = ["north", "south", "east", "west"];
+    let mut n_orders: i64 = 0;
     {
         let mut cust = conn
             .prepare("INSERT INTO customers(name, city, company, balance) VALUES (?1, ?2, ?3, ?4)")
@@ -58,12 +62,18 @@ fn main() {
                 let region = regions[rng.gen_range(0..regions.len())];
                 ord.execute(rusqlite::params![i as i64, product, qty, amount, region])
                     .unwrap();
+                n_orders += 1;
             }
         }
     }
-    conn.execute_batch("COMMIT;").unwrap();
-    let orders: i64 = conn
-        .query_row("SELECT count(*) FROM orders", [], |r| r.get(0))
-        .unwrap();
-    println!("{path}: {n} customers, {orders} orders — open it and hold PgDn");
+    // Indexes AFTER the load (faster than maintaining them per row),
+    // before COMMIT so readers never see an unindexed table. The orders
+    // FK join/filter full-scanned without this.
+    conn.execute_batch(
+        "CREATE INDEX idx_orders_customer ON orders(customer_id);
+         CREATE INDEX idx_orders_region ON orders(region);
+         COMMIT;",
+    )
+    .unwrap();
+    println!("{path}: {n} customers, {n_orders} orders — open it and hold PgDn");
 }

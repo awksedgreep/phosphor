@@ -78,12 +78,13 @@ pub fn app_id(db: &dyn DbLink, name: &str) -> Option<i64> {
 }
 
 pub fn items(db: &dyn DbLink, app: &str) -> Vec<AppItem> {
-    let Some(id) = app_id(db, app) else {
-        return Vec::new();
-    };
+    // Single JOIN (was: app_id lookup + items select = 2 round-trips
+    // on every Apps open, worse over sqld).
     db.query(&format!(
-        "SELECT id, label, action_kind, action_ref, seq \
-         FROM _phosphor_items WHERE app_id = {id} ORDER BY seq, id"
+        "SELECT i.id, i.label, i.action_kind, i.action_ref, i.seq \
+         FROM _phosphor_items i JOIN _phosphor_apps a ON a.id = i.app_id \
+         WHERE a.name = {} ORDER BY i.seq, i.id",
+        store::q(app)
     ))
     .map(|out| {
         out.rows
@@ -129,12 +130,16 @@ pub fn delete_item(db: &dyn DbLink, item_id: i64) -> DbResult<()> {
         .map(|_| ())
 }
 
-/// Swap the seq of two items (reordering in the designer).
+/// Swap the seq of two items (reordering in the designer): one
+/// atomic UPDATE instead of two separate writes (was: clone both +
+/// 2x UPDATE, non-atomic — a crash between them lost the order).
 pub fn swap_items(db: &dyn DbLink, a: &AppItem, b: &AppItem) -> DbResult<()> {
-    let (mut a2, mut b2) = (a.clone(), b.clone());
-    std::mem::swap(&mut a2.seq, &mut b2.seq);
-    update_item(db, &a2)?;
-    update_item(db, &b2)
+    db.execute(&format!(
+        "UPDATE _phosphor_items SET seq = CASE id WHEN {} THEN {} WHEN {} THEN {} ELSE seq END \
+         WHERE id IN ({}, {})",
+        a.id, b.seq, b.id, a.seq, a.id, b.id
+    ))
+    .map(|_| ())
 }
 
 /// Designer state: items of one app, immediate persistence.

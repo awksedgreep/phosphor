@@ -6,7 +6,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::creator::CreateState;
@@ -1127,6 +1127,24 @@ impl App {
         Some((view, base))
     }
 
+    /// Series names for the health fallback path (no window functions).
+    fn series_names(db: &dyn DbLink, base: &str) -> Vec<String> {
+        db.query(&format!(
+            "SELECT DISTINCT name FROM {} ORDER BY name",
+            Self::quote_ident(base)
+        ))
+        .map(|q| {
+            q.rows
+                .into_iter()
+                .filter_map(|r| match r.into_iter().next() {
+                    Some(PValue::Text(t)) => Some(t),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     /// Time-based behavior between keystrokes (main loop ticks ~4x/s).
     /// While the DBHEALTH console is open it is LIVE: phosphor takes a
     /// sample every 5 seconds so the trends move on their own — the
@@ -1185,6 +1203,9 @@ impl App {
         };
 
         // Sparklines: preferred series first, then whatever else exists.
+        // ONE windowed query replaces DISTINCT + N per-series round-trips
+        // (was up to 9 trips per open and per 5s auto-sample): newest 64
+        // samples per series, grouped client-side.
         const PREFERRED: [&str; 8] = [
             "cache_hit_ratio",
             "db_file_bytes",
@@ -1195,22 +1216,54 @@ impl App {
             "cache_used_bytes",
             "memory_used_bytes",
         ];
-        let available: Vec<String> = self
-            .db
-            .query(&format!(
-                "SELECT DISTINCT name FROM {} ORDER BY name",
-                Self::quote_ident(&base)
-            ))
-            .map(|q| {
-                q.rows
-                    .into_iter()
-                    .filter_map(|r| match r.into_iter().next() {
-                        Some(PValue::Text(t)) => Some(t),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut by_name: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        match self.db.query(&format!(
+            "SELECT name, value FROM \
+             (SELECT name, value, row_number() OVER \
+              (PARTITION BY name ORDER BY ts DESC) AS rn FROM {}) \
+             WHERE rn <= 64 ORDER BY name",
+            Self::quote_ident(&base)
+        )) {
+            Ok(q) => {
+                for r in q.rows {
+                    let Some(PValue::Text(name)) = r.first() else { continue };
+                    let v = match r.get(1) {
+                        Some(PValue::Real(f)) => *f,
+                        Some(PValue::Int(i)) => *i as f64,
+                        _ => continue,
+                    };
+                    by_name.entry(name.clone()).or_default().push(v);
+                }
+                // Rows arrived newest-first per series; sparks read oldest-first.
+                for vals in by_name.values_mut() {
+                    vals.reverse();
+                }
+            }
+            Err(_) => {
+                // Old SQLite / quirky vtab without window support:
+                // fall back to the per-series loop (slower, same picture).
+                for name in Self::series_names(self.db.as_ref(), &base) {
+                    let safe = name.replace('\'', "''");
+                    if let Ok(q) = self.db.query(&format!(
+                        "SELECT value FROM {} WHERE name = '{safe}' ORDER BY ts DESC LIMIT 64",
+                        Self::quote_ident(&base)
+                    )) {
+                        let mut vals: Vec<f64> = q
+                            .rows
+                            .into_iter()
+                            .filter_map(|r| match r.into_iter().next() {
+                                Some(PValue::Real(f)) => Some(f),
+                                Some(PValue::Int(i)) => Some(i as f64),
+                                _ => None,
+                            })
+                            .collect();
+                        vals.reverse();
+                        by_name.insert(name, vals);
+                    }
+                }
+            }
+        }
+        let available: Vec<String> = by_name.keys().cloned().collect();
         let mut ordered: Vec<String> = PREFERRED
             .iter()
             .filter(|p| available.iter().any(|a| a == *p))
@@ -1227,21 +1280,7 @@ impl App {
 
         let mut sparks = Vec::new();
         for name in ordered {
-            let safe = name.replace('\'', "''");
-            if let Ok(q) = self.db.query(&format!(
-                "SELECT value FROM {} WHERE name = '{safe}' ORDER BY ts DESC LIMIT 64",
-                Self::quote_ident(&base)
-            )) {
-                let mut vals: Vec<f64> = q
-                    .rows
-                    .into_iter()
-                    .filter_map(|r| match r.into_iter().next() {
-                        Some(PValue::Real(f)) => Some(f),
-                        Some(PValue::Int(i)) => Some(i as f64),
-                        _ => None,
-                    })
-                    .collect();
-                vals.reverse();
+            if let Some(vals) = by_name.get(&name) {
                 if let Some(latest) = vals.last().copied() {
                     let rendered = if latest.abs() >= 1_048_576.0 {
                         format!("{:.1} MB", latest / 1_048_576.0)
@@ -1250,7 +1289,7 @@ impl App {
                     } else {
                         format!("{latest:.3}")
                     };
-                    sparks.push((name, vals, rendered));
+                    sparks.push((name, vals.clone(), rendered));
                 }
             }
         }
@@ -2950,6 +2989,32 @@ mod tests {
         assert!(matches!(a.overlay, Overlay::None));
         let g = a.grid.as_ref().unwrap();
         assert_eq!(g.row(0).unwrap()[1], PValue::Text("edited!".into()));
+    }
+
+    /// The windowed series query (open_health fast path) against a
+    /// synthetic health base — no timeless extension needed.
+    #[test]
+    fn health_sparks_from_windowed_series_query() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE m(name TEXT, value REAL, ts INTEGER);
+             CREATE VIEW m_report AS
+               SELECT 'c' AS \"check\", 'ok' AS status, 1.0 AS value, 'a' AS advice;
+             INSERT INTO m VALUES
+               ('cache_hits', 1.0, 1), ('cache_hits', 2.0, 2), ('cache_hits', 3.0, 3),
+               ('other_metric', 10.0, 1), ('other_metric', 20.0, 2);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenHealth);
+        let Overlay::Health(hv) = &a.overlay else {
+            panic!("health console did not open: {:?}", a.status);
+        };
+        assert_eq!(hv.table, "m");
+        assert_eq!(hv.report.len(), 1);
+        assert_eq!(hv.sparks.len(), 2);
+        let hits = hv.sparks.iter().find(|(n, _, _)| n == "cache_hits").unwrap();
+        assert_eq!(hits.1, vec![1.0, 2.0, 3.0], "chronological after reverse");
     }
 
     /// Full-stack phase 3, when the timeless extension is built next
