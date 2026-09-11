@@ -75,13 +75,17 @@ impl PValue {
                 n.len() <= h.len()
                     && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
             }
-            // Numeric renders contain no letters: an alpha needle can
-            // never match, so skip rendering entirely.
+            // Numeric renders contain no letters when finite: an alpha
+            // needle can never match, so skip rendering entirely.
             PValue::Int(i) => !needle_has_alpha && i.to_string().contains(needle_lc),
-            PValue::Real(_) => !needle_has_alpha && self.render().contains(needle_lc),
+            // NaN/inf render with letters — fall through to the slow path.
+            PValue::Real(f) if f.is_finite() => {
+                !needle_has_alpha && self.render().contains(needle_lc)
+            }
             PValue::Null => "∅".contains(needle_lc),
-            // Rare + mixed-case render ("(5B)"): keep the slow path.
-            PValue::Blob(_) => self.render().to_ascii_lowercase().contains(needle_lc),
+            // Rare + lettered render (non-finite reals, blob hex):
+            // keep the slow path.
+            _ => self.render().to_ascii_lowercase().contains(needle_lc),
         }
     }
 
@@ -468,7 +472,9 @@ impl EmbeddedDb {
             .observe(offset, rowids);
     }
 
-    /// Positions moved: anchors for this table are void.
+    /// Positions moved (write path drops the WHOLE index: cascades and
+    /// triggers can shift other tables' positions too).
+    #[allow(dead_code)]
     fn anchor_clear(&self, table: &str) {
         self.anchors.lock().unwrap().remove(table);
     }
@@ -658,7 +664,9 @@ impl DbLink for EmbeddedDb {
             Err(_) => return fallback(),
         };
         if rows.is_empty() {
-            if offset == 0 {
+            // A zero/negative limit on a non-empty table says nothing
+            // about the total: only trust the shortcut for a real fetch.
+            if offset == 0 && limit > 0 {
                 // Open on an empty table: total is exactly 0, no count needed.
                 let page = Page { rows: Vec::new(), rowids: with_rowid.then(Vec::new) };
                 return Ok((page, 0));
@@ -753,7 +761,9 @@ impl DbLink for EmbeddedDb {
             .map_err(|e| e.to_string())?;
         let n = stmt.raw_execute().map_err(|e| e.to_string())?;
         if n == 1 {
-            self.anchor_clear(table); // positions below may have shifted
+            // Whole index, not just this table: FK cascades and
+            // triggers can move positions in OTHER tables too.
+            self.anchors.lock().unwrap().clear();
             Ok(())
         } else {
             Err(format!("expected to update 1 row, updated {n}"))
@@ -779,7 +789,8 @@ impl DbLink for EmbeddedDb {
             stmt.raw_bind_parameter(i + 1, v).map_err(|e| e.to_string())?;
         }
         stmt.raw_execute().map_err(|e| e.to_string())?;
-        self.anchor_clear(table); // appended row shifts the tail
+        // Cascade/trigger writes may touch other tables: drop all anchors.
+        self.anchors.lock().unwrap().clear();
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -792,7 +803,8 @@ impl DbLink for EmbeddedDb {
             )
             .map_err(|e| e.to_string())?;
         if n == 1 {
-            self.anchor_clear(table); // positions below the gap shift up
+            // Deletes (and their cascades/triggers) can shift any table.
+            self.anchors.lock().unwrap().clear();
             Ok(())
         } else {
             Err(format!("expected to delete 1 row, deleted {n}"))
@@ -954,8 +966,38 @@ mod tests {
         assert_eq!(p2.rows.len(), 150);
         assert_eq!(p2.rows[0], vec![PValue::Text("r190080".into())]);
         assert_eq!(p2.rowids.unwrap()[0], 190081);
-        assert!(warm < cold, "keyset {warm:?} should beat OFFSET rescan {cold:?}");
+        // No timing assert here: microsecond-scale comparisons flake
+        // under scheduler jitter and the cold leg also includes
+        // first-time statement preparation. The equivalence test above
+        // pins correctness; the printout documents the speedup.
         eprintln!("deep page: cold OFFSET {cold:?} vs warm keyset {warm:?}");
+    }
+
+    /// CASCADE deletes shift OTHER tables' positions: any write drops
+    /// the whole anchor index, or child pages silently show wrong rows.
+    #[test]
+    fn anchors_drop_on_cascade() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY,
+                 customer_id INTEGER REFERENCES customers(id) ON DELETE CASCADE);
+             INSERT INTO customers VALUES (1), (2);
+             INSERT INTO orders(customer_id) VALUES (1), (1), (2);",
+        )
+        .unwrap();
+        // Seed orders' anchors via a flight.
+        db.page("orders", 0, 10).unwrap();
+        // Cascading delete: orders rows for customer 1 vanish.
+        db.execute("DELETE FROM customers WHERE id = 1").unwrap();
+        assert!(
+            !db.anchors.lock().unwrap().contains_key("orders"),
+            "cascade must void unrelated tables' anchors"
+        );
+        // Post-cascade truth: only customer 2's order remains.
+        let page = db.page("orders", 0, 10).unwrap();
+        assert_eq!(page.rowids, Some(vec![3]));
+        assert_eq!(page.rows.len(), 1);
     }
 
     /// Keyset pages must return exactly what OFFSET truth says —
@@ -1120,10 +1162,14 @@ mod tests {
             PValue::Int(-7),
             PValue::Real(100.0),
             PValue::Real(4.5),
+            // Non-finite reals render with letters — pin the slow path.
+            PValue::Real(f64::NAN),
+            PValue::Real(f64::INFINITY),
+            PValue::Real(f64::NEG_INFINITY),
             PValue::Null,
             PValue::Blob(vec![0xab, 0x12]),
         ];
-        for needle in ["ada", "LACE", "42", "100", "∅", "x'ab", "zzz", ""] {
+        for needle in ["ada", "LACE", "42", "100", "∅", "x'ab", "zzz", "", "nan", "inf", "-inf"] {
             let lc = needle.to_ascii_lowercase();
             let has_alpha = lc.bytes().any(|b| b.is_ascii_alphabetic());
             for v in &cases {

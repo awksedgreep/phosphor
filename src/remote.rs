@@ -319,7 +319,7 @@ impl DbLink for RemoteDb {
         };
         let rows = out.rows;
         if rows.is_empty() {
-            if offset == 0 {
+            if offset == 0 && limit > 0 {
                 let page = Page { rows: Vec::new(), rowids: with_rowid.then(Vec::new) };
                 return Ok((page, 0));
             }
@@ -486,7 +486,41 @@ impl DbLink for RemoteDb {
             stmts.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
         let outs = match self.pipeline(&refs) {
             Ok(o) => o,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                // A pipeline aborts on its FIRST error — one quirky
+                // table must not empty every relation pane. Isolate
+                // per table instead (the old default's behavior).
+                let mut out = Vec::new();
+                for t in tables
+                    .iter()
+                    .filter(|t| !t.name.eq_ignore_ascii_case(parent))
+                {
+                    if let Ok(o) = self.one(
+                        &format!(
+                            "SELECT \"table\", \"from\", \"to\" FROM pragma_foreign_key_list({})",
+                            Self::str_lit(&t.name)
+                        ),
+                        vec![],
+                    ) {
+                        for row in &o.rows {
+                            let (PValue::Text(to_table), PValue::Text(from_col)) =
+                                (&row[0], &row[1])
+                            else {
+                                continue;
+                            };
+                            if !to_table.eq_ignore_ascii_case(parent) {
+                                continue;
+                            }
+                            let to_col = match &row[2] {
+                                PValue::Text(c) => c.clone(),
+                                _ => String::new(),
+                            };
+                            out.push((t.name.clone(), from_col.clone(), to_col));
+                        }
+                    }
+                }
+                return out;
+            }
         };
         let mut out = Vec::new();
         for (t, stmt_out) in tables

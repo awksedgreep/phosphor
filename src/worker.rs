@@ -207,12 +207,15 @@ impl DbHandle {
             return DbResponse::Gone;
         }
         loop {
-            if let Some(i) = self
+            // Position computed under a short borrow (scrutinee
+            // temporaries in `if let` live through the block — never
+            // overlap the borrow_mut below).
+            let hit = self
                 .buffer
                 .borrow()
                 .iter()
-                .position(|(t, _)| *t == tag)
-            {
+                .position(|(t, _)| *t == tag);
+            if let Some(i) = hit {
                 return self.buffer.borrow_mut().remove(i).1;
             }
             match self.rx.recv() {

@@ -266,6 +266,9 @@ enum PendingOp {
         offset: i64,
         end: i64,
         seq: u64,
+        /// Status epoch at submit: completion messages only overwrite
+        /// what was on screen when the scan started.
+        sseq: u64,
     },
     /// Health console rebuild: installs only if the overlay hasn't
     /// moved on (discriminant guard); `sampled` says so on arrival.
@@ -588,6 +591,7 @@ impl App {
                     offset,
                     end,
                     seq,
+                    sseq,
                 },
                 DbResponse::Page(r),
             ) => match r {
@@ -607,15 +611,19 @@ impl App {
                             let abs = offset + i as i64;
                             self.grid_jump(abs);
                             self.focus = Focus::Grid;
-                            self.say(format!("found at row {}", abs + 1));
+                            if self.status_seq == sseq {
+                                self.say(format!("found at row {}", abs + 1));
+                            }
                             return;
                         }
                     }
                     let next = offset + page.rows.len() as i64;
                     if page.rows.is_empty() || next >= end {
-                        self.say(format!(
-                            "{needle:?} not found below (g for top, n to retry)"
-                        ));
+                        if self.status_seq == sseq {
+                            self.say(format!(
+                                "{needle:?} not found below (g for top, n to retry)"
+                            ));
+                        }
                         return;
                     }
                     // Chain the next window (same scan generation).
@@ -628,6 +636,7 @@ impl App {
                         offset: next,
                         end,
                         seq,
+                        sseq,
                     };
                     match self.db.submit(Box::new(move |db| {
                         DbResponse::Page(db.page(&table, next, limit))
@@ -1401,6 +1410,12 @@ impl App {
     }
 
     fn back(&mut self) {
+        // A parked EDIT target belongs to a form that's about to close:
+        // otherwise a still-flying window would resurrect it (the user
+        // Esc'd once; the form must stay closed).
+        if matches!(self.overlay, Overlay::Edit(_)) {
+            self.pending_edit = None;
+        }
         match &mut self.overlay {
             Overlay::Edit(ed) if ed.editing.is_some() => ed.editing = None,
             Overlay::Qbe(st) if st.editing.is_some() => {
@@ -2744,7 +2759,7 @@ impl App {
     /// it, and builds the form — all before returning, so a second save
     /// cannot insert twins. Rare path (explicit save keypress); bulk
     /// flight stays async.
-    fn flip_to_tail(&mut self, last: i64) {
+    fn flip_to_tail(&mut self, last: i64, new_rowid: i64) {
         let visible = self.visible_rows.max(1);
         let name = match &self.grid {
             Some(g) => match &g.source {
@@ -2782,10 +2797,29 @@ impl App {
                 // Void in-flight windows: their data predates the insert.
                 self.pending_page = None;
             }
-            Err(e) => return self.err(e),
+            Err(e) => {
+                // No twin window on ANY path: demote the form from
+                // INSERT to UPDATE against the new rowid, so further
+                // Enters edit the inserted record instead of inserting
+                // twins while the fetch is broken.
+                self.pending_page = None;
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    ed.inserting = false;
+                    ed.rowid = new_rowid;
+                }
+                return self.err(e);
+            }
         }
         let abs = self.grid.as_ref().map(|g| g.cur_row).unwrap_or(0);
         self.build_edit_for(abs);
+        // If the form build couldn't complete (fetch/columns failure),
+        // still demote — same no-twins contract.
+        if let Overlay::Edit(ed) = &mut self.overlay {
+            if ed.inserting {
+                ed.inserting = false;
+                ed.rowid = new_rowid;
+            }
+        }
     }
 
     /// Build (or rebuild) the EDIT overlay for the record at absolute
@@ -3209,6 +3243,7 @@ impl App {
         let end = total.min(start + SCAN_CAP);
         self.find_seq += 1;
         let seq = self.find_seq;
+        let sseq = self.status_seq;
         let limit = Self::FIND_PAGE.min(end - start).max(0);
         let op = PendingOp::Find {
             table: table.clone(),
@@ -3218,6 +3253,7 @@ impl App {
             offset: start,
             end,
             seq,
+            sseq,
         };
         match self.db.submit(Box::new(move |db| {
             DbResponse::Page(db.page(&table, start, limit))
@@ -3349,14 +3385,14 @@ impl App {
         let result = if inserting {
             self.db
                 .insert_row(&table, &changes)
-                .map(|rowid| format!("inserted rowid {rowid}"))
+                .map(|rowid| (rowid, format!("inserted rowid {rowid}")))
         } else {
             self.db
                 .update_row(&table, rowid, &changes)
-                .map(|()| format!("saved {n} field(s)"))
+                .map(|()| (rowid, format!("saved {n} field(s)")))
         };
         match result {
-            Ok(msg) => {
+            Ok((new_rowid, msg)) => {
                 // The write may have changed child counts/previews and health.
                 self.pane_cache.clear();
                 self.invalidate_health();
@@ -3373,7 +3409,7 @@ impl App {
                         Overlay::Edit(ed) => ed.cursor,
                         _ => 0,
                     };
-                    self.flip_to_tail(last.max(0));
+                    self.flip_to_tail(last.max(0), new_rowid);
                     if let Overlay::Edit(ed) = &mut self.overlay {
                         ed.cursor = cursor.min(ed.fields.len().saturating_sub(1));
                     }
@@ -4327,6 +4363,25 @@ mod tests {
         // FKs are ENFORCED on the embedded backend now.
         let bad = a.db.execute("INSERT INTO orders(product, customer_id) VALUES ('x', 99)");
         assert!(bad.is_err(), "orphan insert must be rejected");
+    }
+
+    /// Esc from a parked-flip EDIT must stay closed: a window still in
+    /// flight arrives later and must NOT resurrect the dismissed form.
+    #[test]
+    fn back_while_parked_keeps_edit_closed() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        // Park a target (rows absent) as a flip would, then Esc.
+        a.pending_edit = Some(400);
+        a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::None), "form closed");
+        assert_eq!(a.pending_edit, None, "park must die with the form");
+        // The late window arrives: nothing resurrects.
+        a.apply(Command::GridPage(1));
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::None));
     }
 
     #[test]
