@@ -101,6 +101,17 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
 fn draw_create(f: &mut Frame, app: &App) {
     let th = app.theme;
     let Overlay::Create(st) = &app.overlay else { return };
+    let is_editor = st.original.is_some();
+    let title_text = if is_editor {
+        format!(" TABLE EDITOR · {} ", st.draft.table)
+    } else {
+        format!(" TABLE DESIGNER · {} ", st.draft.table)
+    };
+    let footer_text = if is_editor {
+        " F3 type F4 pk F5 null F6 uniq F7 dflt F10 fk F8 ins F9 del [] move F2 apply "
+    } else {
+        " F3 type F4 pk F5 null F6 uniq F7 dflt F10 fk F8 ins F9 del [] move F2 create "
+    };
     let area = centered(
         f.area(),
         86,
@@ -111,14 +122,8 @@ fn draw_create(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .border_style(th.bright())
         .style(th.base())
-        .title(Span::styled(
-            format!(" TABLE DESIGNER · {} ", st.draft.table),
-            th.bright(),
-        ))
-        .title_bottom(Line::styled(
-            " F3 type F4 pk F5 null F6 uniq F7 dflt F10 fk F8 ins F9 del [] move F2 create ",
-            th.dim(),
-        ));
+        .title(Span::styled(title_text, th.bright()))
+        .title_bottom(Line::styled(footer_text, th.dim()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -176,12 +181,44 @@ fn draw_create(f: &mut Frame, app: &App) {
     let [rows_area, sql_area] =
         Layout::vertical([Constraint::Length(rows_h), Constraint::Fill(1)]).areas(inner);
     f.render_widget(Paragraph::new(lines), rows_area);
-    f.render_widget(
-        Paragraph::new(vec![
+    // The SQL that F2 will run: CREATE for a new table, the ALTER
+    // diff for an existing one (or the reason it can't be applied).
+    let empty_cols: Vec<crate::db::ColumnInfo> = Vec::new();
+    let sql_lines: Vec<Line> = match (&st.original, st.draft.diff_statements(
+        st.original.as_ref().map(|(_, c)| c).unwrap_or(&empty_cols),
+    )) {
+        (Some((orig_table, _)), Ok(stmts)) => {
+            let renamed = !st.draft.table.eq_ignore_ascii_case(orig_table);
+            let mut v = vec![Line::styled("CHANGES:", th.dim())];
+            if renamed {
+                v.push(Line::styled(
+                    format!(
+                        "ALTER TABLE {} RENAME TO {};",
+                        crate::creator::quote_ident(orig_table),
+                        crate::creator::quote_ident(&st.draft.table)
+                    ),
+                    th.bright(),
+                ));
+            }
+            if stmts.is_empty() && !renamed {
+                v.push(Line::styled("(no changes)", th.dim()));
+            }
+            for s in &stmts {
+                v.push(Line::styled(format!("{s};"), th.bright()));
+            }
+            v
+        }
+        (Some(_), Err(e)) => vec![
+            Line::styled("CHANGES:", th.dim()),
+            Line::styled(e, th.error()),
+        ],
+        _ => vec![
             Line::styled("SQL:", th.dim()),
             Line::styled(st.draft.sql(), th.bright()),
-        ])
-        .wrap(ratatui::widgets::Wrap { trim: false }),
+        ],
+    };
+    f.render_widget(
+        Paragraph::new(sql_lines).wrap(ratatui::widgets::Wrap { trim: false }),
         sql_area,
     );
 }

@@ -280,6 +280,9 @@ pub enum Command {
     /// Toggle the split-view detail pane (SET RELATION on one screen).
     /// Cycles among a table's related children; 'v' again closes.
     ToggleSplit,
+    /// The TABLE EDITOR: open the selected table's structure for
+    /// changes (add / rename / drop columns), applied as ALTERs.
+    OpenTableEditor,
     // Mouse equivalents (hit-testing happens in App::on_mouse):
     /// Select the Nth visible sidebar row; clicking the selection
     /// again opens it.
@@ -1174,6 +1177,7 @@ impl App {
                 Up | Char('k') => Command::SidebarMove(-1),
                 Down | Char('j') => Command::SidebarMove(1),
                 Enter => Command::OpenSelected,
+                Char('E') => Command::OpenTableEditor,
                 Char('Q') => Command::OpenQbe(None),
                 Char('R') => Command::OpenReport(None),
                 Char('L') => Command::OpenLabels(None),
@@ -1200,6 +1204,7 @@ impl App {
             Focus::Grid => Some(match key.code {
                 Esc => Command::Back,
                 Char('v') => Command::ToggleSplit,
+                Char('E') => Command::OpenTableEditor,
                 Up | Char('k') => Command::GridMove { dr: -1, dc: 0 },
                 Down | Char('j') => Command::GridMove { dr: 1, dc: 0 },
                 Left | Char('h') => Command::GridMove { dr: 0, dc: -1 },
@@ -1325,6 +1330,7 @@ impl App {
             }
             Command::OpenSelected => self.open_selected(),
             Command::ToggleSplit => self.toggle_split(),
+            Command::OpenTableEditor => self.open_table_editor(),
             Command::SidebarClick(idx) => {
                 let n = self.visible_tables().len();
                 if idx < n {
@@ -2025,6 +2031,30 @@ impl App {
         self.overlay = Overlay::Create(CreateState::new(&name));
     }
 
+    /// 'E' on a table: the TABLE EDITOR — the designer preloaded with
+    /// the table's live columns. F2 then applies your changes as
+    /// ALTER TABLE statements (add / rename / drop; type and
+    /// constraint changes to existing columns are declined).
+    fn open_table_editor(&mut self) {
+        let name = match &self.grid {
+            Some(g) => match &g.source {
+                GridSource::Table { name, .. } => name.clone(),
+                _ => {
+                    return self.say("the table editor works on a table (query results have no structure)");
+                }
+            },
+            None => match self.visible_tables().get(self.sidebar_idx) {
+                Some(t) => t.name.clone(),
+                None => return self.say("no table selected"),
+            },
+        };
+        let cols = match self.cached_columns(&name) {
+            Ok(c) => c,
+            Err(e) => return self.err(e),
+        };
+        self.overlay = Overlay::Create(CreateState::edit_existing(&name, cols));
+    }
+
     fn create_toggle(&mut self, f: impl FnOnce(&mut crate::creator::FieldDef)) {
         if let Overlay::Create(st) = &mut self.overlay {
             if let Some(i) = st.field_idx() {
@@ -2479,15 +2509,66 @@ impl App {
             }
             Overlay::Create(st) => {
                 let draft = st.draft.clone();
-                match draft.create(self.db.link()) {
-                    Ok(()) => {
-                        self.overlay = Overlay::None;
-                        self.reload_tables();
+                let original = st.original.clone();
+                match original {
+                    // TABLE EDITOR: apply the diff as ALTER statements.
+                    Some((orig_table, orig_cols)) => {
                         let table = draft.table.clone();
-                        self.open_table(&table);
-                        self.say(format!("created {table:?} — a adds the first record"));
+                        let renamed = !table.eq_ignore_ascii_case(&orig_table);
+                        match draft.diff_statements(&orig_cols) {
+                            Ok(stmts) if stmts.is_empty() && !renamed => {
+                                self.say("no structural changes to apply");
+                            }
+                            Ok(stmts) => {
+                                // Atomic: one failed ALTER must not
+                                // leave the table half-migrated.
+                                let mut sql = String::from("BEGIN;\n");
+                                if renamed {
+                                    sql.push_str(&format!(
+                                        "ALTER TABLE {} RENAME TO {};\n",
+                                        crate::creator::quote_ident(&orig_table),
+                                        crate::creator::quote_ident(&table)
+                                    ));
+                                }
+                                for stmt in &stmts {
+                                    sql.push_str(stmt);
+                                    sql.push_str(";\n");
+                                }
+                                sql.push_str("COMMIT;");
+                                match self.db.execute(&sql) {
+                                    Ok((_, elapsed)) => {
+                                        self.last_ms =
+                                            Some(elapsed.as_secs_f64() * 1000.0);
+                                        self.overlay = Overlay::None;
+                                        self.columns_cache.remove(&table);
+                                        self.reload_tables();
+                                        self.open_table(&table);
+                                        self.say(format!(
+                                            "applied {} change(s) to {table:?}",
+                                            stmts.len() + usize::from(renamed)
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        // The batch aborted before COMMIT:
+                                        // roll back so nothing partial stays.
+                                        let _ = self.db.execute("ROLLBACK");
+                                        self.err(e);
+                                    }
+                                }
+                            }
+                            Err(e) => self.err(e),
+                        }
                     }
-                    Err(e) => self.err(e),
+                    None => match draft.create(self.db.link()) {
+                        Ok(()) => {
+                            self.overlay = Overlay::None;
+                            self.reload_tables();
+                            let table = draft.table.clone();
+                            self.open_table(&table);
+                            self.say(format!("created {table:?} — a adds the first record"));
+                        }
+                        Err(e) => self.err(e),
+                    },
                 }
             }
             Overlay::Form(_) => {
@@ -5164,6 +5245,79 @@ mod tests {
         a.apply(Command::DesignerCommit);
         let Overlay::Create(st) = &a.overlay else { panic!() };
         assert_eq!(st.draft.fields[1].name, "city", "no Enter, no backspacing");
+    }
+
+    /// The TABLE EDITOR end to end: 'E' opens a table's live columns,
+    /// add + rename + drop edits apply as ALTERs, and the data
+    /// survives (rename keeps it, drop loses only its own column).
+    #[test]
+    fn table_editor_applies_alters_and_preserves_data() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE clients(id INTEGER PRIMARY KEY, name TEXT, city TEXT, stale TEXT);
+             INSERT INTO clients(name, city, stale) VALUES
+               ('Ada', 'London', 'x'), ('Grace', 'Arlington', 'y');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::SidebarSeek('c'));
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenTableEditor);
+        let Overlay::Create(st) = &a.overlay else {
+            panic!("table editor did not open");
+        };
+        assert_eq!(st.draft.fields.len(), 4, "live columns preloaded");
+        assert!(st.original.is_some());
+        // The editor opens with the cursor on the LAST field (stale).
+        // Edit plan: drop `stale`, rename `city` -> `locality`, add
+        // `balance REAL`.
+        a.apply(Command::DesignerDelete); // stale dropped; cursor now on city
+        a.apply(Command::DesignerEditBegin);
+        if let Overlay::Create(st) = &mut a.overlay {
+            if let Some(buf) = &mut st.editing {
+                *buf = "locality".into();
+            }
+        }
+        a.apply(Command::DesignerCommit);
+        a.apply(Command::DesignerAdd); // new field after locality
+        a.apply(Command::DesignerEditBegin);
+        if let Overlay::Create(st) = &mut a.overlay {
+            if let Some(buf) = &mut st.editing {
+                *buf = "balance".into();
+            }
+        }
+        a.apply(Command::DesignerCommit);
+        a.apply(Command::DesignerCycle); // TEXT -> REAL
+        a.apply(Command::DesignerRun);
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::None), "editor closed");
+        let cols = a.db.columns("clients").unwrap();
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name", "locality", "balance"], "renamed+added+dropped");
+        let q = a.db.query("SELECT name, locality FROM clients ORDER BY name").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Text("Ada".into()));
+        assert_eq!(q.rows[0][1], PValue::Text("London".into()), "data survived the rename");
+    }
+
+    /// The editor declines a type change on an existing column with a
+    /// clear message instead of a raw SQLite error.
+    #[test]
+    fn table_editor_declines_type_change() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE things(id INTEGER PRIMARY KEY, size TEXT);")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenTableEditor);
+        a.apply(Command::DesignerCycle); // TEXT -> REAL: a type change
+        a.apply(Command::DesignerRun);
+        assert!(matches!(a.overlay, Overlay::Create(_)), "stays open");
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("rebuild")));
     }
 
     #[test]
