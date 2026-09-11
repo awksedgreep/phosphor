@@ -51,7 +51,13 @@ INSERT INTO people(name, city, note)
 SQL
 
 # dbhealth with a fast cadence so the live console moves on camera.
-sqlite3 "$DB" ".load $DBHEALTH_EXT" \
-  "CREATE VIRTUAL TABLE dbhealth USING dbhealth(every=2);
-   INSERT INTO dbhealth(dbhealth) VALUES ('sample');"
-echo "seeded $DB"
+# Optional: the timeless extension ships in its own repo; when it is
+# not built, seed everything else and let the health demo be skipped.
+if [ -f "${DBHEALTH_EXT}.so" ] || [ -f "$DBHEALTH_EXT" ]; then
+  sqlite3 "$DB" ".load $DBHEALTH_EXT" \
+    "CREATE VIRTUAL TABLE dbhealth USING dbhealth(every=2);
+     INSERT INTO dbhealth(dbhealth) VALUES ('sample');"
+  echo "seeded $DB (with dbhealth)"
+else
+  echo "seeded $DB (dbhealth skipped: $DBHEALTH_EXT not built)"
+fi

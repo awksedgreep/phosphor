@@ -13,6 +13,7 @@ cargo build --release --manifest-path "$ROOT/Cargo.toml"
 python3 "$ROOT/tools/demo/scenarios.py"
 cd "$ROOT/docs/demo"
 for c in browse builders health appmode; do
+  [ -f "$c.cast" ] || continue   # health needs the timeless extension
   agg --font-size 16 --font-family "$FONT" "$c.cast" "$c.gif"
 done
 echo "GIFs regenerated in docs/demo/"

@@ -13,7 +13,10 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 BIN = os.path.join(ROOT, "target/release/phosphor")
 DB = "/tmp/phosphor-demo.db"
 EXT = os.path.abspath(os.path.join(ROOT, "../timeless-libsql/target/release/libdbhealth_ext.so"))
-ENV = {"PHOSPHOR_EXT": EXT}
+# Only point PHOSPHOR_EXT at the extension when it actually exists —
+# otherwise the status bar would carry a load warning on every GIF.
+ENV = {"PHOSPHOR_EXT": EXT} if os.path.exists(EXT) else {}
+HAS_EXT = bool(ENV)
 OUT = os.path.join(ROOT, "docs/demo")
 
 ESC, ENTER, CTRL_Q = "\x1b", "\r", "\x11"
@@ -107,4 +110,10 @@ def appmode():
 
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
-    browse(); builders(); health(); appmode()
+    if not HAS_EXT:
+        print("skipping health demo: timeless extension not built "
+              f"({EXT}); the existing GIF stays as-is")
+    browse(); builders()
+    if HAS_EXT:
+        health()
+    appmode()
