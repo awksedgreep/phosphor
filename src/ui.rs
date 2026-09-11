@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use std::borrow::Cow;
 
-use crate::app::{App, Focus, Grid, GridSource, Overlay};
+use crate::app::{App, DetailState, Focus, Grid, GridSource, Overlay};
 use crate::db::{DbLink, PValue};
 
 pub fn draw(f: &mut Frame, app: &mut App) -> bool {
@@ -756,30 +756,45 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
-    let th = app.theme;
-    let title = match &app.grid {
-        Some(Grid {
-            source: GridSource::Table { name, editable },
-            ..
-        }) => {
+    // Split BROWSE: master left, related child rows right — only when
+    // there's room (narrow terminals keep the single-pane layout).
+    // Matches toggle_split's 74-col inner-width gate (main area = 76).
+    let split = app.detail.is_some() && area.width >= 76;
+    if split {
+        let [m_area, d_area] =
+            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .areas(area);
+        draw_master_panel(f, app, m_area);
+        let state = app.detail.as_ref().expect("split checked above");
+        draw_detail_panel(f, app, state, d_area);
+        return;
+    }
+    draw_master_panel(f, app, area);
+}
+
+fn master_title(g: &Grid) -> String {
+    match &g.source {
+        GridSource::Table { name, editable } => {
             if *editable {
                 format!(" BROWSE {name} ")
             } else {
                 format!(" BROWSE {name} (read-only) ")
             }
         }
-        Some(Grid {
-            source: GridSource::Query { truncated },
-            ..
-        }) => {
+        GridSource::Query { truncated } => {
             if *truncated {
                 " QUERY (capped at 10k rows) ".to_owned()
             } else {
                 " QUERY ".to_owned()
             }
         }
-        None => " phosphor ".to_owned(),
-    };
+        GridSource::Detail { .. } => " DETAIL ".to_owned(),
+    }
+}
+
+fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
+    let th = app.theme;
+    let title = app.grid.as_ref().map(master_title).unwrap_or_else(|| " phosphor ".to_owned());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_style(app, Focus::Grid))
@@ -798,6 +813,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
                 Line::styled("  Enter on a table to BROWSE", th.dim()),
                 Line::styled("  .  for the dot prompt", th.dim()),
                 Line::styled("  F1 for help", th.dim()),
+                Line::styled("  v  splits a related table onto this screen", th.dim()),
             ]),
             inner,
         );
@@ -840,6 +856,86 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
                         .get(c)
                         .map(PValue::render)
                         .unwrap_or_default();
+                    let style = if abs == g.cur_row && c == g.cur_col {
+                        th.cursor()
+                    } else if abs == g.cur_row {
+                        th.bright()
+                    } else if matches!(row.get(c), Some(PValue::Null)) {
+                        th.dim()
+                    } else {
+                        th.base()
+                    };
+                    Span::styled(pad(&text, g.widths[c]), style)
+                })
+                .collect(),
+            None => vec![Span::styled("…", th.dim())],
+        };
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_detail_panel(f: &mut Frame, app: &App, state: &DetailState, area: Rect) {
+    let th = app.theme;
+    let (child, child_col, key_sql) = match &state.grid.source {
+        GridSource::Detail {
+            child,
+            child_col,
+            key_sql,
+            ..
+        } => (child.as_str(), child_col.as_str(), key_sql.as_str()),
+        _ => ("", "", ""),
+    };
+    let title = format!(
+        " {child} · {child_col} = {key_sql} · {} rows ",
+        state.grid.total
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_style(app, Focus::Detail))
+        .title(Span::styled(title, focus_style(app, Focus::Detail)))
+        .title_bottom(Line::styled(
+            " Tab master · v close · read-only ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let visible = inner.height.saturating_sub(1).max(1) as i64; // minus header
+
+    if state.grid.columns.is_empty() {
+        f.render_widget(Paragraph::new(Line::styled("…", th.dim())), inner);
+        return;
+    }
+
+    // Visible column window (pane is ~half the screen).
+    let mut cols: Vec<usize> = Vec::new();
+    let mut used: u16 = 0;
+    for c in state.grid.col_off..state.grid.columns.len() {
+        let w = state.grid.widths[c] + 1;
+        if used + w > inner.width && !cols.is_empty() {
+            break;
+        }
+        used += w;
+        cols.push(c);
+    }
+
+    let g = &state.grid;
+    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
+    lines.push(Line::from(
+        cols.iter()
+            .map(|&c| Span::styled(pad(&g.columns[c], g.widths[c]), th.bright()))
+            .collect::<Vec<_>>(),
+    ));
+    for vis in 0..visible {
+        let abs = g.row_off + vis;
+        if abs >= g.total {
+            break;
+        }
+        let spans: Vec<Span> = match g.row(abs) {
+            Some(row) => cols
+                .iter()
+                .map(|&c| {
+                    let text = row.get(c).map(PValue::render).unwrap_or_default();
                     let style = if abs == g.cur_row && c == g.cur_col {
                         th.cursor()
                     } else if abs == g.cur_row {
@@ -909,6 +1005,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             match &g.source {
                 GridSource::Table { name, .. } => name.as_str(),
                 GridSource::Query { .. } => "query",
+                GridSource::Detail { .. } => "detail",
             },
             g.cur_row + 1,
             g.total,

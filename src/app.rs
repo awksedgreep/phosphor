@@ -11,8 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::creator::CreateState;
 use crate::db::{ColumnInfo, DbLink, DbResult, PValue, TableInfo};
-use crate::worker::{DbHandle, DbResponse};
-use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
+use crate::worker::{DbHandle, DbResponse};use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
 use crate::help::{self, HelpState};
 use crate::qbe::{QbeSpec, QbeState};
 use crate::report::{self, PagerState, ReportSpec, ReportState};
@@ -25,6 +24,8 @@ const WIDTH_SAMPLE: usize = 50;
 pub enum Focus {
     Sidebar,
     Grid,
+    /// The detail pane of a split BROWSE (SET RELATION on one screen).
+    Detail,
     Prompt,
 }
 
@@ -106,6 +107,26 @@ pub enum GridSource {
     Query {
         truncated: bool,
     },
+    /// Split-view detail pane: the child rows of one parent record,
+    /// fetched in full (bounded) — read-only in v1.
+    Detail {
+        parent: String,
+        child: String,
+        child_col: String,
+        key_sql: String,
+    },
+}
+
+/// The right-hand pane of a split BROWSE: one child table filtered to
+/// the master cursor's record. SET RELATION, on one screen. The pane's
+/// Grid is read-only (GridSource::Detail); child/col/key live in the
+/// source — one copy of the truth.
+pub struct DetailState {
+    pub grid: Grid,
+    /// Parent-side FK column name ("" = the parent's pk / rowid).
+    pub parent_col: String,
+    /// Viewport height, reported back by the renderer each frame.
+    pub visible_rows: i64,
 }
 
 pub struct Grid {
@@ -239,6 +260,9 @@ pub enum Command {
     SidebarSeek(char),
     /// Show/hide internal tables (shadow, _phosphor, dbhealth views).
     ToggleInternals,
+    /// Toggle the split-view detail pane (SET RELATION on one screen).
+    /// Cycles among a table's related children; 'v' again closes.
+    ToggleSplit,
     /// A worker response arrived (main loop polls, tests pump): the
     /// token routes it to its pending continuation in finish_db().
     DbReady(crate::worker::Token, crate::worker::DbResponse),
@@ -278,6 +302,12 @@ enum PendingOp {
         at: std::time::Instant,
         overlay: std::mem::Discriminant<Overlay>,
     },
+    /// Detail-pane rows for a split BROWSE, keyed by the parent key
+    /// they were fetched for (stale arrivals drop).
+    Detail {
+        want_key: String,
+        at: std::time::Instant,
+    },
 }
 
 pub struct App {
@@ -293,6 +323,9 @@ pub struct App {
     pub tables: Vec<TableInfo>,
     pub sidebar_idx: usize,
     pub grid: Option<Grid>,
+    /// Split-view detail pane (None = single-pane BROWSE, as always).
+    /// The pane's Grid lives here too; its source is GridSource::Detail.
+    pub detail: Option<DetailState>,
     pub prompt: Prompt,
     /// (message, is_error) for the status line.
     pub status: Option<(String, bool)>,
@@ -342,6 +375,8 @@ pub struct App {
     /// Latest in-flight scroll window (token, table, want_start): older
     /// arrivals drop, so hold-to-fly converges on the newest window.
     pending_page: Option<(crate::worker::Token, String, i64)>,
+    /// Latest in-flight detail-pane fetch and the key it was for.
+    pending_detail: Option<(crate::worker::Token, String)>,
     /// EDIT target parked while its window flies in (built on arrival).
     pending_edit: Option<i64>,
     /// Find-scan generation: a new find supersedes older chains.
@@ -364,6 +399,7 @@ impl App {
             tables: Vec::new(),
             sidebar_idx: 0,
             grid: None,
+            detail: None,
             prompt: Prompt {
                 input: String::new(),
                 cursor: 0,
@@ -392,6 +428,7 @@ impl App {
             pane_cache: HashMap::new(),
             pending: HashMap::new(),
             pending_page: None,
+            pending_detail: None,
             pending_edit: None,
             find_seq: 0,
             status_seq: 0,
@@ -476,6 +513,7 @@ impl App {
                     self.grid = Some(grid);
                     self.focus = Focus::Grid;
                     self.pending_edit = None; // new table: parked rows are void
+                    self.close_detail(); // the old pane links a different table
                     self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
                     self.refresh_health();
                     // Clear only our own (silent) open — a newer message wins.
@@ -506,6 +544,7 @@ impl App {
                     self.grid = Some(grid);
                     self.focus = Focus::Grid;
                     self.pending_edit = None; // new result: parked rows are void
+                    self.close_detail(); // query results have no child links
                     self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
                     if self.status_seq == seq {
                         self.say(if truncated {
@@ -675,6 +714,45 @@ impl App {
                     if sampled && self.status_seq == seq {
                         self.say("sampled");
                     }
+                }
+                Err(e) => self.err(e),
+            },
+            (
+                PendingOp::Detail { want_key, at },
+                DbResponse::Detail(r),
+            ) => match r {
+                Ok(d) => {
+                    // Latest fetch wins; older arrivals drop.
+                    if self.pending_detail.as_ref() != Some(&(tag, want_key.clone())) {
+                        return;
+                    }
+                    self.pending_detail = None;
+                    let Some(state) = &mut self.detail else { return };
+                    let (parent, child, child_col) = match &state.grid.source {
+                        GridSource::Detail {
+                            parent,
+                            child,
+                            child_col,
+                            ..
+                        } => (parent.clone(), child.clone(), child_col.clone()),
+                        _ => return,
+                    };
+                    state.grid.source = GridSource::Detail {
+                        parent,
+                        child,
+                        child_col,
+                        key_sql: want_key,
+                    };
+                    let g = &mut state.grid;
+                    g.columns = d.columns;
+                    g.total = d.total;
+                    g.cache = d.rows;
+                    g.cache_start = 0;
+                    g.rowids = None;
+                    g.cur_row = g.cur_row.clamp(0, g.total.saturating_sub(1).max(0));
+                    g.row_off = g.row_off.min(g.cur_row);
+                    g.compute_widths();
+                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
                 }
                 Err(e) => self.err(e),
             },
@@ -1091,6 +1169,7 @@ impl App {
             }),
             Focus::Grid => Some(match key.code {
                 Esc => Command::Back,
+                Char('v') => Command::ToggleSplit,
                 Up | Char('k') => Command::GridMove { dr: -1, dc: 0 },
                 Down | Char('j') => Command::GridMove { dr: 1, dc: 0 },
                 Left | Char('h') => Command::GridMove { dr: 0, dc: -1 },
@@ -1112,7 +1191,33 @@ impl App {
                 Char('F') => Command::OpenForm(None),
                 Char('A') => Command::OpenApps(None),
                 Char('.') => Command::Focus(Focus::Prompt),
-                Tab => Command::Focus(Focus::Prompt),
+                // Tab bounces between the linked panes when split is
+                // open; otherwise it heads for the dot prompt.
+                Tab => {
+                    if self.detail.is_some() {
+                        Command::Focus(Focus::Detail)
+                    } else {
+                        Command::Focus(Focus::Prompt)
+                    }
+                }
+                _ => return None,
+            }),
+            Focus::Detail => Some(match key.code {
+                Esc => Command::Back,
+                Char('v') => Command::ToggleSplit,
+                Up | Char('k') => Command::GridMove { dr: -1, dc: 0 },
+                Down | Char('j') => Command::GridMove { dr: 1, dc: 0 },
+                Left | Char('h') => Command::GridMove { dr: 0, dc: -1 },
+                Right | Char('l') => Command::GridMove { dr: 0, dc: 1 },
+                PageUp => Command::GridPage(-1),
+                PageDown => Command::GridPage(1),
+                Home => Command::GridEdge(false),
+                End => Command::GridEdge(true),
+                Char('g') => Command::GridTop,
+                Char('G') => Command::GridBottom,
+                Enter => Command::OpenEdit,
+                Tab => Command::Focus(Focus::Grid),
+                Char('.') => Command::Focus(Focus::Prompt),
                 _ => return None,
             }),
         }
@@ -1189,18 +1294,53 @@ impl App {
                 }
             }
             Command::OpenSelected => self.open_selected(),
-            Command::GridMove { dr, dc } => self.grid_move(dr, dc),
-            Command::GridPage(dir) => self.grid_move(dir * self.visible_rows.max(1), 0),
-            Command::GridEdge(end) => {
-                if let Some(g) = &mut self.grid {
-                    g.cur_col = if end { g.columns.len().saturating_sub(1) } else { 0 };
+            Command::ToggleSplit => self.toggle_split(),
+            // Grid commands land on whichever pane has focus; master
+            // movement re-links the detail pane inside grid_move itself.
+            Command::GridMove { dr, dc } => {
+                if self.focus == Focus::Detail {
+                    self.detail_move(dr, dc);
+                } else {
+                    self.grid_move(dr, dc);
                 }
-                self.grid_move(0, 0);
             }
-            Command::GridTop => self.grid_jump(0),
+            Command::GridPage(dir) => {
+                let step = dir * self.visible_rows.max(1);
+                if self.focus == Focus::Detail {
+                    self.detail_move(step, 0);
+                } else {
+                    self.grid_move(step, 0);
+                }
+            }
+            Command::GridEdge(end) => {
+                if self.focus == Focus::Detail {
+                    if let Some(state) = &mut self.detail {
+                        let g = &mut state.grid;
+                        g.cur_col = if end { g.columns.len().saturating_sub(1) } else { 0 };
+                    }
+                    self.detail_move(0, 0);
+                } else {
+                    if let Some(g) = &mut self.grid {
+                        g.cur_col = if end { g.columns.len().saturating_sub(1) } else { 0 };
+                    }
+                    self.grid_move(0, 0);
+                }
+            }
+            Command::GridTop => {
+                if self.focus == Focus::Detail {
+                    self.detail_jump(0);
+                } else {
+                    self.grid_jump(0);
+                }
+            }
             Command::GridBottom => {
-                let total = self.grid.as_ref().map_or(0, |g| g.total);
-                self.grid_jump(total.saturating_sub(1));
+                if self.focus == Focus::Detail {
+                    let total = self.detail.as_ref().map_or(0, |d| d.grid.total);
+                    self.detail_jump(total.saturating_sub(1));
+                } else {
+                    let total = self.grid.as_ref().map_or(0, |g| g.total);
+                    self.grid_jump(total.saturating_sub(1));
+                }
             }
             Command::OpenEdit => self.open_edit(),
             Command::EditMove(d) => {
@@ -1468,7 +1608,8 @@ impl App {
                         Focus::Sidebar
                     }
                 }
-                Focus::Grid => self.focus = Focus::Sidebar,
+                Focus::Detail => self.close_detail(), // Esc: pane first…
+                Focus::Grid => self.focus = Focus::Sidebar, // …then sidebar
                 Focus::Sidebar => match self.app_home.clone() {
                     // App mode: the top level IS the application menu.
                     Some(home) => self.open_app_menu(Some(home)),
@@ -2575,6 +2716,263 @@ impl App {
         }
     }
 
+    // ── split BROWSE: SET RELATION on one screen ─────────────────────
+
+    /// 'v' in BROWSE: open/cycle/close the detail pane. The pane shows
+    /// the child rows of the master cursor's record (declared FKs only,
+    /// same discovery as the EDIT link panes). Needs a wide terminal —
+    /// narrow screens keep the single-pane layout they're good at.
+    fn toggle_split(&mut self) {
+        if self.detail.is_some() {
+            // Already open: advance to the next related child, or close
+            // after the last one.
+            let parent = match &self.grid {
+                Some(g) => match &g.source {
+                    GridSource::Table { name, .. } => name.clone(),
+                    _ => return,
+                },
+                None => return,
+            };
+            let links = self.cached_links(&parent);
+            if links.len() > 1 {
+                let current = self.detail.as_ref().and_then(|d| match &d.grid.source {
+                    GridSource::Detail { child, child_col, .. } => {
+                        Some((child.clone(), child_col.clone()))
+                    }
+                    _ => None,
+                });
+                let pos = links.iter().position(|l| {
+                    current.as_ref().is_some_and(|(c, k)| c == &l.0 && k == &l.1)
+                });
+                if let Some(next) = pos.and_then(|i| links.get(i + 1)) {
+                    let (child, col, pcol) = next.clone();
+                    self.open_detail(child, col, pcol);
+                    return;
+                }
+            }
+            self.close_detail();
+            return;
+        }
+        // Opening: the layout needs room for two grids side by side
+        // (visible_cols_width is the master panel's inner width).
+        if self.visible_cols_width < 74 {
+            return self.say("split view needs a wider terminal (100+ cols)");
+        }
+        let parent = match &self.grid {
+            Some(g) => match &g.source {
+                GridSource::Table { name, .. } => name.clone(),
+                _ => return self.say("split works on a table BROWSE"),
+            },
+            None => return self.say("open a table first (Enter in the sidebar)"),
+        };
+        let links = self.cached_links(&parent);
+        match links.first() {
+            Some((child, col, pcol)) => {
+                let (c, k, p) = (child.clone(), col.clone(), pcol.clone());
+                self.open_detail(c, k, p);
+            }
+            None => self.say(format!(
+                "{parent} has no related tables (declared foreign keys)"
+            )),
+        }
+    }
+
+    /// (Re)target the detail pane at (child, child_col) for the current
+    /// master record. Installs a placeholder immediately; rows fly in
+    /// async and swap when they match the still-current key.
+    fn open_detail(&mut self, child: String, child_col: String, parent_col: String) {
+        let Some(key_sql) = self.master_key_sql(&parent_col) else {
+            return self.say("this record has no key to relate on");
+        };
+        let parent = match &self.grid {
+            Some(g) => match &g.source {
+                GridSource::Table { name, .. } => name.clone(),
+                _ => return,
+            },
+            None => return,
+        };
+        let grid = Grid {
+            source: GridSource::Detail {
+                parent: parent.clone(),
+                child: child.clone(),
+                child_col: child_col.clone(),
+                key_sql: key_sql.clone(),
+            },
+            columns: Vec::new(),
+            total: 0,
+            cache: Vec::new(),
+            cache_start: 0,
+            rowids: None,
+            cur_row: 0,
+            cur_col: 0,
+            row_off: 0,
+            col_off: 0,
+            widths: Vec::new(),
+        };
+        self.detail = Some(DetailState {
+            grid,
+            parent_col,
+            visible_rows: 12,
+        });
+        self.submit_detail(&child, &child_col, &key_sql);
+    }
+
+    fn close_detail(&mut self) {
+        self.detail = None;
+        self.pending_detail = None;
+        if self.focus == Focus::Detail {
+            self.focus = Focus::Grid;
+        }
+    }
+
+    /// The master cursor's key for `parent_col` as a SQL literal —
+    /// same resolution as the EDIT link panes (named column, else pk,
+    /// else rowid).
+    fn master_key_sql(&self, parent_col: &str) -> Option<String> {
+        let g = self.grid.as_ref()?;
+        let table = match &g.source {
+            GridSource::Table { name, .. } => name.as_str(),
+            _ => return None,
+        };
+        let idx = g.cur_row.checked_sub(g.cache_start)? as usize;
+        let row = g.cache.get(idx)?;
+        // Named FK column first (ASCII-case-insensitive, like the
+        // link panes).
+        if !parent_col.is_empty() {
+            let cols = self.columns_cache.get(table)?;
+            if let Some((i, _)) = cols
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.name.eq_ignore_ascii_case(parent_col))
+            {
+                return match row.get(i)? {
+                    PValue::Null => None,
+                    PValue::Int(i) => Some(i.to_string()),
+                    PValue::Real(r) => Some(r.to_string()),
+                    v => Some(format!("'{}'", v.render().replace('\'', "''"))),
+                };
+            }
+        }
+        // pk fallback (an INTEGER PRIMARY KEY *is* the rowid), then rowid.
+        let pk_is_first = self
+            .columns_cache
+            .get(table)
+            .and_then(|cols| cols.first())
+            .is_some_and(|c| c.pk);
+        match (pk_is_first, row.first(), g.rowids.as_ref().and_then(|r| r.get(idx))) {
+            (true, Some(PValue::Int(id)), _) => Some(id.to_string()),
+            (_, _, Some(id)) => Some(id.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Submit the detail fetch: filtered count + rows in ONE worker job.
+    /// Latest-wins via pending_detail; a stale arrival (master moved on)
+    /// is dropped by the finish arm.
+    fn submit_detail(&mut self, child: &str, child_col: &str, key_sql: &str) {
+        let (child, child_col, key_sql) =
+            (child.to_owned(), child_col.to_owned(), key_sql.to_owned());
+        let limit = 2001; // bounded fetch; count reports the real total
+        let want_key = key_sql.to_owned();
+        match self.db.submit(Box::new(move |db| {
+            let where_clause = format!("\"{}\" = {}", child_col.replace('"', "\"\""), key_sql);
+            let order = if db.has_rowid(&child) { " ORDER BY rowid" } else { "" };
+            let q = db.query(&format!(
+                "SELECT * FROM \"{}\" WHERE {}{} LIMIT {}",
+                child.replace('"', "\"\""),
+                where_clause,
+                order,
+                limit
+            ));
+            let total = db.query(&format!(
+                "SELECT count(*) FROM \"{}\" WHERE {}",
+                child.replace('"', "\"\""),
+                where_clause
+            ));
+            DbResponse::Detail(match (q, total) {
+                (Ok(q), Ok(t)) => Ok(crate::worker::DetailData {
+                    columns: q.columns,
+                    rows: q.rows,
+                    total: t.rows.first().and_then(|r| r.first()).map_or(0, |v| match v {
+                        PValue::Int(n) => *n,
+                        _ => 0,
+                    }),
+                }),
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            })
+        })) {
+            Some(tag) => {
+                self.pending.insert(
+                    tag,
+                    PendingOp::Detail {
+                        want_key: want_key.clone(),
+                        at: std::time::Instant::now(),
+                    },
+                );
+                self.pending_detail = Some((tag, want_key));
+            }
+            None => self.err("database worker is gone"),
+        }
+    }
+
+    /// Master cursor moved (or values changed): re-link the detail pane.
+    fn refresh_detail(&mut self) {
+        let Some(state) = &self.detail else { return };
+        let (child, child_col, key_sql) = match &state.grid.source {
+            GridSource::Detail {
+                child, child_col, key_sql, ..
+            } => (child.clone(), child_col.clone(), key_sql.clone()),
+            _ => return,
+        };
+        let Some(new_key) = self.master_key_sql(&state.parent_col) else {
+            return; // unkeyed record: pane keeps its last picture
+        };
+        if key_sql == new_key {
+            return; // same record, nothing to re-link
+        }
+        let state = self.detail.as_mut().unwrap();
+        if let GridSource::Detail { key_sql, .. } = &mut state.grid.source {
+            *key_sql = new_key.clone();
+        }
+        self.submit_detail(&child, &child_col, &new_key);
+    }
+
+    /// Detail-pane local navigation (its own grid, no cascade).
+    fn detail_move(&mut self, dr: i64, dc: i64) {
+        let visible = self
+            .detail
+            .as_ref()
+            .map(|d| d.visible_rows.max(1))
+            .unwrap_or(1);
+        let Some(state) = &mut self.detail else { return };
+        let g = &mut state.grid;
+        if g.total == 0 {
+            return;
+        }
+        g.cur_row = (g.cur_row + dr).clamp(0, g.total - 1);
+        g.cur_col = (g.cur_col as i64 + dc).clamp(0, g.columns.len() as i64 - 1) as usize;
+        if g.cur_row < g.row_off {
+            g.row_off = g.cur_row;
+        }
+        if g.cur_row >= g.row_off + visible {
+            g.row_off = g.cur_row - visible + 1;
+        }
+        while g.col_off < g.cur_col {
+            let used: u16 = g.widths[g.col_off..=g.cur_col].iter().map(|w| w + 1).sum();
+            if used <= self.visible_cols_width / 2 {
+                break;
+            }
+            g.col_off += 1;
+        }
+    }
+
+    fn detail_jump(&mut self, row: i64) {
+        if let Some(state) = &mut self.detail {
+            state.grid.cur_row = row.clamp(0, state.grid.total.saturating_sub(1).max(0));
+        }
+        self.detail_move(0, 0);
+    }
+
     fn open_table(&mut self, name: &str) {
         // Async: columns + rowid-ness + first window + total bundle into
         // ONE worker job (one round-trip, cold or warm). The previous
@@ -2642,6 +3040,10 @@ impl App {
             g.col_off += 1;
         }
         self.ensure_cache();
+        // Cursor-linked detail: every master movement re-points the
+        // split pane (single choke point — commands, find, refill and
+        // the insert flip all funnel through here).
+        self.refresh_detail();
     }
 
     /// Virtualization: keep [row_off-OVERSCAN, row_off+visible+OVERSCAN)
@@ -3220,7 +3622,7 @@ impl App {
         let (start, total) = (g.cur_row + 1, g.total);
         let table = match &g.source {
             GridSource::Table { name, .. } => Some(name.clone()),
-            GridSource::Query { .. } => None,
+            GridSource::Query { .. } | GridSource::Detail { .. } => None,
         };
         self.last_find = Some(needle.to_owned());
         let Some(table) = table else {
@@ -4043,6 +4445,108 @@ mod tests {
             g.cur_row
         );
         assert_eq!(g.total, 500);
+    }
+
+    /// 'v' opens the detail pane linked to the master cursor: Ada's
+    /// orders on screen; moving to Grace re-links (the whole point).
+    #[test]
+    fn split_browse_links_master_to_detail() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY, product TEXT,
+                                 customer_id INTEGER REFERENCES customers(id));
+             INSERT INTO customers(name) VALUES ('Ada'), ('Grace');
+             INSERT INTO orders(product, customer_id)
+               VALUES ('modem', 1), ('coax', 1), ('router', 2);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected); // customers first
+        a.sync();
+        a.visible_cols_width = 120; // wide enough to split
+        a.apply(Command::ToggleSplit);
+        a.sync();
+        let d = a.detail.as_ref().expect("detail pane opened");
+        let GridSource::Detail { child, key_sql, .. } = &d.grid.source else {
+            panic!("detail source");
+        };
+        assert_eq!(child, "orders");
+        assert_eq!(key_sql, "1", "filtered to Ada (rowid 1)");
+        assert_eq!(d.grid.total, 2, "Ada's two orders");
+        // Cursor down to Grace: the pane re-links automatically.
+        a.apply(Command::GridMove { dr: 1, dc: 0 });
+        a.sync();
+        let d = a.detail.as_ref().unwrap();
+        let GridSource::Detail { key_sql, .. } = &d.grid.source else {
+            panic!("detail source");
+        };
+        assert_eq!(key_sql, "2", "re-linked to Grace");
+        assert_eq!(d.grid.total, 1);
+        assert_eq!(d.grid.cache[0][1], PValue::Text("router".into()));
+    }
+
+    /// 'v' closes an open pane (single link); on a narrow terminal it
+    /// refuses politely instead of squeezing two grids into 80 cols.
+    #[test]
+    fn split_toggles_closed_and_refuses_narrow() {
+        let mut a = app(); // t(a,b): no FKs at all
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.visible_cols_width = 120;
+        a.apply(Command::ToggleSplit);
+        assert!(a.detail.is_none(), "no declared FKs: nothing to show");
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("no related")));
+
+        // FK fixture, but narrow: refuses with a hint.
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id));
+             INSERT INTO customers VALUES (1, 'Ada');",
+        )
+        .unwrap();
+        let mut b = App::new(Box::new(db), None);
+        b.apply(Command::OpenSelected);
+        b.sync();
+        b.visible_cols_width = 70;
+        b.apply(Command::ToggleSplit);
+        assert!(b.detail.is_none());
+        assert!(b.status.as_ref().is_some_and(|(m, _)| m.contains("wider")));
+        // Widen: now it opens, and 'v' again closes it.
+        b.visible_cols_width = 120;
+        b.apply(Command::ToggleSplit);
+        b.sync();
+        assert!(b.detail.is_some());
+        b.apply(Command::ToggleSplit);
+        assert!(b.detail.is_none());
+        assert_eq!(b.focus, Focus::Grid);
+    }
+
+    /// Esc while the detail pane has focus closes the pane, not the grid.
+    #[test]
+    fn back_from_detail_pane_keeps_grid() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id));
+             INSERT INTO customers VALUES (1, 'Ada');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.visible_cols_width = 120;
+        a.apply(Command::ToggleSplit);
+        a.sync();
+        a.apply(Command::Focus(Focus::Detail));
+        a.apply(Command::Back);
+        assert!(a.detail.is_none(), "pane closed");
+        assert!(a.grid.is_some(), "master stays");
+        assert_eq!(a.focus, Focus::Grid);
     }
 
     #[test]

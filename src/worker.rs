@@ -48,6 +48,8 @@ pub enum DbResponse {
     Opened(DbResult<OpenedGrid>),
     /// Bundled health console: base + report + sparks + dot in one job.
     HealthConsole(DbResult<HealthData>),
+    /// Split-view detail pane: filtered child rows + total in one job.
+    Detail(DbResult<DetailData>),
 }
 
 /// Everything open_table needs to build a Grid, from one worker job.
@@ -66,6 +68,15 @@ pub struct HealthData {
     pub report: Vec<[String; 4]>,
     pub sparks: Vec<(String, Vec<f64>, String)>,
     pub health: Option<String>,
+}
+
+/// Split-view detail pane: the child rows of one parent record plus
+/// the filtered total (count runs in the same job = one round-trip).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetailData {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<PValue>>,
+    pub total: i64,
 }
 
 impl DbResponse {
