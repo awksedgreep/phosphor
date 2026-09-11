@@ -163,26 +163,34 @@ pub struct DbHandle {
     backend: &'static str,
     display: String,
     tx: mpsc::Sender<Job>,
-    rx: mpsc::Receiver<(Token, DbResponse)>,
+    rx: mpsc::Receiver<(Token, std::time::Duration, DbResponse)>,
     /// Responses that arrived while a blocking call waited for its own
     /// tag (only matters once async submits exist).
-    buffer: RefCell<Vec<(Token, DbResponse)>>,
+    buffer: RefCell<Vec<(Token, std::time::Duration, DbResponse)>>,
     next: Cell<Token>,
 }
+
+
 
 /// Spawn the worker owning `link`; returns the UI-side handle.
 pub fn spawn(link: Box<dyn DbLink>) -> DbHandle {
     let backend = link.backend();
     let display = link.name().to_owned();
     let (job_tx, job_rx) = mpsc::channel::<Job>();
-    let (res_tx, res_rx) = mpsc::channel::<(Token, DbResponse)>();
+    let (res_tx, res_rx) = mpsc::channel::<(Token, std::time::Duration, DbResponse)>();
     std::thread::Builder::new()
         .name("phosphor-db".into())
         .spawn(move || {
             for job in job_rx {
                 let mut work = job.work;
+                let t0 = std::time::Instant::now();
                 let resp = work(&*link);
-                if res_tx.send((job.tag, resp)).is_err() {
+                // The WORK duration, measured on the worker thread.
+                // (Measuring submit-to-arrival on the UI side would
+                // include poll idle time — the "everything takes
+                // 250ms" bug.)
+                let took = t0.elapsed();
+                if res_tx.send((job.tag, took, resp)).is_err() {
                     break; // UI gone; exit
                 }
             }
@@ -225,16 +233,16 @@ impl DbHandle {
                 .buffer
                 .borrow()
                 .iter()
-                .position(|(t, _)| *t == tag);
+                .position(|(t, _, _)| *t == tag);
             if let Some(i) = hit {
-                return self.buffer.borrow_mut().remove(i).1;
+                return self.buffer.borrow_mut().remove(i).2;
             }
             match self.rx.recv() {
-                Ok((t, r)) => {
+                Ok((t, _, r)) => {
                     if t == tag {
                         return r;
                     }
-                    self.buffer.borrow_mut().push((t, r));
+                    self.buffer.borrow_mut().push((t, std::time::Duration::ZERO, r));
                 }
                 Err(_) => return DbResponse::Gone,
             }
@@ -252,7 +260,7 @@ impl DbHandle {
 
     /// Drain all arrived async responses (plus anything buffered).
     #[allow(dead_code)] // slice 1 is blocking-parity; async slices use this
-    pub fn poll(&self) -> Vec<(Token, DbResponse)> {
+    pub fn poll(&self) -> Vec<(Token, std::time::Duration, DbResponse)> {
         while let Ok(msg) = self.rx.try_recv() {
             self.buffer.borrow_mut().push(msg);
         }

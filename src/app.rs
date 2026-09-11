@@ -294,7 +294,11 @@ pub enum Command {
     GridScroll(i64),
     /// A worker response arrived (main loop polls, tests pump): the
     /// token routes it to its pending continuation in finish_db().
-    DbReady(crate::worker::Token, crate::worker::DbResponse),
+    DbReady(
+        crate::worker::Token,
+        std::time::Duration,
+        crate::worker::DbResponse,
+    ),
 }
 
 /// An outstanding async worker job and what to do with its answer.
@@ -302,13 +306,13 @@ pub enum Command {
 /// order and converge on the latest state without generation guards.
 enum PendingOp {
     /// Table open: build + swap in a fresh grid on arrival.
-    Open { name: String, seq: u64, at: std::time::Instant },
+    Open { name: String, seq: u64 },
     /// Ad-hoc SELECT: build a query grid on arrival.
-    Select { seq: u64, at: std::time::Instant },
+    Select { seq: u64 },
     /// Refresh: total + window into the live grid, then re-seek.
-    Refill { name: String, row: i64, col: usize, want_start: i64, at: std::time::Instant },
+    Refill { name: String, row: i64, col: usize, want_start: i64 },
     /// Scroll window: installs into the live grid when still wanted.
-    Page { table: String, want_start: i64, at: std::time::Instant },
+    Page { table: String, want_start: i64 },
     /// Find scan: one table window per response; hits jump, misses
     /// chain the next window until the cap. Superseded scans die by seq.
     Find {
@@ -328,15 +332,11 @@ enum PendingOp {
     Health {
         sampled: bool,
         seq: u64,
-        at: std::time::Instant,
         overlay: std::mem::Discriminant<Overlay>,
     },
     /// Detail-pane rows for a split BROWSE, keyed by the parent key
     /// they were fetched for (stale arrivals drop).
-    Detail {
-        want_key: String,
-        at: std::time::Instant,
-    },
+    Detail { want_key: String },
 }
 
 pub struct App {
@@ -486,8 +486,8 @@ impl App {
     /// iteration (unarrived responses apply on a later tick). Tests
     /// needing determinism use sync() instead.
     pub fn pump(&mut self) {
-        for (tag, resp) in self.db.poll() {
-            self.apply(Command::DbReady(tag, resp));
+        for (tag, took, resp) in self.db.poll() {
+            self.apply(Command::DbReady(tag, took, resp));
         }
     }
 
@@ -512,7 +512,12 @@ impl App {
     /// Route an arrived worker response to its pending continuation.
     /// Unknown tags are ignored (already handled — each tag resolves
     /// exactly once and is removed here).
-    fn finish_db(&mut self, tag: crate::worker::Token, resp: DbResponse) {
+    fn finish_db(
+        &mut self,
+        tag: crate::worker::Token,
+        took: std::time::Duration,
+        resp: DbResponse,
+    ) {
         if matches!(resp, DbResponse::Gone) {
             self.pending.remove(&tag);
             self.err("database worker is gone");
@@ -522,7 +527,7 @@ impl App {
             return;
         };
         match (op, resp) {
-            (PendingOp::Open { name, seq, at }, DbResponse::Opened(r)) => match r {
+            (PendingOp::Open { name, seq }, DbResponse::Opened(r)) => match r {
                 Ok(g) => {
                     // Refresh the schema caches the job already paid for.
                     self.columns_cache.insert(name.clone(), g.columns.clone());
@@ -547,7 +552,7 @@ impl App {
                     self.focus = Focus::Grid;
                     self.pending_edit = None; // new table: parked rows are void
                     self.close_detail(); // the old pane links a different table
-                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.last_ms = Some(took.as_secs_f64() * 1000.0);
                     self.refresh_health();
                     // Clear only our own (silent) open — a newer message wins.
                     if self.status_seq == seq {
@@ -556,7 +561,7 @@ impl App {
                 }
                 Err(e) => self.err(e),
             },
-            (PendingOp::Select { seq, at }, DbResponse::Query(r)) => match r {
+            (PendingOp::Select { seq }, DbResponse::Query(r)) => match r {
                 Ok(q) => {
                     let n = q.rows.len();
                     let truncated = q.truncated;
@@ -578,7 +583,7 @@ impl App {
                     self.focus = Focus::Grid;
                     self.pending_edit = None; // new result: parked rows are void
                     self.close_detail(); // query results have no child links
-                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.last_ms = Some(took.as_secs_f64() * 1000.0);
                     if self.status_seq == seq {
                         self.say(if truncated {
                             format!("{n} rows (capped) — add a WHERE or LIMIT")
@@ -595,7 +600,6 @@ impl App {
                     row,
                     col,
                     want_start,
-                    at,
                 },
                 DbResponse::Window(r),
             ) => match r {
@@ -614,18 +618,14 @@ impl App {
                         g.cache_start = want_start;
                         g.cur_col = col.min(g.columns.len().saturating_sub(1));
                     }
-                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.last_ms = Some(took.as_secs_f64() * 1000.0);
                     self.grid_jump(row);
                     self.try_pending_edit();
                 }
                 Err(e) => self.err(e),
             },
             (
-                PendingOp::Page {
-                    table,
-                    want_start,
-                    at,
-                },
+                PendingOp::Page { table, want_start },
                 DbResponse::Page(r),
             ) => match r {
                 Ok(page) => {
@@ -649,7 +649,7 @@ impl App {
                             g.compute_widths();
                         }
                     }
-                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.last_ms = Some(took.as_secs_f64() * 1000.0);
                     self.try_pending_edit();
                 }
                 Err(e) => self.err(e),
@@ -722,12 +722,7 @@ impl App {
                 Err(e) => self.err(e),
             },
             (
-                PendingOp::Health {
-                    sampled,
-                    seq,
-                    at,
-                    overlay,
-                },
+                PendingOp::Health { sampled, seq, overlay },
                 DbResponse::HealthConsole(r),
             ) => match r {
                 Ok(h) => {
@@ -738,7 +733,7 @@ impl App {
                     self.health_cache =
                         Some((h.health, std::time::Instant::now()));
                     self.last_auto_sample = std::time::Instant::now();
-                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.last_ms = Some(took.as_secs_f64() * 1000.0);
                     self.overlay = Overlay::Health(HealthView {
                         table: h.base,
                         report: h.report,
@@ -751,7 +746,7 @@ impl App {
                 Err(e) => self.err(e),
             },
             (
-                PendingOp::Detail { want_key, at },
+                PendingOp::Detail { want_key },
                 DbResponse::Detail(r),
             ) => match r {
                 Ok(d) => {
@@ -785,7 +780,7 @@ impl App {
                     g.cur_row = g.cur_row.clamp(0, g.total.saturating_sub(1).max(0));
                     g.row_off = g.row_off.min(g.cur_row);
                     g.compute_widths();
-                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.last_ms = Some(took.as_secs_f64() * 1000.0);
                 }
                 Err(e) => self.err(e),
             },
@@ -1561,7 +1556,7 @@ impl App {
             Command::EditPage(d) => self.edit_page(d),
             Command::DeleteRow => self.delete_row(),
             Command::FindNext => self.find_next(),
-            Command::DbReady(tag, resp) => self.finish_db(tag, resp),
+            Command::DbReady(tag, took, resp) => self.finish_db(tag, took, resp),
             Command::PromptClear => {
                 self.prompt.input.clear();
                 self.prompt.cursor = 0;
@@ -1707,23 +1702,14 @@ impl App {
             None => None,
         };
         if let Some((name, row, col, want_start, limit)) = target {
-            let at = std::time::Instant::now();
             let job_name = name.clone();
             let submitted = self.db.submit(Box::new(move |db| {
                 DbResponse::Window(db.open_window(&job_name, want_start, limit))
             }));
             match submitted {
                 Some(tag) => {
-                    self.pending.insert(
-                        tag,
-                        PendingOp::Refill {
-                            name,
-                            row,
-                            col,
-                            want_start,
-                            at,
-                        },
-                    );
+                    self.pending
+                        .insert(tag, PendingOp::Refill { name, row, col, want_start });
                 }
                 None => self.err("database worker is gone"),
             }
@@ -1941,7 +1927,6 @@ impl App {
         // one job; the current screen stays put until the console does.
         // The overlay discriminant guards stale installs (user moved on).
         let seq = self.status_seq;
-        let at = std::time::Instant::now();
         let overlay = std::mem::discriminant(&self.overlay);
         match self
             .db
@@ -1955,7 +1940,6 @@ impl App {
                     PendingOp::Health {
                         sampled: false,
                         seq,
-                        at,
                         overlay,
                     },
                 );
@@ -1976,7 +1960,6 @@ impl App {
                 // Async rebuild (same bundle as open); "sampled" lands
                 // with the fresh console so the message never lies.
                 let seq = self.status_seq;
-                let at = std::time::Instant::now();
                 let overlay = std::mem::discriminant(&self.overlay);
                 match self.db.submit(Box::new(move |db| {
                     DbResponse::HealthConsole(Self::fetch_health_console(db))
@@ -1987,7 +1970,6 @@ impl App {
                             PendingOp::Health {
                                 sampled: true,
                                 seq,
-                                at,
                                 overlay,
                             },
                         );
@@ -2841,14 +2823,13 @@ impl App {
         // analytical queries especially). The grid swaps in on arrival;
         // until then the previous screen stays put.
         let seq = self.status_seq;
-        let at = std::time::Instant::now();
         let query = sql.to_owned();
         match self
             .db
             .submit(Box::new(move |db| DbResponse::Query(db.query(&query))))
         {
             Some(tag) => {
-                self.pending.insert(tag, PendingOp::Select { seq, at });
+                self.pending.insert(tag, PendingOp::Select { seq });
             }
             None => self.err("database worker is gone"),
         }
@@ -3083,7 +3064,6 @@ impl App {
                     tag,
                     PendingOp::Detail {
                         want_key: want_key.clone(),
-                        at: std::time::Instant::now(),
                     },
                 );
                 self.pending_detail = Some((tag, want_key));
@@ -3219,7 +3199,6 @@ impl App {
         let table = name.to_owned();
         let limit = self.visible_rows + OVERSCAN;
         let seq = self.status_seq;
-        let at = std::time::Instant::now();
         let submitted = self.db.submit(Box::new(move |db| {
             let res = (|| -> DbResult<crate::worker::OpenedGrid> {
                 let columns = db.columns(&table)?;
@@ -3236,7 +3215,7 @@ impl App {
         }));
         match submitted {
             Some(tag) => {
-                self.pending.insert(tag, PendingOp::Open { name: name.to_owned(), seq, at });
+                self.pending.insert(tag, PendingOp::Open { name: name.to_owned(), seq });
             }
             None => self.err("database worker is gone"),
         }
@@ -3309,7 +3288,6 @@ impl App {
                 return; // already flying; its arrival installs it
             }
         }
-        let at = std::time::Instant::now();
         let job_name = name.clone();
         match self.db.submit(Box::new(move |db| {
             DbResponse::Page(db.page(&job_name, want_start, limit))
@@ -3317,11 +3295,7 @@ impl App {
             Some(tag) => {
                 self.pending.insert(
                     tag,
-                    PendingOp::Page {
-                        table: name.clone(),
-                        want_start,
-                        at,
-                    },
+                    PendingOp::Page { table: name.clone(), want_start },
                 );
                 self.pending_page = Some((tag, name, want_start));
             }
@@ -3342,7 +3316,6 @@ impl App {
         let want_end = (g.row_off + visible + OVERSCAN).min(g.total);
         let name = name.clone();
         let limit = (want_end - want_start).max(1);
-        let at = std::time::Instant::now();
         let job_name = name.clone();
         match self.db.submit(Box::new(move |db| {
             DbResponse::Page(db.page(&job_name, want_start, limit))
@@ -3350,11 +3323,7 @@ impl App {
             Some(tag) => {
                 self.pending.insert(
                     tag,
-                    PendingOp::Page {
-                        table: name.clone(),
-                        want_start,
-                        at,
-                    },
+                    PendingOp::Page { table: name.clone(), want_start },
                 );
                 self.pending_page = Some((tag, name, want_start));
             }
@@ -5037,6 +5006,7 @@ mod tests {
         let before = a.status.clone();
         a.apply(Command::DbReady(
             999_999,
+            std::time::Duration::ZERO,
             crate::worker::DbResponse::Query(Err("stale".into())),
         ));
         assert_eq!(a.status, before);
