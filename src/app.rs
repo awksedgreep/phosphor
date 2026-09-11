@@ -55,6 +55,7 @@ pub struct HealthView {
 
 /// A related-child pane under the EDIT form: the SET RELATION of
 /// 1988, discovered from declared foreign keys.
+#[derive(Clone)]
 pub struct LinkPane {
     pub child: String,
     pub child_col: String,
@@ -280,6 +281,10 @@ pub struct App {
     columns_cache: HashMap<String, Vec<ColumnInfo>>,
     form_cache: HashMap<String, Option<FormSpec>>,
     links_cache: HashMap<String, Vec<(String, String, String)>>,
+    /// Pane previews keyed by (child, child_col, key_sql): flipping
+    /// back across records reuses them instead of re-querying.
+    /// Cleared on writes (counts/previews may change) and capped.
+    pane_cache: HashMap<(String, String, String), LinkPane>,
 }
 
 impl App {
@@ -316,6 +321,7 @@ impl App {
             columns_cache: HashMap::new(),
             form_cache: HashMap::new(),
             links_cache: HashMap::new(),
+            pane_cache: HashMap::new(),
         };
         app.reload_tables();
         app.health = app.db.health();
@@ -383,10 +389,11 @@ impl App {
             Err(e) => self.err(e),
         }
         // Schema may have changed: drop per-table caches (columns,
-        // saved forms, FK links). Record flips re-fill them lazily.
+        // saved forms, FK links, pane previews). Flips re-fill lazily.
         self.columns_cache.clear();
         self.form_cache.clear();
         self.links_cache.clear();
+        self.pane_cache.clear();
     }
 
     /// Cached schema introspection for the EDIT hot path: one DB hit
@@ -2311,8 +2318,6 @@ impl App {
         fields: &[(ColumnInfo, PValue)],
         rowid: i64,
     ) -> Vec<LinkPane> {
-        const PREVIEW_ROWS: usize = 4;
-        const PREVIEW_COLS: usize = 4;
         let mut out = Vec::new();
         // Column index once (was a linear find per pane per flip).
         let by_name: HashMap<&str, &PValue> = fields
@@ -2341,44 +2346,105 @@ impl App {
                 PValue::Real(r) => r.to_string(),
                 v => format!("'{}'", v.render().replace('\'', "''")),
             };
-            let qchild = child.replace('"', "\"\"");
-            let qcol = child_col.replace('"', "\"\"");
-            let total = self
-                .db
-                .query(&format!(
-                    "SELECT count(*) FROM \"{qchild}\" WHERE \"{qcol}\" = {key_sql}"
-                ))
-                .ok()
-                .and_then(|q| match q.rows.first().and_then(|r| r.first()) {
-                    Some(PValue::Int(n)) => Some(*n),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            let Ok(q) = self.db.query(&format!(
-                "SELECT * FROM \"{qchild}\" WHERE \"{qcol}\" = {key_sql} LIMIT {PREVIEW_ROWS}"
-            )) else {
+            // Revisited keys reuse the cached pane (no queries at all).
+            let cache_key = (child.clone(), child_col.clone(), key_sql.clone());
+            if let Some(pane) = self.pane_cache.get(&cache_key) {
+                out.push(pane.clone());
+                continue;
+            }
+            let Some(pane) = self.fetch_pane(&child, &child_col, &key_sql) else {
                 continue;
             };
-            // Preview the first few NON-key columns — the fk value is
-            // already on the parent form; show what's interesting.
-            let keep: Vec<usize> = (0..q.columns.len())
-                .filter(|&i| !q.columns[i].eq_ignore_ascii_case(&child_col))
-                .take(PREVIEW_COLS)
-                .collect();
-            out.push(LinkPane {
-                header: keep.iter().map(|&i| q.columns[i].clone()).collect(),
-                rows: q
-                    .rows
-                    .iter()
-                    .map(|r| keep.iter().map(|&i| r[i].render()).collect())
-                    .collect(),
-                total,
-                key_sql,
-                child,
-                child_col,
-            });
+            // Cap the cache: a cross-country flight over millions of
+            // rows must not pin millions of previews.
+            if self.pane_cache.len() >= 512 {
+                self.pane_cache.clear();
+            }
+            self.pane_cache.insert(cache_key, pane.clone());
+            out.push(pane);
         }
         out
+    }
+
+    /// One pane's preview + total in a SINGLE query: count(*) OVER ()
+    /// rides along with the LIMITed preview rows (was count(*) + SELECT
+    /// = 2 round-trips per pane per flip). Falls back to the two-query
+    /// form on engines without window functions.
+    fn fetch_pane(&self, child: &str, child_col: &str, key_sql: &str) -> Option<LinkPane> {
+        const PREVIEW_ROWS: usize = 4;
+        const PREVIEW_COLS: usize = 4;
+        let qchild = child.replace('"', "\"\"");
+        let qcol = child_col.replace('"', "\"\"");
+        if let Ok(q) = self.db.query(&format!(
+            "SELECT *, count(*) OVER () AS _pane_total FROM \"{qchild}\" \
+             WHERE \"{qcol}\" = {key_sql} LIMIT {PREVIEW_ROWS}"
+        )) {
+            // Our appended total is the LAST column; strip it back off.
+            if q.columns.last().is_some_and(|c| c == "_pane_total") {
+                let n = q.columns.len() - 1;
+                let total = q
+                    .rows
+                    .first()
+                    .and_then(|r| r.get(n))
+                    .and_then(|v| match v {
+                        PValue::Int(t) => Some(*t),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                // Preview the first few NON-key columns — the fk value is
+                // already on the parent form; show what's interesting.
+                let keep: Vec<usize> = (0..n)
+                    .filter(|&i| !q.columns[i].eq_ignore_ascii_case(child_col))
+                    .take(PREVIEW_COLS)
+                    .collect();
+                return Some(LinkPane {
+                    header: keep.iter().map(|&i| q.columns[i].clone()).collect(),
+                    rows: q
+                        .rows
+                        .iter()
+                        .map(|r| keep.iter().map(|&i| r[i].render()).collect())
+                        .collect(),
+                    total,
+                    key_sql: key_sql.to_owned(),
+                    child: child.to_owned(),
+                    child_col: child_col.to_owned(),
+                });
+            }
+        }
+        // Fallback: count + preview as two queries.
+        let total = self
+            .db
+            .query(&format!(
+                "SELECT count(*) FROM \"{qchild}\" WHERE \"{qcol}\" = {key_sql}"
+            ))
+            .ok()
+            .and_then(|q| match q.rows.first().and_then(|r| r.first()) {
+                Some(PValue::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let q = self
+            .db
+            .query(&format!(
+                "SELECT * FROM \"{qchild}\" WHERE \"{qcol}\" = {key_sql} LIMIT {PREVIEW_ROWS}"
+            ))
+            .ok()?;
+        let keep: Vec<usize> = (0..q.columns.len())
+            .filter(|&i| !q.columns[i].eq_ignore_ascii_case(child_col))
+            .take(PREVIEW_COLS)
+            .collect();
+        Some(LinkPane {
+            header: keep.iter().map(|&i| q.columns[i].clone()).collect(),
+            rows: q
+                .rows
+                .iter()
+                .map(|r| keep.iter().map(|&i| r[i].render()).collect())
+                .collect(),
+            total,
+            key_sql: key_sql.to_owned(),
+            child: child.to_owned(),
+            child_col: child_col.to_owned(),
+        })
     }
 
     /// PgUp/PgDn (or ←→) in EDIT: flip to the previous/next RECORD,
@@ -2514,6 +2580,7 @@ impl App {
             self.pending_delete = None;
             match self.db.delete_row(&table, rowid) {
                 Ok(()) => {
+                    self.pane_cache.clear(); // child counts changed
                     self.refresh_grid_keep_position();
                     self.say("row deleted");
                 }
@@ -2735,6 +2802,8 @@ impl App {
         };
         match result {
             Ok(msg) => {
+                // The write may have changed child counts/previews.
+                self.pane_cache.clear();
                 if inserting {
                     // Total changed: full refresh, then flip the open
                     // form onto the newly inserted record so further
@@ -3478,10 +3547,15 @@ mod tests {
         a.apply(Command::EditPage(1));
         let Overlay::Edit(ed) = &a.overlay else { panic!() };
         assert_eq!(ed.links[0].total, 1, "Grace has one order");
+        // Back to Ada: the pane comes from the per-key cache, same picture.
+        a.apply(Command::EditPage(-1));
+        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        assert_eq!(ed.links[0].total, 2, "Ada again, cached");
+        assert!(ed.links[0].rows.iter().any(|r| r.contains(&"modem".into())));
         // F4 jumps into a filtered BROWSE of the children.
         a.apply(Command::EditOpenLink(0));
         let g = a.grid.as_ref().expect("filtered child browse");
-        assert_eq!(g.total, 1, "only Grace's orders");
+        assert_eq!(g.total, 2, "only Ada's orders");
         // FKs are ENFORCED on the embedded backend now.
         let bad = a.db.execute("INSERT INTO orders(product, customer_id) VALUES ('x', 99)");
         assert!(bad.is_err(), "orphan insert must be rejected");
