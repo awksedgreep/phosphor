@@ -254,6 +254,17 @@ enum PendingOp {
     Select { seq: u64, at: std::time::Instant },
     /// Refresh: total + window into the live grid, then re-seek.
     Refill { name: String, row: i64, col: usize, want_start: i64, at: std::time::Instant },
+    /// Find scan: one table window per response; hits jump, misses
+    /// chain the next window until the cap. Superseded scans die by seq.
+    Find {
+        table: String,
+        needle: String,
+        needle_lc: String,
+        needle_has_alpha: bool,
+        offset: i64,
+        end: i64,
+        seq: u64,
+    },
 }
 
 pub struct App {
@@ -315,6 +326,8 @@ pub struct App {
     pane_cache: HashMap<(String, String, String), LinkPane>,
     /// Outstanding async worker jobs by token (finish_db routes answers).
     pending: HashMap<crate::worker::Token, PendingOp>,
+    /// Find-scan generation: a new find supersedes older chains.
+    find_seq: u64,
     /// Status epoch: async completions only touch the status line when
     /// no newer message has landed since they were submitted.
     status_seq: u64,
@@ -360,6 +373,7 @@ impl App {
             links_cache: HashMap::new(),
             pane_cache: HashMap::new(),
             pending: HashMap::new(),
+            find_seq: 0,
             status_seq: 0,
         };
         app.reload_tables();
@@ -511,6 +525,67 @@ impl App {
                 }
                 Err(e) => self.err(e),
             },
+            (
+                PendingOp::Find {
+                    table,
+                    needle,
+                    needle_lc,
+                    needle_has_alpha,
+                    offset,
+                    end,
+                    seq,
+                },
+                DbResponse::Page(r),
+            ) => match r {
+                Ok(page) => {
+                    if seq != self.find_seq {
+                        return; // superseded by a newer find; chain dies
+                    }
+                    let current = matches!(
+                        &self.grid,
+                        Some(g) if matches!(&g.source, GridSource::Table { name: n, .. } if n == &table)
+                    );
+                    if !current {
+                        return; // user moved on; drop the stale window
+                    }
+                    for (i, row) in page.rows.iter().enumerate() {
+                        if row.iter().any(|v| v.contains_ci(&needle_lc, needle_has_alpha)) {
+                            let abs = offset + i as i64;
+                            self.grid_jump(abs);
+                            self.focus = Focus::Grid;
+                            self.say(format!("found at row {}", abs + 1));
+                            return;
+                        }
+                    }
+                    let next = offset + page.rows.len() as i64;
+                    if page.rows.is_empty() || next >= end {
+                        self.say(format!(
+                            "{needle:?} not found below (g for top, n to retry)"
+                        ));
+                        return;
+                    }
+                    // Chain the next window (same scan generation).
+                    let limit = Self::FIND_PAGE.min(end - next).max(0);
+                    let op = PendingOp::Find {
+                        table: table.clone(),
+                        needle,
+                        needle_lc,
+                        needle_has_alpha,
+                        offset: next,
+                        end,
+                        seq,
+                    };
+                    match self.db.submit(Box::new(move |db| {
+                        DbResponse::Page(db.page(&table, next, limit))
+                    })) {
+                        Some(tag) => {
+                            self.pending.insert(tag, op);
+                        }
+                        None => self.err("database worker is gone"),
+                    }
+                }
+                Err(e) => self.err(e),
+            },
             (_, _) => self.err("db worker protocol mismatch"),
         }
     }
@@ -579,6 +654,10 @@ impl App {
 
     /// Health-dot TTL: re-query at most every 30 s between writes.
     const HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Find-scan window: wide enough that round-trips (not matching)
+    /// dominate scan cost; matching itself is zero-alloc.
+    const FIND_PAGE: i64 = 4096;
 
     /// Advisory dot for opens/refreshes: cached value when fresh,
     /// one re-query otherwise. Console/sample paths query directly.
@@ -2862,47 +2941,44 @@ impl App {
             GridSource::Table { name, .. } => Some(name.clone()),
             GridSource::Query { .. } => None,
         };
-        let hit = match table {
-            None => {
-                let g = self.grid.as_ref().unwrap();
-                (start..total).find(|&abs| g.row(abs).is_some_and(|row| matches(row)))
-            }
-            Some(name) => {
-                let mut found = None;
-                let mut offset = start;
-                let end = total.min(start + SCAN_CAP);
-                // Wide windows: fewer round-trips per scan (latency
-                // dominates on sqld); matching itself is zero-alloc.
-                const FIND_PAGE: i64 = 4096;
-                'scan: while offset < end {
-                    let limit = FIND_PAGE.min(end - offset);
-                    match self.db.page(&name, offset, limit) {
-                        Ok(page) => {
-                            for (i, row) in page.rows.iter().enumerate() {
-                                if matches(row) {
-                                    found = Some(offset + i as i64);
-                                    break 'scan;
-                                }
-                            }
-                            if page.rows.is_empty() {
-                                break;
-                            }
-                            offset += limit;
-                        }
-                        Err(e) => return self.err(e),
-                    }
-                }
-                found
-            }
-        };
         self.last_find = Some(needle.to_owned());
-        match hit {
-            Some(abs) => {
-                self.grid_jump(abs);
-                self.focus = Focus::Grid;
-                self.say(format!("found at row {}", abs + 1));
+        let Some(table) = table else {
+            // Query results live in memory: synchronous scan, unchanged.
+            let g = self.grid.as_ref().unwrap();
+            let hit = (start..total)
+                .find(|&abs| g.row(abs).is_some_and(|row| matches(row)));
+            return match hit {
+                Some(abs) => {
+                    self.grid_jump(abs);
+                    self.focus = Focus::Grid;
+                    self.say(format!("found at row {}", abs + 1));
+                }
+                None => self.say(format!("{needle:?} not found below (g for top, n to retry)")),
+            };
+        };
+        // Table scan, async: submit the first window; each response
+        // scans its rows and chains the next window until hit or cap.
+        // The UI stays live throughout (keys keep flowing between trips).
+        let end = total.min(start + SCAN_CAP);
+        self.find_seq += 1;
+        let seq = self.find_seq;
+        let limit = Self::FIND_PAGE.min(end - start).max(0);
+        let op = PendingOp::Find {
+            table: table.clone(),
+            needle: needle.to_owned(),
+            needle_lc,
+            needle_has_alpha,
+            offset: start,
+            end,
+            seq,
+        };
+        match self.db.submit(Box::new(move |db| {
+            DbResponse::Page(db.page(&table, start, limit))
+        })) {
+            Some(tag) => {
+                self.pending.insert(tag, op);
             }
-            None => self.say(format!("{needle:?} not found below (g for top, n to retry)")),
+            None => self.err("database worker is gone"),
         }
     }
 
@@ -3555,11 +3631,62 @@ mod tests {
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 436);
         // 'n' finds nothing further (unique value) and says so politely.
         a.apply(Command::FindNext);
+        a.sync();
         assert!(a
             .status
             .as_ref()
             .is_some_and(|(m, _)| m.contains("not found")));
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 436);
+    }
+
+    /// Find chains windows until the hit: needle past row 8192 needs
+    /// three 4k windows (tests the async chain, not just one round).
+    #[test]
+    fn find_chains_windows_to_deep_hit() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE big(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO big(v)
+               WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 10000)
+               SELECT 'item' || x FROM c;",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.open_table("big");
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().total, 10_000);
+        for c in "find item9000".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(a.pending.is_empty(), "chain completed");
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 8999);
+        assert!(a.status.as_ref().is_some_and(|(m, _)| m.contains("9000")));
+    }
+
+    /// A second find supersedes the first: stale chain responses die
+    /// by seq guard, the latest needle wins.
+    #[test]
+    fn find_supersede_latest_wins() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE big(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO big(v)
+               WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 10000)
+               SELECT 'item' || x FROM c;",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.open_table("big");
+        a.sync();
+        // Early-hit needle first, then a deep one with no sync between:
+        // both chains queue, but only the latest may land.
+        a.find("item100");
+        a.find("item9000");
+        a.sync();
+        assert!(a.pending.is_empty());
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 8999);
     }
 
     #[test]
