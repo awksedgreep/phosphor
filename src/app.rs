@@ -971,7 +971,7 @@ impl App {
                 // Byte-wise backward word erase over char boundaries.
                 let len = self.prompt.input.len();
                 let mut i = self.prompt.cursor.min(len);
-                let at = |s: &str, j: usize| s[..j].chars().next_back().map_or(' ', |c| c);
+                let at = |s: &str, j: usize| s[..j].chars().next_back().unwrap_or(' ');
                 while i > 0 && at(&self.prompt.input, i).is_whitespace() {
                     i -= self.prompt.input[..i]
                         .chars()
