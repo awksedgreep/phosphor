@@ -128,7 +128,26 @@ from the real program.
 
 | | |
 |---|---|
-| **The CRM, from nothing** — an empty database becomes a working CRM entirely through the UI: tables, foreign keys, data, a painted form, split views, queries, reports, labels, schema evolution, then boots as `phosphor --app` (~5 min, [chapter casts](docs/demo/crm/)) | ![the CRM story: empty db to working app](docs/demo/crm.gif) |
+| **The CRM, from nothing** — an empty database becomes a working CRM entirely through the UI: tables, foreign keys, data, a painted form, split views, queries, reports, labels, schema evolution, then boots as `phosphor --app` (~5 min) | ![the CRM story: empty db to working app](docs/demo/crm.gif) |
+
+<details>
+<summary>CRM chapters (each stage as its own GIF)</summary>
+
+| | |
+|---|---|
+| 01 · an empty db becomes customers | ![customers](docs/demo/crm/01-customers.gif) |
+| 02 · orders + the first foreign key | ![orders fk](docs/demo/crm/02-orders-fk.gif) |
+| 03 · designs change: alter, drop, rethink | ![evolution](docs/demo/crm/03-evolution.gif) |
+| 04 · contacts, interactions — and the split cycle | ![contacts](docs/demo/crm/04-contacts-split.gif) |
+| 05 · CREATE SCREEN: the painted customer card | ![painted form](docs/demo/crm/05-painted-form.gif) |
+| 06 · the split view, driven by keys and mouse | ![split mouse](docs/demo/crm/06-split-mouse.gif) |
+| 07 · query by example → saved query | ![qbe](docs/demo/crm/07-qbe.gif) |
+| 08 · the banded report + mailing labels | ![report](docs/demo/crm/08-report-labels.gif) |
+| 09 · the dot prompt runs the shop | ![prompt](docs/demo/crm/09-dot-prompt.gif) |
+| 10 · wiring the application menu | ![app builder](docs/demo/crm/10-app-builder.gif) |
+| 11 · --app: the database IS the application | ![app boots](docs/demo/crm/11-app-boots.gif) |
+
+</details>
 | **Split BROWSE** — `v` splits a related table onto the screen; the cursor drives it, the mouse re-points it, layouts are remembered | ![split browse: customer ↔ orders on one screen](docs/demo/split.gif) |
 | **The builders** — QBE writing its SQL, the banded report with group subtotals, the form painter | ![qbe, reports, painter](docs/demo/builders.gif) |
 | **DBHEALTH, live** — the report and sparklines moving on their own (auto-collection + the live console) | ![dbhealth console](docs/demo/health.gif) |
