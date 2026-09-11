@@ -46,6 +46,8 @@ pub enum DbResponse {
     /// Bundled table open: columns + rowid-ness + first window + total,
     /// fetched as one job so cold opens cost a single round-trip.
     Opened(DbResult<OpenedGrid>),
+    /// Bundled health console: base + report + sparks + dot in one job.
+    HealthConsole(DbResult<HealthData>),
 }
 
 /// Everything open_table needs to build a Grid, from one worker job.
@@ -55,6 +57,15 @@ pub struct OpenedGrid {
     pub editable: bool,
     pub page: Page,
     pub total: i64,
+}
+
+/// Everything the health console needs to render, from one worker job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HealthData {
+    pub base: String,
+    pub report: Vec<[String; 4]>,
+    pub sparks: Vec<(String, Vec<f64>, String)>,
+    pub health: Option<String>,
 }
 
 impl DbResponse {

@@ -265,6 +265,14 @@ enum PendingOp {
         end: i64,
         seq: u64,
     },
+    /// Health console rebuild: installs only if the overlay hasn't
+    /// moved on (discriminant guard); `sampled` says so on arrival.
+    Health {
+        sampled: bool,
+        seq: u64,
+        at: std::time::Instant,
+        overlay: std::mem::Discriminant<Overlay>,
+    },
 }
 
 pub struct App {
@@ -522,6 +530,35 @@ impl App {
                     }
                     self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
                     self.grid_jump(row);
+                }
+                Err(e) => self.err(e),
+            },
+            (
+                PendingOp::Health {
+                    sampled,
+                    seq,
+                    at,
+                    overlay,
+                },
+                DbResponse::HealthConsole(r),
+            ) => match r {
+                Ok(h) => {
+                    if std::mem::discriminant(&self.overlay) != overlay {
+                        return; // user moved on; silent drop, no yank
+                    }
+                    self.health = h.health.clone();
+                    self.health_cache =
+                        Some((h.health, std::time::Instant::now()));
+                    self.last_auto_sample = std::time::Instant::now();
+                    self.last_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                    self.overlay = Overlay::Health(HealthView {
+                        table: h.base,
+                        report: h.report,
+                        sparks: h.sparks,
+                    });
+                    if sampled && self.status_seq == seq {
+                        self.say("sampled");
+                    }
                 }
                 Err(e) => self.err(e),
             },
@@ -1431,24 +1468,6 @@ impl App {
         format!("\"{}\"", ident.replace('"', "\"\""))
     }
 
-    /// Find the dbhealth report view and its base vtab, if this
-    /// database carries one. Backend-agnostic: plain SQL via DbLink.
-    fn find_health_base(&self) -> Option<(String, String)> {
-        let q = self
-            .db
-            .query(
-                "SELECT name FROM sqlite_master \
-                 WHERE type = 'view' AND name LIKE '%\\_report' ESCAPE '\\' \
-                 ORDER BY name LIMIT 1",
-            )
-            .ok()?;
-        let PValue::Text(view) = q.rows.first()?.first()?.clone() else {
-            return None;
-        };
-        let base = view.strip_suffix("_report")?.to_owned();
-        Some((view, base))
-    }
-
     /// Series names for the health fallback path (no window functions).
     fn series_names(db: &dyn DbLink, base: &str) -> Vec<String> {
         db.query(&format!(
@@ -1504,26 +1523,46 @@ impl App {
         });
     }
 
-    fn open_health(&mut self) {
-        let Some((view, base)) = self.find_health_base() else {
-            return self.err(
+    /// The whole health console in one worker job: base discovery,
+    /// report, sparklines, and dot. Pure function of the link, so the
+    /// UI thread never blocks on its (up to 4) round-trips.
+    fn fetch_health_console(
+        db: &dyn DbLink,
+    ) -> DbResult<crate::worker::HealthData> {
+        let view: String = db
+            .query(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'view' AND name LIKE '%\\_report' ESCAPE '\\' \
+                 ORDER BY name LIMIT 1",
+            )
+            .ok()
+            .and_then(|q| q.rows.into_iter().next())
+            .and_then(|r| r.into_iter().next())
+            .and_then(|v| match v {
+                PValue::Text(t) => Some(t),
+                _ => None,
+            })
+            .filter(|v| v.ends_with("_report"))
+            .ok_or_else(|| {
                 "no dbhealth here — needs the timeless extension and \
-                 CREATE VIRTUAL TABLE dbhealth USING timeless_health",
-            );
-        };
-        let report = match self.db.query(&format!(
-            "SELECT \"check\", status, value, advice FROM {}",
-            Self::quote_ident(&view)
-        )) {
-            Ok(q) => q
-                .rows
-                .into_iter()
-                .map(|r| {
-                    [0, 1, 2, 3].map(|i| r.get(i).map(PValue::render).unwrap_or_default())
-                })
-                .collect(),
-            Err(e) => return self.err(e),
-        };
+                 CREATE VIRTUAL TABLE dbhealth USING timeless_health"
+                    .to_owned()
+            })?;
+        let base = view
+            .strip_suffix("_report")
+            .unwrap_or(&view)
+            .to_owned();
+        let report = db
+            .query(&format!(
+                "SELECT \"check\", status, value, advice FROM {}",
+                Self::quote_ident(&view)
+            ))?
+            .rows
+            .into_iter()
+            .map(|r| {
+                [0, 1, 2, 3].map(|i| r.get(i).map(PValue::render).unwrap_or_default())
+            })
+            .collect();
 
         // Sparklines: preferred series first, then whatever else exists.
         // ONE windowed query replaces DISTINCT + N per-series round-trips
@@ -1540,7 +1579,7 @@ impl App {
             "memory_used_bytes",
         ];
         let mut by_name: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-        match self.db.query(&format!(
+        match db.query(&format!(
             "SELECT name, value FROM \
              (SELECT name, value, row_number() OVER \
               (PARTITION BY name ORDER BY ts DESC) AS rn FROM {}) \
@@ -1565,9 +1604,9 @@ impl App {
             Err(_) => {
                 // Old SQLite / quirky vtab without window support:
                 // fall back to the per-series loop (slower, same picture).
-                for name in Self::series_names(self.db.link(), &base) {
+                for name in Self::series_names(db, &base) {
                     let safe = name.replace('\'', "''");
-                    if let Ok(q) = self.db.query(&format!(
+                    if let Ok(q) = db.query(&format!(
                         "SELECT value FROM {} WHERE name = '{safe}' ORDER BY ts DESC LIMIT 64",
                         Self::quote_ident(&base)
                     )) {
@@ -1617,14 +1656,40 @@ impl App {
             }
         }
 
-        self.health = self.db.health();
-        self.health_cache = Some((self.health.clone(), std::time::Instant::now()));
-        self.last_auto_sample = std::time::Instant::now();
-        self.overlay = Overlay::Health(HealthView {
-            table: base,
+        Ok(crate::worker::HealthData {
+            base,
             report,
             sparks,
-        });
+            health: db.health(),
+        })
+    }
+
+    fn open_health(&mut self) {
+        // Async: the bundle (base + report + sparks + dot) arrives as
+        // one job; the current screen stays put until the console does.
+        // The overlay discriminant guards stale installs (user moved on).
+        let seq = self.status_seq;
+        let at = std::time::Instant::now();
+        let overlay = std::mem::discriminant(&self.overlay);
+        match self
+            .db
+            .submit(Box::new(move |db| {
+                DbResponse::HealthConsole(Self::fetch_health_console(db))
+            }))
+        {
+            Some(tag) => {
+                self.pending.insert(
+                    tag,
+                    PendingOp::Health {
+                        sampled: false,
+                        seq,
+                        at,
+                        overlay,
+                    },
+                );
+            }
+            None => self.err("database worker is gone"),
+        }
     }
 
     fn health_sample(&mut self) {
@@ -1636,8 +1701,27 @@ impl App {
         {
             Ok((_, elapsed)) => {
                 self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
-                self.open_health(); // rebuild report + sparks + dot
-                self.say("sampled");
+                // Async rebuild (same bundle as open); "sampled" lands
+                // with the fresh console so the message never lies.
+                let seq = self.status_seq;
+                let at = std::time::Instant::now();
+                let overlay = std::mem::discriminant(&self.overlay);
+                match self.db.submit(Box::new(move |db| {
+                    DbResponse::HealthConsole(Self::fetch_health_console(db))
+                })) {
+                    Some(tag) => {
+                        self.pending.insert(
+                            tag,
+                            PendingOp::Health {
+                                sampled: true,
+                                seq,
+                                at,
+                                overlay,
+                            },
+                        );
+                    }
+                    None => self.err("database worker is gone"),
+                }
             }
             Err(e) => self.err(e),
         }
@@ -3388,6 +3472,7 @@ mod tests {
         .unwrap();
         let mut a = App::new(Box::new(db), None);
         a.apply(Command::OpenHealth);
+        a.sync();
         let Overlay::Health(hv) = &a.overlay else {
             panic!("health console did not open: {:?}", a.status);
         };
@@ -3423,6 +3508,29 @@ mod tests {
         assert_eq!(a.health, None);
     }
 
+    /// A health response arriving after the user moved on is dropped,
+    /// never yanked over the new screen.
+    #[test]
+    fn stale_health_console_does_not_yank() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE m(name TEXT, value REAL, ts INTEGER);
+             CREATE VIEW m_report AS
+               SELECT 'c' AS \"check\", 'ok' AS status, 1.0 AS value, 'a' AS advice;",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenHealth);
+        // Navigate away BEFORE reconciling: QBE owns the screen now.
+        a.apply(Command::OpenQbe(Some("m".into())));
+        assert!(matches!(a.overlay, Overlay::Qbe(_)));
+        a.sync();
+        assert!(
+            matches!(a.overlay, Overlay::Qbe(_)),
+            "late health console must not clobber QBE"
+        );
+    }
+
     /// Full-stack phase 3, when the timeless extension is built next
     /// door: dbhealth vtab + samples + the console over the bus.
     #[test]
@@ -3443,6 +3551,7 @@ mod tests {
             .unwrap();
         let mut a = App::new(Box::new(db), None);
         a.apply(Command::OpenHealth);
+        a.sync();
         let Overlay::Health(hv) = &a.overlay else {
             panic!("health console did not open");
         };
@@ -3450,6 +3559,7 @@ mod tests {
         assert!(hv.report.len() >= 7, "report rows: {}", hv.report.len());
         assert!(!hv.sparks.is_empty(), "no sparkline series");
         a.apply(Command::HealthSample);
+        a.sync();
         assert!(matches!(a.overlay, Overlay::Health(_)));
         assert!(a.health.is_some(), "status dot missing after sample");
         a.apply(Command::Back);
@@ -3827,6 +3937,7 @@ mod tests {
             .unwrap();
         let mut a = App::new(Box::new(db), None);
         a.apply(Command::OpenHealth);
+        a.sync();
         assert!(matches!(a.overlay, Overlay::Health(_)));
         let count = |a: &App| -> i64 {
             match a.db.query("SELECT count(*) FROM dbhealth").unwrap().rows[0][0] {
