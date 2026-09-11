@@ -210,6 +210,15 @@ pub trait DbLink {
     /// True when the table has usable rowids (EDIT is possible).
     fn has_rowid(&self, table: &str) -> bool;
     fn page(&self, table: &str, offset: i64, limit: i64) -> DbResult<Page>;
+    /// A window PLUS the table total. Default is page()+count() (two
+    /// round-trips); backends collapse it into one query with
+    /// count(*) OVER (). Used on open/refresh only — per-turn paging
+    /// stays on page() (re-counting every PgDn would be worse).
+    fn open_window(&self, table: &str, offset: i64, limit: i64) -> DbResult<(Page, i64)> {
+        let page = self.page(table, offset, limit)?;
+        let total = self.count(table)?;
+        Ok((page, total))
+    }
     fn query(&self, sql: &str) -> DbResult<QueryResult>;
     /// Non-SELECT statement; returns affected-row count (-1 if unknown).
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)>;
@@ -271,6 +280,44 @@ pub struct EmbeddedDb {
     conn: Connection,
     name: String,
     rowid_cache: RefCell<HashMap<String, bool>>,
+}
+
+/// Split a `SELECT ..., count(*) OVER () AS _total` result back into a
+/// Page + total: every row carries the same total in its trailing
+/// column, rowid tables carry rowids in the leading column. Shared by
+/// both backends' open_window. Errs (→ caller falls back to
+/// page()+count()) on any structural surprise.
+pub(crate) fn strip_window_total(
+    mut rows: Vec<Vec<PValue>>,
+    with_rowid: bool,
+) -> DbResult<(Page, i64)> {
+    if rows.is_empty() {
+        return Err("empty window carries no total".into());
+    }
+    let total = match rows[0].pop() {
+        Some(PValue::Int(t)) => t,
+        _ => return Err("total column was not an integer".into()),
+    };
+    for row in rows.iter_mut().skip(1) {
+        if !matches!(row.pop(), Some(PValue::Int(_))) {
+            return Err("total column was not an integer".into());
+        }
+    }
+    if with_rowid {
+        let mut rowids = Vec::with_capacity(rows.len());
+        for row in &mut rows {
+            if row.is_empty() {
+                return Err("rowid column missing".into());
+            }
+            match row.remove(0) {
+                PValue::Int(id) => rowids.push(id),
+                _ => return Err("rowid was not an integer".into()),
+            }
+        }
+        Ok((Page { rows, rowids: Some(rowids) }, total))
+    } else {
+        Ok((Page { rows, rowids: None }, total))
+    }
 }
 
 /// True when `sql` already constrains its row count (conservative
@@ -452,6 +499,46 @@ impl DbLink for EmbeddedDb {
                 .map_err(|e| e.to_string())?;
             let (rows, _) = Self::collect_rows(&mut stmt, limit as usize)?;
             Ok(Page { rows, rowids: None })
+        }
+    }
+
+    /// Single-query open_window: the total rides along as a trailing
+    /// count(*) OVER () column, stripped back off here. Falls back to
+    /// page()+count() on any structural surprise.
+    fn open_window(&self, table: &str, offset: i64, limit: i64) -> DbResult<(Page, i64)> {
+        let fallback = || {
+            let page = self.page(table, offset, limit)?;
+            let total = self.count(table)?;
+            Ok((page, total))
+        };
+        let q = Self::quote(table);
+        let with_rowid = self.has_rowid(table);
+        let select = if with_rowid {
+            format!("SELECT rowid, *, count(*) OVER () AS _total FROM {q}")
+        } else {
+            format!("SELECT *, count(*) OVER () AS _total FROM {q}")
+        };
+        let mut stmt = match self.conn.prepare_cached(&format!(
+            "{select} LIMIT {limit} OFFSET {offset}"
+        )) {
+            Ok(s) => s,
+            Err(_) => return fallback(),
+        };
+        let (rows, _) = match Self::collect_rows(&mut stmt, limit.max(0) as usize) {
+            Ok(r) => r,
+            Err(_) => return fallback(),
+        };
+        if rows.is_empty() {
+            if offset == 0 {
+                // Open on an empty table: total is exactly 0, no count needed.
+                let page = Page { rows: Vec::new(), rowids: with_rowid.then(Vec::new) };
+                return Ok((page, 0));
+            }
+            return fallback();
+        }
+        match strip_window_total(rows, with_rowid) {
+            Ok(ok) => Ok(ok),
+            Err(_) => fallback(),
         }
     }
 
@@ -698,6 +785,33 @@ mod tests {
         assert_eq!(q.columns, ["id", "name", "score"]);
         assert_eq!(q.rows.len(), 3);
         assert!(!q.truncated);
+    }
+
+    #[test]
+    fn open_window_matches_page_plus_count() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES ('a'), ('b'), ('c');",
+        )
+        .unwrap();
+        // Rowid table: window + total + rowids in one trip.
+        let (page, total) = db.open_window("t", 1, 2).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(page.rows.len(), 2);
+        assert_eq!(page.rowids, Some(vec![2, 3]));
+        // Rowid-less view: no rowids, total still rides along.
+        db.execute("CREATE VIEW v AS SELECT v AS letter FROM t").unwrap();
+        let (page, total) = db.open_window("v", 0, 10).unwrap();
+        assert_eq!((total, page.rows.len()), (3, 3));
+        assert_eq!(page.rowids, None);
+        // Empty table at offset 0: total exactly 0, no count query.
+        db.execute("CREATE TABLE e(id INTEGER PRIMARY KEY)").unwrap();
+        let (page, total) = db.open_window("e", 0, 10).unwrap();
+        assert_eq!((total, page.rows.len()), (0, 0));
+        // Past-the-end window falls back to count (total still right).
+        let (_, total) = db.open_window("t", 99, 10).unwrap();
+        assert_eq!(total, 3);
     }
 
     #[test]

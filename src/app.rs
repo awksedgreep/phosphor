@@ -279,6 +279,10 @@ pub struct App {
     /// the main loop after drawing. The terminal is static between
     /// commands, so idle ticks skip the full redraw.
     pub dirty: bool,
+    /// Status-bar health dot cache: health() is 2 round-trips (worse
+    /// over sqld) and the dot is advisory, so opens/refreshes reuse a
+    /// fresh-enough value. Writes invalidate; TTL bounds time drift.
+    health_cache: Option<(Option<String>, std::time::Instant)>,
     /// Per-table caches so EDIT record flips don't re-query schema,
     /// re-parse the saved form, or re-run FK introspection per record.
     /// Cleared in reload_tables() (every schema-changing path funnels
@@ -324,6 +328,7 @@ impl App {
             page_streak: 0,
             last_auto_sample: std::time::Instant::now(),
             dirty: true, // first frame must paint
+            health_cache: None,
             columns_cache: HashMap::new(),
             form_cache: HashMap::new(),
             links_cache: HashMap::new(),
@@ -395,11 +400,39 @@ impl App {
             Err(e) => self.err(e),
         }
         // Schema may have changed: drop per-table caches (columns,
-        // saved forms, FK links, pane previews). Flips re-fill lazily.
+        // saved forms, FK links, pane previews) and the health dot.
+        // Flips re-fill lazily.
         self.columns_cache.clear();
         self.form_cache.clear();
         self.links_cache.clear();
         self.pane_cache.clear();
+        self.health_cache = None;
+    }
+
+    /// Health-dot TTL: re-query at most every 30 s between writes.
+    const HEALTH_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Advisory dot for opens/refreshes: cached value when fresh,
+    /// one re-query otherwise. Console/sample paths query directly.
+    fn refresh_health(&mut self) {
+        let fresh = self
+            .health_cache
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed() < Self::HEALTH_TTL);
+        if fresh {
+            if let Some((h, _)) = &self.health_cache {
+                self.health = h.clone();
+            }
+            return;
+        }
+        let h = self.db.health();
+        self.health_cache = Some((h.clone(), std::time::Instant::now()));
+        self.health = h;
+    }
+
+    /// Writes may move the dot: drop the cache (callers re-query).
+    fn invalidate_health(&mut self) {
+        self.health_cache = None;
     }
 
     /// Cached schema introspection for the EDIT hot path: one DB hit
@@ -1115,7 +1148,9 @@ impl App {
             }
             self.grid_jump(row);
         }
-        self.health = self.db.health();
+        // Explicit user refresh: force a fresh dot, not the cache.
+        self.invalidate_health();
+        self.refresh_health();
         self.say("refreshed");
     }
 
@@ -1312,6 +1347,7 @@ impl App {
         }
 
         self.health = self.db.health();
+        self.health_cache = Some((self.health.clone(), std::time::Instant::now()));
         self.last_auto_sample = std::time::Instant::now();
         self.overlay = Overlay::Health(HealthView {
             table: base,
@@ -2143,10 +2179,6 @@ impl App {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
-        let total = match self.db.count(name) {
-            Ok(n) => n,
-            Err(e) => return self.err(e),
-        };
         let editable = self.db.has_rowid(name);
         let mut grid = Grid {
             source: GridSource::Table {
@@ -2154,7 +2186,7 @@ impl App {
                 editable,
             },
             columns: cols.iter().map(|c| c.name.clone()).collect(),
-            total,
+            total: 0,
             cache: Vec::new(),
             cache_start: 0,
             rowids: None,
@@ -2164,8 +2196,10 @@ impl App {
             col_off: 0,
             widths: Vec::new(),
         };
-        match self.db.page(name, 0, self.visible_rows + OVERSCAN) {
-            Ok(page) => {
+        // First window + total in one round-trip (was count + page).
+        match self.db.open_window(name, 0, self.visible_rows + OVERSCAN) {
+            Ok((page, total)) => {
+                grid.total = total;
                 grid.cache = page.rows;
                 grid.rowids = page.rowids;
             }
@@ -2175,7 +2209,7 @@ impl App {
         self.last_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
         self.grid = Some(grid);
         self.focus = Focus::Grid;
-        self.health = self.db.health();
+        self.refresh_health();
     }
 
     fn grid_jump(&mut self, row: i64) {
@@ -2591,6 +2625,7 @@ impl App {
             match self.db.delete_row(&table, rowid) {
                 Ok(()) => {
                     self.pane_cache.clear(); // child counts changed
+                    self.invalidate_health();
                     self.refresh_grid_keep_position();
                     self.say("row deleted");
                 }
@@ -2603,33 +2638,35 @@ impl App {
     }
 
     /// Refresh the current table grid without losing the cursor.
-    /// After a write: re-count + re-page the current window, keeping
-    /// columns/widths/editable (was: full open_table = columns+count+
-    /// rowid+page+widths+health on every delete/insert/save).
+    /// Fresh total + current window via open_window (one trip),
+    /// keeping columns/widths/editable. grid_jump then re-pages only
+    /// if the clamped cursor left the fetched window.
     fn refresh_grid_keep_position(&mut self) {
-        let (name, row, col) = match &self.grid {
+        let (name, row, col, want_start, limit) = match &self.grid {
             Some(g) => match &g.source {
-                GridSource::Table { name, .. } => (name.clone(), g.cur_row, g.cur_col),
+                GridSource::Table { name, .. } => {
+                    let limit = (g.cache.len() as i64).max(1);
+                    (name.clone(), g.cur_row, g.cur_col, g.cache_start, limit)
+                }
                 _ => return,
             },
             None => return,
         };
-        match self.db.count(&name) {
-            Ok(n) => {
+        let start = std::time::Instant::now();
+        match self.db.open_window(&name, want_start, limit) {
+            Ok((page, total)) => {
                 if let Some(g) = &mut self.grid {
-                    g.total = n;
+                    g.total = total;
+                    g.cache = page.rows;
+                    g.rowids = page.rowids;
+                    g.cache_start = want_start;
+                    g.cur_col = col.min(g.columns.len().saturating_sub(1));
                 }
+                self.last_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
             }
             Err(e) => return self.err(e),
         }
-        if let Some(g) = &mut self.grid {
-            g.cur_col = col.min(g.columns.len().saturating_sub(1));
-            // Force ensure_cache to re-page around the clamped cursor.
-            g.cache.clear();
-            g.cache_start = row;
-            g.rowids = None;
-        }
-        self.grid_move(0, 0);
+        self.grid_jump(row);
     }
 
     /// `find <text>` / 'n': scan forward from the cursor for a row with
@@ -2664,8 +2701,11 @@ impl App {
                 let mut found = None;
                 let mut offset = start;
                 let end = total.min(start + SCAN_CAP);
+                // Wide windows: fewer round-trips per scan (latency
+                // dominates on sqld); matching itself is zero-alloc.
+                const FIND_PAGE: i64 = 4096;
                 'scan: while offset < end {
-                    let limit = 1024.min(end - offset);
+                    let limit = FIND_PAGE.min(end - offset);
                     match self.db.page(&name, offset, limit) {
                         Ok(page) => {
                             for (i, row) in page.rows.iter().enumerate() {
@@ -2824,8 +2864,9 @@ impl App {
         };
         match result {
             Ok(msg) => {
-                // The write may have changed child counts/previews.
+                // The write may have changed child counts/previews and health.
                 self.pane_cache.clear();
+                self.invalidate_health();
                 if inserting {
                     // Total changed: full refresh, then flip the open
                     // form onto the newly inserted record so further
@@ -3004,7 +3045,7 @@ impl App {
                 Ok((n, elapsed)) => {
                     self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
                     self.reload_tables();
-                    self.health = self.db.health();
+                    self.refresh_health();
                     self.say(match n {
                         -1 => "ok (batch)".to_owned(),
                         n => format!("ok, {n} row(s) affected"),
@@ -3106,6 +3147,31 @@ mod tests {
         assert_eq!(hv.sparks.len(), 2);
         let hits = hv.sparks.iter().find(|(n, _, _)| n == "cache_hits").unwrap();
         assert_eq!(hits.1, vec![1.0, 2.0, 3.0], "chronological after reverse");
+    }
+
+    /// The health dot is cached (TTL) and invalidated on demand:
+    /// a dropped report view stays cached until invalidated.
+    #[test]
+    fn health_dot_cache_hit_and_invalidate() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE VIEW m_report AS
+               SELECT 'c' AS \"check\", 'ok' AS status, 1.0 AS value, 'a' AS advice;",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        assert_eq!(a.health, Some("ok".into()));
+        a.refresh_health();
+        assert_eq!(a.health, Some("ok".into()));
+        assert!(a.health_cache.is_some(), "dot cached after refresh");
+        // The view goes away: cache still serves the dot.
+        a.db.execute("DROP VIEW m_report").unwrap();
+        a.refresh_health();
+        assert_eq!(a.health, Some("ok".into()), "fresh cache wins");
+        // Invalidate (what writes do): next refresh re-queries → None.
+        a.invalidate_health();
+        a.refresh_health();
+        assert_eq!(a.health, None);
     }
 
     /// Full-stack phase 3, when the timeless extension is built next

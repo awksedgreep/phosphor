@@ -296,6 +296,41 @@ impl DbLink for RemoteDb {
         }
     }
 
+    /// Single-pipeline open_window (total rides along, stripped here).
+    fn open_window(&self, table: &str, offset: i64, limit: i64) -> DbResult<(Page, i64)> {
+        let fallback = || {
+            let page = self.page(table, offset, limit)?;
+            let total = self.count(table)?;
+            Ok((page, total))
+        };
+        let q = Self::quote(table);
+        let with_rowid = self.has_rowid(table);
+        let select = if with_rowid {
+            format!("SELECT rowid, *, count(*) OVER () AS _total FROM {q}")
+        } else {
+            format!("SELECT *, count(*) OVER () AS _total FROM {q}")
+        };
+        let out = match self.one(
+            &format!("{select} LIMIT {limit} OFFSET {offset}"),
+            vec![],
+        ) {
+            Ok(o) => o,
+            Err(_) => return fallback(),
+        };
+        let rows = out.rows;
+        if rows.is_empty() {
+            if offset == 0 {
+                let page = Page { rows: Vec::new(), rowids: with_rowid.then(Vec::new) };
+                return Ok((page, 0));
+            }
+            return fallback();
+        }
+        match crate::db::strip_window_total(rows, with_rowid) {
+            Ok(ok) => Ok(ok),
+            Err(_) => fallback(),
+        }
+    }
+
     fn query(&self, sql: &str) -> DbResult<QueryResult> {
         let start = Instant::now();
         // Push the cap server-side: without this a bare
