@@ -110,6 +110,10 @@ impl RemoteDb {
     fn quote(ident: &str) -> String {
         format!("\"{}\"", ident.replace('"', "\"\""))
     }
+
+    fn str_lit(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "''"))
+    }
 }
 
 fn encode(v: &PValue) -> Json {
@@ -414,6 +418,59 @@ impl DbLink for RemoteDb {
             PValue::Text(s) => Some(s),
             _ => None,
         }
+    }
+
+    /// Batched override: all pragma_foreign_key_list probes go out in
+    /// ONE pipeline (one HTTP round-trip) instead of N.
+    fn child_links(&self, parent: &str) -> Vec<(String, String, String)> {
+        let tables = match self.tables() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let stmts: Vec<(String, Vec<Json>)> = tables
+            .iter()
+            .filter(|t| !t.name.eq_ignore_ascii_case(parent))
+            .map(|t| {
+                (
+                    format!(
+                        "SELECT \"table\", \"from\", \"to\" FROM pragma_foreign_key_list({})",
+                        Self::str_lit(&t.name)
+                    ),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        if stmts.is_empty() {
+            return Vec::new();
+        }
+        let refs: Vec<(&str, Vec<Json>)> =
+            stmts.iter().map(|(s, a)| (s.as_str(), a.clone())).collect();
+        let outs = match self.pipeline(&refs) {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for (t, stmt_out) in tables
+            .iter()
+            .filter(|t| !t.name.eq_ignore_ascii_case(parent))
+            .zip(outs.iter())
+        {
+            for row in &stmt_out.rows {
+                let (PValue::Text(to_table), PValue::Text(from_col)) = (&row[0], &row[1])
+                else {
+                    continue;
+                };
+                if !to_table.eq_ignore_ascii_case(parent) {
+                    continue;
+                }
+                let to_col = match &row[2] {
+                    PValue::Text(c) => c.clone(),
+                    _ => String::new(),
+                };
+                out.push((t.name.clone(), from_col.clone(), to_col));
+            }
+        }
+        out
     }
 }
 

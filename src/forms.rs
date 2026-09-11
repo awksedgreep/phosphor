@@ -48,8 +48,12 @@ pub struct FormSpec {
 impl FormSpec {
     /// A default form mirroring the table's columns (unpainted).
     pub fn new(db: &dyn DbLink, table: &str) -> DbResult<FormSpec> {
-        let fields = db
-            .columns(table)?
+        Ok(Self::from_columns(table, db.columns(table)?))
+    }
+
+    /// Same, from already-fetched columns (lets callers reuse a cache).
+    pub fn from_columns(table: &str, cols: Vec<crate::db::ColumnInfo>) -> FormSpec {
+        let fields = cols
             .into_iter()
             .map(|c| FormField {
                 label: c.name.clone(),
@@ -60,13 +64,13 @@ impl FormSpec {
                 width: DEFAULT_FIELD_WIDTH,
             })
             .collect();
-        Ok(FormSpec {
+        FormSpec {
             table: table.to_owned(),
             fields,
             texts: Vec::new(),
             boxes: Vec::new(),
             size: DEFAULT_CANVAS,
-        })
+        }
     }
 
     /// Has this form been painted (2D mode), or is it still a list?

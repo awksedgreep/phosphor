@@ -545,6 +545,47 @@ impl DbLink for EmbeddedDb {
             )
             .ok()
     }
+
+    /// Batched override: one UNION ALL over pragma_foreign_key_list
+    /// instead of the default method's N queries (one per table).
+    /// Column order mirrors the default: (child_tbl, to_table, from, to).
+    fn child_links(&self, parent: &str) -> Vec<(String, String, String)> {
+        let Ok(tables) = self.tables() else { return Vec::new() };
+        let parts: Vec<String> = tables
+            .iter()
+            .filter(|t| !t.name.eq_ignore_ascii_case(parent))
+            .map(|t| {
+                format!(
+                    "SELECT {} AS child_tbl, \"table\" AS to_table, \
+                     \"from\" AS from_col, \"to\" AS to_col \
+                     FROM pragma_foreign_key_list({})",
+                    sql_str(&t.name),
+                    sql_str(&t.name)
+                )
+            })
+            .collect();
+        if parts.is_empty() {
+            return Vec::new();
+        }
+        let Ok(q) = self.query(&parts.join(" UNION ALL ")) else { return Vec::new() };
+        let mut out = Vec::new();
+        for row in &q.rows {
+            let [PValue::Text(child), PValue::Text(to_table), PValue::Text(from_col), to_col] =
+                row.as_slice()
+            else {
+                continue;
+            };
+            if !to_table.eq_ignore_ascii_case(parent) {
+                continue;
+            }
+            let to_col = match to_col {
+                PValue::Text(c) => c.clone(),
+                _ => String::new(), // NULL → the parent's pk
+            };
+            out.push((child.clone(), from_col.clone(), to_col));
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -605,6 +646,21 @@ mod tests {
         assert_eq!(q.columns, ["id", "name", "score"]);
         assert_eq!(q.rows.len(), 3);
         assert!(!q.truncated);
+    }
+
+    #[test]
+    fn child_links_finds_fk_children() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id), total REAL);
+             CREATE TABLE orphan(id INTEGER PRIMARY KEY, note TEXT);",
+        )
+        .unwrap();
+        let mut links = db.child_links("customers");
+        links.sort();
+        assert_eq!(links, [("orders".to_owned(), "customer_id".to_owned(), "id".to_owned())]);
+        assert!(db.child_links("orphan").is_empty());
     }
 
     #[test]

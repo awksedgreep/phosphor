@@ -6,6 +6,8 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use std::collections::HashMap;
+
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::creator::CreateState;
 use crate::db::{ColumnInfo, DbLink, PValue, TableInfo};
@@ -271,6 +273,13 @@ pub struct App {
     /// Held-key acceleration state for record paging.
     last_edit_page: Option<std::time::Instant>,
     page_streak: u32,
+    /// Per-table caches so EDIT record flips don't re-query schema,
+    /// re-parse the saved form, or re-run FK introspection per record.
+    /// Cleared in reload_tables() (every schema-changing path funnels
+    /// through it) and on form save.
+    columns_cache: HashMap<String, Vec<ColumnInfo>>,
+    form_cache: HashMap<String, Option<FormSpec>>,
+    links_cache: HashMap<String, Vec<(String, String, String)>>,
 }
 
 impl App {
@@ -304,6 +313,9 @@ impl App {
             last_edit_page: None,
             page_streak: 0,
             last_auto_sample: std::time::Instant::now(),
+            columns_cache: HashMap::new(),
+            form_cache: HashMap::new(),
+            links_cache: HashMap::new(),
         };
         app.reload_tables();
         app.health = app.db.health();
@@ -370,6 +382,42 @@ impl App {
             }
             Err(e) => self.err(e),
         }
+        // Schema may have changed: drop per-table caches (columns,
+        // saved forms, FK links). Record flips re-fill them lazily.
+        self.columns_cache.clear();
+        self.form_cache.clear();
+        self.links_cache.clear();
+    }
+
+    /// Cached schema introspection for the EDIT hot path: one DB hit
+    /// per table until the next reload_tables(), not one per record.
+    fn cached_columns(&mut self, table: &str) -> crate::db::DbResult<Vec<ColumnInfo>> {
+        if let Some(c) = self.columns_cache.get(table) {
+            return Ok(c.clone());
+        }
+        let cols = self.db.columns(table)?;
+        self.columns_cache.insert(table.to_owned(), cols.clone());
+        Ok(cols)
+    }
+
+    /// Cached FormSpec::load: one parse per table, not one per record.
+    fn cached_form(&mut self, table: &str) -> Option<FormSpec> {
+        if let Some(s) = self.form_cache.get(table) {
+            return s.clone();
+        }
+        let spec = FormSpec::load(self.db.as_ref(), table);
+        self.form_cache.insert(table.to_owned(), spec.clone());
+        spec
+    }
+
+    /// Cached FK introspection: one (now batched) probe per table.
+    fn cached_links(&mut self, parent: &str) -> Vec<(String, String, String)> {
+        if let Some(l) = self.links_cache.get(parent) {
+            return l.clone();
+        }
+        let links = self.db.child_links(parent);
+        self.links_cache.insert(parent.to_owned(), links.clone());
+        links
     }
 
     // ── key → command (pure mapping; no state changes here) ──────────
@@ -1793,20 +1841,26 @@ impl App {
             Overlay::Form(st) => {
                 let spec = st.spec.clone();
                 match spec.save(self.db.as_ref()) {
-                    Ok(()) => self.say(format!(
-                        "saved form for {:?} — EDIT uses it from now on",
-                        spec.table
-                    )),
+                    Ok(()) => {
+                        self.form_cache.remove(&spec.table);
+                        self.say(format!(
+                            "saved form for {:?} — EDIT uses it from now on",
+                            spec.table
+                        ))
+                    }
                     Err(e) => self.err(e),
                 }
             }
             Overlay::Paint(st) => {
                 let spec = st.spec.clone();
                 match spec.save(self.db.as_ref()) {
-                    Ok(()) => self.say(format!(
-                        "saved painted form for {:?} — EDIT renders it now",
-                        spec.table
-                    )),
+                    Ok(()) => {
+                        self.form_cache.remove(&spec.table);
+                        self.say(format!(
+                            "saved painted form for {:?} — EDIT renders it now",
+                            spec.table
+                        ))
+                    }
                     Err(e) => self.err(e),
                 }
             }
@@ -1916,9 +1970,15 @@ impl App {
         let Some(table) = self.target_table(table) else {
             return self.err("form: no table selected (form <table>)");
         };
-        let spec = FormSpec::load(self.db.as_ref(), &table)
-            .map(Ok)
-            .unwrap_or_else(|| FormSpec::new(self.db.as_ref(), &table));
+        let spec = match self.cached_form(&table) {
+            Some(spec) => Ok(spec),
+            // Miss: build the default from (cached) columns — one DB
+            // hit total instead of load-probe + columns query.
+            None => match self.cached_columns(&table) {
+                Ok(cols) => Ok(FormSpec::from_columns(&table, cols)),
+                Err(e) => Err(e),
+            },
+        };
         match spec {
             Ok(spec) => {
                 self.overlay = Overlay::Form(FormState {
@@ -2150,7 +2210,7 @@ impl App {
         };
         let name = name.clone();
         let row: Vec<PValue> = row.clone();
-        let cols = match self.db.columns(&name) {
+        let cols = match self.cached_columns(&name) {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
@@ -2189,7 +2249,7 @@ impl App {
     /// SET RELATION, reborn: one pane per declared FK pointing at this
     /// table, filtered to the record on screen. Refreshed per page flip.
     fn build_link_panes(
-        &self,
+        &mut self,
         parent: &str,
         fields: &[(ColumnInfo, PValue)],
         rowid: i64,
@@ -2197,20 +2257,27 @@ impl App {
         const PREVIEW_ROWS: usize = 4;
         const PREVIEW_COLS: usize = 4;
         let mut out = Vec::new();
-        for (child, child_col, parent_col) in self.db.child_links(parent) {
+        // Column index once (was a linear find per pane per flip).
+        let by_name: HashMap<&str, &PValue> = fields
+            .iter()
+            .map(|(c, v)| (c.name.as_str(), v))
+            .collect();
+        let pk_val = fields.iter().find(|(c, _)| c.pk).map(|(_, v)| v);
+        for (child, child_col, parent_col) in self.cached_links(parent) {
             // The parent-side key: the named column, or the pk (whose
             // value for an INTEGER PRIMARY KEY is the rowid itself).
-            let key = fields
-                .iter()
-                .find(|(c, _)| {
-                    if parent_col.is_empty() {
-                        c.pk
-                    } else {
-                        c.name.eq_ignore_ascii_case(&parent_col)
-                    }
-                })
-                .map(|(_, v)| v.clone())
-                .unwrap_or(PValue::Int(rowid));
+            let key = if parent_col.is_empty() {
+                pk_val.cloned().unwrap_or(PValue::Int(rowid))
+            } else if let Some(v) = by_name.get(parent_col.as_str()) {
+                (*v).clone()
+            } else {
+                // Case-variant fallback (same semantics as before).
+                fields
+                    .iter()
+                    .find(|(c, _)| c.name.eq_ignore_ascii_case(&parent_col))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(PValue::Int(rowid))
+            };
             let key_sql = match &key {
                 PValue::Null => continue, // unsaved/keyless: no pane
                 PValue::Int(i) => i.to_string(),
@@ -2295,18 +2362,24 @@ impl App {
     /// the parallel field vectors; returns the spec when it is PAINTED
     /// so EDIT can render the 2D layout.
     fn apply_crafted_form(
-        &self,
+        &mut self,
         table: &str,
         fields: &mut Vec<(ColumnInfo, PValue)>,
         labels: &mut Vec<String>,
         required: &mut Vec<bool>,
     ) -> Option<FormSpec> {
-        let spec = FormSpec::load(self.db.as_ref(), table)?;
+        let spec = self.cached_form(table)?;
+        // Column index once (was O(F*C) position() scans per record).
+        let index: HashMap<&str, usize> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, (c, _))| (c.name.as_str(), i))
+            .collect();
         let mut ordered = Vec::new();
         let mut new_labels = Vec::new();
         let mut new_required = Vec::new();
         for f in spec.fields.iter().filter(|f| f.include) {
-            if let Some(idx) = fields.iter().position(|(c, _)| c.name == f.column) {
+            if let Some(&idx) = index.get(f.column.as_str()) {
                 ordered.push(fields[idx].clone());
                 new_labels.push(f.label.clone());
                 new_required.push(f.required);
@@ -2334,7 +2407,7 @@ impl App {
             return self.say("this table has no rowid; cannot insert here");
         }
         let name = name.clone();
-        let cols = match self.db.columns(&name) {
+        let cols = match self.cached_columns(&name) {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
