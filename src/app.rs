@@ -5546,30 +5546,35 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod tmp_repro {
-    use super::*;
+/// An ALTER-added REAL column edits cleanly through the bus (the CRM
+/// demo's balance beat, pinned so a binding regression can't return).
+#[test]
+fn alter_added_column_edits_cleanly() {
     use crate::db::EmbeddedDb;
-    #[test]
-    fn tmp_alter_balance_edit() {
-        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
-        db.execute(
-            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
-             INSERT INTO customers(name, city) VALUES ('Ada', 'London');
-             ALTER TABLE customers ADD COLUMN balance real default 0;",
-        )
-        .unwrap();
-        let mut a = App::new(Box::new(db), None);
-        a.apply(Command::OpenSelected);
-        a.sync();
-        a.apply(Command::OpenEdit);
-        a.apply(Command::EditMove(3));
-        a.apply(Command::EditBegin);
-        for c in "120.5".chars() {
-            a.apply(Command::EditChar(c));
-        }
-        a.apply(Command::EditCommitField);
-        assert!(!a.status.as_ref().is_some_and(|(m, e)| *e), "status: {:?}", a.status);
+    let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+    db.execute(
+        "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+         INSERT INTO customers(name, city) VALUES ('Ada', 'London');
+         ALTER TABLE customers ADD COLUMN balance real default 0;",
+    )
+    .unwrap();
+    let mut a = App::new(Box::new(db), None);
+    a.apply(Command::OpenSelected);
+    a.sync();
+    a.apply(Command::OpenEdit);
+    a.apply(Command::EditMove(3));
+    a.apply(Command::EditBegin);
+    for c in "120.5".chars() {
+        a.apply(Command::EditChar(c));
     }
+    a.apply(Command::EditCommitField);
+    a.sync(); // the fresh window arrives async
+    assert!(
+        !a.status.as_ref().is_some_and(|(_, e)| *e),
+        "status: {:?}",
+        a.status
+    );
+    let g = a.grid.as_ref().unwrap();
+    assert_eq!(g.row(0).unwrap()[3], PValue::Real(120.5));
 }
 

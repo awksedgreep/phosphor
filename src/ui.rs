@@ -127,7 +127,7 @@ fn draw_create(f: &mut Frame, app: &App) {
     let name_selected = st.cursor == 0;
     use crate::creator::EditSlot;
     let name_span: Span = match (name_selected, st.slot, &st.editing) {
-        (true, EditSlot::Name, Some(buf)) => editing_span(buf, th),
+        (true, EditSlot::Name, Some(buf)) => editing_span(buf, 17, th),
         _ => Span::styled(
             st.draft.table.clone(),
             if name_selected { th.cursor() } else { th.bright() },
@@ -151,15 +151,15 @@ fn draw_create(f: &mut Frame, app: &App) {
         let selected = st.cursor == i + 1;
         let style = if selected { th.cursor() } else { th.base() };
         let name: Span = match (selected, st.slot, &st.editing) {
-            (true, EditSlot::Name, Some(buf)) => editing_span(buf, th),
+            (true, EditSlot::Name, Some(buf)) => editing_span(buf, 16, th),
             _ => Span::styled(pad(&fld.name, 16), style),
         };
         let default: Span = match (selected, st.slot, &st.editing) {
-            (true, EditSlot::Default, Some(buf)) => editing_span(buf, th),
+            (true, EditSlot::Default, Some(buf)) => editing_span(buf, 13, th),
             _ => Span::styled(pad(&fld.default, 13), style),
         };
         let refs: Span = match (selected, st.slot, &st.editing) {
-            (true, EditSlot::Refs, Some(buf)) => editing_span(buf, th),
+            (true, EditSlot::Refs, Some(buf)) => editing_span(buf, 0, th),
             _ => Span::styled(fld.references.clone(), style),
         };
         lines.push(Line::from(vec![
@@ -297,7 +297,7 @@ fn draw_paint(f: &mut Frame, app: &App) {
         let w = (buf.chars().count() as u16 + 1).max(1);
         if let Some(r) = canvas_rect(inner, st.cursor.0, st.cursor.1, w, 1) {
             f.render_widget(
-                Paragraph::new(Line::from(editing_span(buf, th))),
+                Paragraph::new(Line::from(editing_span(buf, w, th))),
                 r,
             );
         }
@@ -365,7 +365,7 @@ fn draw_form(f: &mut Frame, app: &App) {
         let selected = i == st.cursor;
         let style = if selected { th.cursor() } else { th.base() };
         let label: Span = match (selected, &st.editing) {
-            (true, Some(buf)) => editing_span(buf, th),
+            (true, Some(buf)) => editing_span(buf, 0, th),
             _ => Span::styled(field.label.clone(), style),
         };
         lines.push(Line::from(vec![
@@ -413,10 +413,10 @@ fn draw_apps(f: &mut Frame, app: &App) {
         let (label, target): (Span, Span) = match (selected, &st.editing) {
             (true, Some(buf)) if st.editing_ref => (
                 Span::styled(pad(&item.label, 24), style),
-                editing_span(buf, th),
+                editing_span(buf, 0, th),
             ),
             (true, Some(buf)) => (
-                editing_span(buf, th),
+                editing_span(buf, 24, th),
                 Span::styled(item.action_ref.clone(), style),
             ),
             _ => (
@@ -484,8 +484,11 @@ fn draw_app_menu(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn editing_span<'a>(buf: &'a str, th: &crate::theme::Theme) -> Span<'a> {
-    Span::styled(format!("{buf}▏"), th.cursor())
+/// The editing cell: buffer + caret, PADDED to the column width so the
+/// columns to its right hold still while you type (they used to slide
+/// with every keystroke — the designer's "drifting type" bug).
+fn editing_span<'a>(buf: &'a str, width: u16, th: &crate::theme::Theme) -> Span<'a> {
+    Span::styled(pad(&format!("{buf}▏"), width.max(buf.chars().count() as u16 + 1)), th.cursor())
 }
 
 fn draw_qbe(f: &mut Frame, app: &App) {
@@ -522,7 +525,7 @@ fn draw_qbe(f: &mut Frame, app: &App) {
         let selected = i == st.cursor;
         let row_style = if selected { th.cursor() } else { th.base() };
         let filter: Span = match (selected && !st.naming, &st.editing) {
-            (true, Some(buf)) => editing_span(buf, th),
+            (true, Some(buf)) => editing_span(buf, 0, th),
             _ => Span::styled(col.filter.clone(), row_style),
         };
         lines.push(Line::from(vec![
@@ -536,7 +539,7 @@ fn draw_qbe(f: &mut Frame, app: &App) {
     if st.naming {
         lines.push(Line::from(vec![
             Span::styled("save as: ", th.bright()),
-            editing_span(st.editing.as_deref().unwrap_or(""), th),
+            editing_span(st.editing.as_deref().unwrap_or(""), 0, th),
         ]));
     }
     let rows_h = lines.len() as u16;
@@ -588,7 +591,7 @@ fn draw_report(f: &mut Frame, app: &App) {
     for (i, (label, value)) in fields.iter().enumerate() {
         let selected = i == st.cursor;
         let value_span = match (selected, &st.editing) {
-            (true, Some(buf)) => editing_span(buf, th),
+            (true, Some(buf)) => editing_span(buf, 0, th),
             _ => Span::styled(
                 value.clone(),
                 if selected { th.cursor() } else { th.base() },
