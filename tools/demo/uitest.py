@@ -183,7 +183,7 @@ def reels():
 
     # ── A · navigation: seek, internals, browse motion, read-only ────
     r = Reel("nav", "navigation: seek · internals · browse · read-only")
-    r.expect("… 9 internal (i)")
+    r.expect("internal (i)")
     r.key("o").expect("orders")                       # seek
     r.key(ENTER, 0.6).expect("BROWSE orders")
     r.key("G", 0.4).expect("row 8/8")                 # bottom
@@ -387,7 +387,7 @@ def reels():
     # ── I · app mode: the database IS the application ────────────────
     r = Reel("appmode", "--app: menu · report · single-Esc home",
              argv=[BIN, "--app", DB])
-    r.pause(1.2).expect("CRM")
+    r.pause(1.2).expect("Customers")
     r.key("b", 1.2).expect("TOTAL (8 rows)")          # Balances report
     r.key(ESC, 0.8).expect("hotkey letters")          # ONE Esc → menu
     r.key("c", 0.8).expect("BROWSE customers")

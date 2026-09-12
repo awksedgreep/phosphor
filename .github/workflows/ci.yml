@@ -16,9 +16,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: clippy (deny warnings)
         run: cargo clippy --all-targets -- -D warnings
+      - name: fmt
+        run: cargo fmt --check
       - name: tests
         # The sqld and timeless-extension integration tests detect their
         # dependencies and skip gracefully on bare runners.
         run: cargo test
+      - name: manual is generated, not stale
+        # docs/MANUAL.md must match `phosphor --manual` (issue #24).
+        run: |
+          cargo run --quiet --bin phosphor -- --manual | diff -u docs/MANUAL.md -
+      - name: perf budgets (release)
+        # DESIGN.md speed budgets, asserted only in release (issue #23).
+        run: cargo test --release perf_budget
       - name: build release
         run: cargo build --release

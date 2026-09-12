@@ -74,7 +74,9 @@ impl Theme {
     pub fn health(&self, status: &str) -> Style {
         match status {
             "ok" => self.base(),
-            "warn" => Style::default().fg(Color::Rgb(0xff, 0xb0, 0x00)).bg(self.bg),
+            "warn" => Style::default()
+                .fg(Color::Rgb(0xff, 0xb0, 0x00))
+                .bg(self.bg),
             "attention" => self.error(),
             _ => self.dim(),
         }

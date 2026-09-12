@@ -19,6 +19,13 @@ pub struct FormField {
     pub pos: Option<(u16, u16)>,
     /// Width of the value cell in painted mode.
     pub width: u16,
+    /// dBASE PICTURE mask (`999-99-9999`). Empty = free text. `9` digit,
+    /// `A` letter, `X`/`#` alphanumeric, anything else is a literal.
+    pub mask: String,
+    /// A SQL expression shown read-only on the form (`qty * amount`).
+    /// A field with `computed` need not name a real column; its value is
+    /// calculated per record and never written back.
+    pub computed: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +65,8 @@ impl FormSpec {
                 required: false,
                 pos: None,
                 width: DEFAULT_FIELD_WIDTH,
+                mask: String::new(),
+                computed: String::new(),
             })
             .collect();
         FormSpec {
@@ -112,7 +121,8 @@ impl FormSpec {
                 let mut v = serde_json::json!({
                     "column": f.column, "label": f.label,
                     "include": f.include, "required": f.required,
-                    "width": f.width,
+                    "width": f.width, "mask": f.mask,
+                    "computed": f.computed,
                 });
                 if let Some((x, y)) = f.pos {
                     v["x"] = x.into();
@@ -155,8 +165,11 @@ impl FormSpec {
                     _ => None,
                 },
                 width: u16_of(&f["width"]).unwrap_or(DEFAULT_FIELD_WIDTH).max(1),
+                mask: f["mask"].as_str().unwrap_or("").to_owned(),
+                computed: f["computed"].as_str().unwrap_or("").to_owned(),
             })
-            .filter(|f| !f.column.is_empty())
+            // A field needs an identity: a real column, or an expression.
+            .filter(|f| !f.column.is_empty() || !f.computed.is_empty())
             .collect();
         let texts = v["texts"]
             .as_array()
@@ -201,11 +214,76 @@ impl FormSpec {
     }
 }
 
-/// List designer state (labels, include, required, order).
+/// Does `c` fit the PICTURE slot `m`? `9` digit, `A` letter,
+/// `X`/`N`/`#` alphanumeric — the dBASE conventions.
+fn char_fits(m: char, c: char) -> bool {
+    match m {
+        '9' => c.is_ascii_digit(),
+        'A' => c.is_ascii_alphabetic(),
+        'X' | 'N' | '#' => c.is_ascii_alphanumeric(),
+        _ => false,
+    }
+}
+
+/// Format `input` against a PICTURE `mask`, keeping only characters that
+/// fit a slot and inserting the literals. Used live as the user types.
+/// An empty mask returns the input unchanged.
+pub fn apply_mask(mask: &str, input: &str) -> String {
+    if mask.is_empty() {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(mask.len());
+    let mut it = input.chars().peekable();
+    for m in mask.chars() {
+        if matches!(m, '9' | 'A' | 'X' | 'N' | '#') {
+            // A slot: take the next input char that fits (skipping others).
+            while let Some(&c) = it.peek() {
+                it.next();
+                if char_fits(m, c) {
+                    out.push(c);
+                    break;
+                }
+            }
+        } else {
+            // A literal: consume it if the user typed it, then emit it.
+            if it.peek() == Some(&m) {
+                it.next();
+            }
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// True when `value` satisfies every mask slot and literal. An empty mask
+/// is always valid; an empty value is valid too (NULL, unless required).
+pub fn mask_ok(mask: &str, value: &str) -> bool {
+    if mask.is_empty() || value.is_empty() {
+        return true;
+    }
+    let mut it = value.chars();
+    for m in mask.chars() {
+        if matches!(m, '9' | 'A' | 'X' | 'N' | '#') {
+            match it.next() {
+                Some(c) if char_fits(m, c) => {}
+                _ => return false,
+            }
+        } else if it.next() != Some(m) {
+            return false;
+        }
+    }
+    true
+}
+
+/// List designer state (labels, include, required, order, mask).
 pub struct FormState {
     pub spec: FormSpec,
     pub cursor: usize,
     pub editing: Option<String>,
+    /// true → the buffer edits the PICTURE mask, false → the label.
+    pub editing_mask: bool,
+    /// true → the buffer edits the computed expression.
+    pub editing_computed: bool,
 }
 
 /// The painter: a canvas cursor, a selected field, optional text-input
@@ -312,7 +390,15 @@ mod tests {
         assert_eq!(back.fields[0].pos, Some((4, 2)));
         assert_eq!(back.fields[1].width, 32);
         assert_eq!(back.texts[0].text, "CUSTOMER ENTRY");
-        assert_eq!(back.boxes[0], BoxItem { x: 1, y: 1, w: 50, h: 8 });
+        assert_eq!(
+            back.boxes[0],
+            BoxItem {
+                x: 1,
+                y: 1,
+                w: 50,
+                h: 8
+            }
+        );
         assert_eq!(back.size, (60, 14));
     }
 
@@ -327,6 +413,53 @@ mod tests {
         assert!(spec.fields[1].required);
         assert!(!spec.painted());
         assert_eq!(spec.size, DEFAULT_CANVAS);
+    }
+
+    #[test]
+    fn picture_masks_format_and_validate() {
+        assert_eq!(apply_mask("", "abc"), "abc");
+        assert_eq!(apply_mask("999-99-9999", "123456789"), "123-45-6789");
+        assert_eq!(apply_mask("999-99-9999", "123-45-6789"), "123-45-6789");
+        assert_eq!(apply_mask("A9A 9A9", "k1x 2y3"), "k1x 2y3");
+        // Non-fitting characters are dropped, literals re-inserted.
+        assert_eq!(apply_mask("99/99", "1a2b3"), "12/3");
+        assert!(mask_ok("999-99-9999", "123-45-6789"));
+        assert!(!mask_ok("999-99-9999", "123-45-678"));
+        assert!(!mask_ok("999-99-9999", "12a-45-6789"));
+        assert!(mask_ok("", "anything"));
+        assert!(mask_ok("999", ""), "empty is NULL, allowed unless required");
+    }
+
+    #[test]
+    fn mask_round_trips_through_store() {
+        let db = db();
+        let mut spec = FormSpec::from_columns("c", db.columns("c").unwrap());
+        spec.fields[1].mask = "999-99-9999".into();
+        spec.save(&db).unwrap();
+        let back = FormSpec::load(&db, "c").unwrap();
+        assert_eq!(back.fields[1].mask, "999-99-9999");
+        assert_eq!(back.fields[0].mask, "");
+    }
+
+    #[test]
+    fn computed_fields_round_trip() {
+        let db = db();
+        let mut spec = FormSpec::from_columns("c", db.columns("c").unwrap());
+        spec.fields.push(FormField {
+            column: "total".into(),
+            label: "Total".into(),
+            include: true,
+            required: false,
+            pos: None,
+            width: 12,
+            mask: String::new(),
+            computed: "length(email)".into(),
+        });
+        spec.save(&db).unwrap();
+        let back = FormSpec::load(&db, "c").unwrap();
+        let total = back.fields.iter().find(|f| f.column == "total").unwrap();
+        assert_eq!(total.computed, "length(email)");
+        assert_eq!(total.label, "Total");
     }
 
     #[test]

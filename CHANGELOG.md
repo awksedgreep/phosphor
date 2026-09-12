@@ -1,5 +1,58 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **CSV import/export** at the dot prompt (#14): `import <table> <path>`
+  (headered, case-insensitive column match, empty → NULL, transactional)
+  and `export <table|SELECT> <path>` (proper CSV quoting). New `csv_io`
+  module; works embedded or over sqld.
+- **Printing** from the pager (#13): `p` writes the report/labels file and
+  pipes it to `$PHOSPHOR_PRINT` (default `lp`, then `lpr`); a missing
+  printer reports cleanly and leaves the text file for manual printing.
+- **Report `GROUP BY` expressions** (#17): the report designer's group-by
+  cell accepts any SQL expression (`substr(city,1,1)`), not just a column
+  name, via a synthetic ordering column stripped before layout.
+- **QBE joins + GROUP BY** (#16): `J` cycles FK-driven JOINs (both
+  directions), qualifying the projection; `g` cycles GROUP BY, collapsing
+  to `key, count(*) AS n`. The live SQL preview shows both.
+- **PICTURE masks** (#15, first slice): form designer `m` sets a dBASE
+  input mask (`999-99-9999`); the EDIT buffer formats as you type and a
+  save that doesn't fit is refused.
+- **Foreign-key pickers** (#15, second slice): `F7` on a declared FK
+  field pops a parent-row picker; Enter writes the chosen key into the
+  field — dBASE value lookup, no manual id typing.
+- **Computed form fields** (#15, third slice): form designer `c` sets a
+  SQL expression (`qty * price`) rendered read-only (`ƒ`); it is
+  calculated per record in one query and never written back.
+- **Persistent appearance** (#22): `set theme` and `set shimmer on|off`
+  are remembered in `_phosphor_prefs` across sessions; shimmer dims every
+  other screen row (off by default).
+- **Manual drift guard** (#24): a test and a CI step assert that
+  `docs/MANUAL.md` matches `phosphor --manual`.
+- **Perf budgets in CI** (#23): release-only tests assert embedded page
+  and worker round-trip stay under budget (measured ~36µs / ~17µs).
+- **Key reference** (#25): the F1 key topic now covers the table editor,
+  split view, designer keys (mask/join/group), and CSV/print commands.
+- **Index & vacuum advisor** (#19): `advise` lists foreign-key columns
+  without an index (with the exact `CREATE INDEX`), plus a VACUUM nudge
+  from dbhealth's bloat check.
+- **Split orientation** (#18): `H` stacks the master above the detail
+  pane (default stays side-by-side); the choice is remembered.
+- **Read-only kiosk + app version** (#21): `--app --readonly` refuses
+  every write centrally; `_phosphor_apps.version` migrates in place and
+  shows in the menu title when above 1.
+
+### Fixed
+- `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).
+- TABLE EDITOR `ALTER TABLE RENAME` + `DROP/ADD COLUMN` targeting the old name after a table rename (now targets the live name); column renames already handled.
+- `DbHandle::call` buffering `Duration::ZERO` for async responses arriving during a sync call (now preserves worker-measured latency).
+- `has_rowid` negative-cache poisoning on transient errors (now only caches definitive `no such column` failures, both embedded and remote).
+- `EditCommitField` double `PValue::parse` per required field (now single quiet check + `commit_edit_inner(skip_required)`).
+
+### Chore
+- `cargo fmt` across the workspace (was ~2.8k lines of drift) and CI now runs `cargo fmt --check`.
+
 ## 0.1.0 — 2026-08-04
 
 The first tagged release: all five founding phases plus a season of

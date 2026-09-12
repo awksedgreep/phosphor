@@ -57,14 +57,33 @@ pub fn list_apps(db: &dyn DbLink) -> Vec<String> {
     store::names(db, "_phosphor_apps", "name")
 }
 
-/// Find-or-create an app by name; returns its id.
+/// Find-or-create an app by name; returns its id. Also brings older
+/// databases up to the current schema (the `version` column), since
+/// `CREATE TABLE IF NOT EXISTS` cannot alter an existing table.
 pub fn ensure_app(db: &dyn DbLink, name: &str) -> DbResult<i64> {
     store::ensure(db)?;
+    // Explicit migration, not part of the idempotent DDL. Ignore the
+    // "duplicate column name" error on databases that already have it.
+    let _ = db.execute("ALTER TABLE _phosphor_apps ADD COLUMN version INTEGER DEFAULT 1");
     db.execute(&format!(
         "INSERT OR IGNORE INTO _phosphor_apps(name) VALUES ({})",
         store::q(name)
     ))?;
     app_id(db, name).ok_or_else(|| format!("app {name:?} not found after insert"))
+}
+
+/// The app's declared version (defaults to 1 for pre-version databases).
+pub fn app_version(db: &dyn DbLink, name: &str) -> i64 {
+    db.query(&format!(
+        "SELECT version FROM _phosphor_apps WHERE name = {}",
+        store::q(name)
+    ))
+    .ok()
+    .and_then(|q| q.rows.into_iter().next())
+    .and_then(|r| r.into_iter().next())
+    .map(|v| store::int(Some(&v)))
+    .filter(|v| *v > 0)
+    .unwrap_or(1)
 }
 
 pub fn app_id(db: &dyn DbLink, name: &str) -> Option<i64> {
@@ -155,6 +174,7 @@ pub struct AppDesignState {
 /// Runtime state: the menu end users drive.
 pub struct AppMenuState {
     pub app: String,
+    pub version: i64,
     pub items: Vec<AppItem>,
     pub cursor: usize,
 }
@@ -163,6 +183,25 @@ pub struct AppMenuState {
 mod tests {
     use super::*;
     use crate::db::EmbeddedDb;
+
+    /// #21: an app table created before the `version` column existed is
+    /// migrated in place, defaulting to version 1.
+    #[test]
+    fn legacy_app_table_migrates_version() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE _phosphor_apps (
+                 id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT);",
+        )
+        .unwrap();
+        ensure_app(&db, "legacy").unwrap();
+        assert_eq!(app_version(&db, "legacy"), 1);
+        let cols = db.columns("_phosphor_apps").unwrap();
+        assert!(
+            cols.iter().any(|c| c.name == "version"),
+            "version column added"
+        );
+    }
 
     #[test]
     fn app_crud_and_ordering() {

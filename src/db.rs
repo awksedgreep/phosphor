@@ -72,8 +72,7 @@ impl PValue {
         match self {
             PValue::Text(t) => {
                 let (h, n) = (t.as_bytes(), needle_lc.as_bytes());
-                n.len() <= h.len()
-                    && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+                n.len() <= h.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
             }
             // Numeric renders contain no letters when finite: an alpha
             // needle can never match, so skip rendering entirely.
@@ -230,12 +229,7 @@ pub trait DbLink: Send {
     fn query(&self, sql: &str) -> DbResult<QueryResult>;
     /// Non-SELECT statement; returns affected-row count (-1 if unknown).
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)>;
-    fn update_row(
-        &self,
-        table: &str,
-        rowid: i64,
-        changes: &[(String, PValue)],
-    ) -> DbResult<()>;
+    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()>;
     /// INSERT with the provided columns (omitted ones take DB defaults);
     /// returns the new rowid.
     fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64>;
@@ -258,11 +252,7 @@ pub trait DbLink: Send {
         q.rows
             .iter()
             .filter_map(|r| match (r.first(), r.get(1), r.get(2)) {
-                (
-                    Some(PValue::Text(from)),
-                    Some(PValue::Text(to_table)),
-                    to_col,
-                ) => Some((
+                (Some(PValue::Text(from)), Some(PValue::Text(to_table)), to_col) => Some((
                     from.clone(),
                     to_table.clone(),
                     match to_col {
@@ -284,7 +274,9 @@ pub trait DbLink: Send {
     /// the parent's rowid pk when the FK names no column. Works on any
     /// backend — it's plain SQL over pragma table-functions.
     fn child_links(&self, parent: &str) -> Vec<(String, String, String)> {
-        let Ok(tables) = self.tables() else { return Vec::new() };
+        let Ok(tables) = self.tables() else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         for t in &tables {
             if t.name.eq_ignore_ascii_case(parent) {
@@ -296,8 +288,7 @@ pub trait DbLink: Send {
             );
             let Ok(q) = self.query(&sql) else { continue };
             for row in &q.rows {
-                let (PValue::Text(to_table), PValue::Text(from_col)) = (&row[0], &row[1])
-                else {
+                let (PValue::Text(to_table), PValue::Text(from_col)) = (&row[0], &row[1]) else {
                     continue;
                 };
                 if !to_table.eq_ignore_ascii_case(parent) {
@@ -362,7 +353,13 @@ pub(crate) fn strip_window_total(
                 _ => return Err("rowid was not an integer".into()),
             }
         }
-        Ok((Page { rows, rowids: Some(rowids) }, total))
+        Ok((
+            Page {
+                rows,
+                rowids: Some(rowids),
+            },
+            total,
+        ))
     } else {
         Ok((Page { rows, rowids: None }, total))
     }
@@ -448,8 +445,8 @@ impl EmbeddedDb {
         if let Ok(ext) = std::env::var("PHOSPHOR_EXT") {
             if !ext.is_empty() {
                 let loaded = unsafe {
-                    let _guard = rusqlite::LoadExtensionGuard::new(&conn)
-                        .map_err(|e| e.to_string())?;
+                    let _guard =
+                        rusqlite::LoadExtensionGuard::new(&conn).map_err(|e| e.to_string())?;
                     conn.load_extension(&ext, None::<&str>)
                 };
                 if let Err(e) = loaded {
@@ -488,9 +485,7 @@ impl EmbeddedDb {
             }
             let mut out = Vec::with_capacity(ncols);
             for i in 0..ncols {
-                out.push(PValue::from_ref(
-                    row.get_ref(i).map_err(|e| e.to_string())?,
-                ));
+                out.push(PValue::from_ref(row.get_ref(i).map_err(|e| e.to_string())?));
             }
             rows_out.push(out);
         }
@@ -499,13 +494,18 @@ impl EmbeddedDb {
 
     /// Nearest anchor at/before `offset`, if any.
     fn anchor_plan(&self, table: &str, offset: i64) -> Option<(i64, i64)> {
-        self.anchors.lock().unwrap().get(table).and_then(|a| a.plan(offset))
+        self.anchors
+            .lock()
+            .unwrap()
+            .get(table)
+            .and_then(|a| a.plan(offset))
     }
 
     /// Record a fetched window's rowids (absolute positions).
     fn anchor_observe(&self, table: &str, offset: i64, rowids: &[i64]) {
         self.anchors
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .entry(table.to_owned())
             .or_default()
             .observe(offset, rowids);
@@ -536,11 +536,8 @@ impl EmbeddedDb {
                 "SELECT rowid, * FROM {q} WHERE rowid >= ?1 ORDER BY rowid LIMIT ?2"
             ))
             .map_err(|e| e.to_string())?;
-        let (all, _) = Self::collect_rows(
-            &mut stmt,
-            &[&start_rowid, &fetch],
-            fetch.max(0) as usize,
-        )?;
+        let (all, _) =
+            Self::collect_rows(&mut stmt, &[&start_rowid, &fetch], fetch.max(0) as usize)?;
         if (all.len() as i64) < skip {
             return Err("anchor overshot: table shrank under us".into());
         }
@@ -557,7 +554,10 @@ impl EmbeddedDb {
             }
         }
         self.anchor_observe(table, offset, &rowids);
-        Ok(Page { rows, rowids: Some(rowids) })
+        Ok(Page {
+            rows,
+            rowids: Some(rowids),
+        })
     }
 
     /// Plain OFFSET fetch in pinned rowid order; observes anchors.
@@ -578,7 +578,10 @@ impl EmbeddedDb {
             }
         }
         self.anchor_observe(table, offset, &rowids);
-        Ok(Page { rows, rowids: Some(rowids) })
+        Ok(Page {
+            rows,
+            rowids: Some(rowids),
+        })
     }
 }
 
@@ -644,12 +647,32 @@ impl DbLink for EmbeddedDb {
         if let Some(&known) = self.rowid_cache.lock().unwrap().get(table) {
             return known;
         }
-        let ok = self
+        let res = self
             .conn
-            .prepare_cached(&format!("SELECT rowid FROM {} LIMIT 0", Self::quote(table)))
-            .is_ok();
-        self.rowid_cache.lock().unwrap().insert(table.to_owned(), ok);
-        ok
+            .prepare_cached(&format!("SELECT rowid FROM {} LIMIT 0", Self::quote(table)));
+        match res {
+            Ok(_) => {
+                self.rowid_cache
+                    .lock()
+                    .unwrap()
+                    .insert(table.to_owned(), true);
+                true
+            }
+            Err(e) => {
+                let msg = e.to_string().to_ascii_lowercase();
+                // Definitive: WITHOUT ROWID / view has no rowid. Cache the
+                // negative. Anything else (locked, busy, auth, etc.) is
+                // transient — don't poison the cache.
+                let definitive = msg.contains("no such column") || msg.contains("has no column");
+                if definitive {
+                    self.rowid_cache
+                        .lock()
+                        .unwrap()
+                        .insert(table.to_owned(), false);
+                }
+                false
+            }
+        }
     }
 
     fn page(&self, table: &str, offset: i64, limit: i64) -> DbResult<Page> {
@@ -693,9 +716,10 @@ impl DbLink for EmbeddedDb {
         } else {
             format!("SELECT *, count(*) OVER () AS _total FROM {q}")
         };
-        let mut stmt = match self.conn.prepare_cached(&format!(
-            "{select} LIMIT {limit} OFFSET {offset}"
-        )) {
+        let mut stmt = match self
+            .conn
+            .prepare_cached(&format!("{select} LIMIT {limit} OFFSET {offset}"))
+        {
             Ok(s) => s,
             Err(_) => return fallback(),
         };
@@ -708,7 +732,10 @@ impl DbLink for EmbeddedDb {
             // about the total: only trust the shortcut for a real fetch.
             if offset == 0 && limit > 0 {
                 // Open on an empty table: total is exactly 0, no count needed.
-                let page = Page { rows: Vec::new(), rowids: with_rowid.then(Vec::new) };
+                let page = Page {
+                    rows: Vec::new(),
+                    rowids: with_rowid.then(Vec::new),
+                };
                 return Ok((page, 0));
             }
             return fallback();
@@ -726,11 +753,7 @@ impl DbLink for EmbeddedDb {
         // QUERY_CAP+1 rows => truncated flag stays exact.
         let capped = apply_cap(sql, QUERY_CAP + 1);
         let mut stmt = self.conn.prepare(&capped).map_err(|e| e.to_string())?;
-        let columns: Vec<String> = stmt
-            .column_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
+        let columns: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
         let (mut rows, _) = Self::collect_rows(&mut stmt, &[], QUERY_CAP + 1)?;
         let truncated = rows.len() > QUERY_CAP;
         rows.truncate(QUERY_CAP);
@@ -773,12 +796,7 @@ impl DbLink for EmbeddedDb {
         }
     }
 
-    fn update_row(
-        &self,
-        table: &str,
-        rowid: i64,
-        changes: &[(String, PValue)],
-    ) -> DbResult<()> {
+    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
         if changes.is_empty() {
             return Ok(());
         }
@@ -795,7 +813,8 @@ impl DbLink for EmbeddedDb {
         );
         let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
         for (i, (_, v)) in changes.iter().enumerate() {
-            stmt.raw_bind_parameter(i + 1, v).map_err(|e| e.to_string())?;
+            stmt.raw_bind_parameter(i + 1, v)
+                .map_err(|e| e.to_string())?;
         }
         stmt.raw_bind_parameter(changes.len() + 1, rowid)
             .map_err(|e| e.to_string())?;
@@ -815,8 +834,7 @@ impl DbLink for EmbeddedDb {
             format!("INSERT INTO {} DEFAULT VALUES", Self::quote(table))
         } else {
             let cols: Vec<String> = changes.iter().map(|(c, _)| Self::quote(c)).collect();
-            let marks: Vec<String> =
-                (1..=changes.len()).map(|i| format!("?{i}")).collect();
+            let marks: Vec<String> = (1..=changes.len()).map(|i| format!("?{i}")).collect();
             format!(
                 "INSERT INTO {} ({}) VALUES ({})",
                 Self::quote(table),
@@ -826,7 +844,8 @@ impl DbLink for EmbeddedDb {
         };
         let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
         for (i, (_, v)) in changes.iter().enumerate() {
-            stmt.raw_bind_parameter(i + 1, v).map_err(|e| e.to_string())?;
+            stmt.raw_bind_parameter(i + 1, v)
+                .map_err(|e| e.to_string())?;
         }
         stmt.raw_execute().map_err(|e| e.to_string())?;
         // Cascade/trigger writes may touch other tables: drop all anchors.
@@ -877,7 +896,9 @@ impl DbLink for EmbeddedDb {
     /// instead of the default method's N queries (one per table).
     /// Column order mirrors the default: (child_tbl, to_table, from, to).
     fn child_links(&self, parent: &str) -> Vec<(String, String, String)> {
-        let Ok(tables) = self.tables() else { return Vec::new() };
+        let Ok(tables) = self.tables() else {
+            return Vec::new();
+        };
         let parts: Vec<String> = tables
             .iter()
             .filter(|t| !t.name.eq_ignore_ascii_case(parent))
@@ -894,7 +915,9 @@ impl DbLink for EmbeddedDb {
         if parts.is_empty() {
             return Vec::new();
         }
-        let Ok(q) = self.query(&parts.join(" UNION ALL ")) else { return Vec::new() };
+        let Ok(q) = self.query(&parts.join(" UNION ALL ")) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         for row in &q.rows {
             let [PValue::Text(child), PValue::Text(to_table), PValue::Text(from_col), to_col] =
@@ -985,7 +1008,12 @@ mod tests {
         db.execute("BEGIN").unwrap();
         for chunk in 0..200 {
             let mut ins = String::from("INSERT INTO big(v) VALUES ");
-            ins.push_str(&(0..1000).map(|i| format!("('r{}')", chunk * 1000 + i)).collect::<Vec<_>>().join(","));
+            ins.push_str(
+                &(0..1000)
+                    .map(|i| format!("('r{}')", chunk * 1000 + i))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             db.execute(&ins).unwrap();
         }
         db.execute("COMMIT").unwrap();
@@ -1011,6 +1039,66 @@ mod tests {
         // first-time statement preparation. The equivalence test above
         // pins correctness; the printout documents the speedup.
         eprintln!("deep page: cold OFFSET {cold:?} vs warm keyset {warm:?}");
+    }
+
+    /// #23: the DESIGN.md speed budget, enforced in release builds only
+    /// (`cargo test --release perf_budget`). Debug timing is meaningless,
+    /// so the test compiles out under `cfg(debug_assertions)`; the bound
+    /// is deliberately loose (2 ms vs the 1 ms target) to survive a
+    /// shared CI runner while still catching an order-of-magnitude
+    /// regression (e.g. a lost prepare-cache or OFFSET-only paging).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn perf_budget_embedded_pages() {
+        use std::time::Duration;
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE big(v TEXT)").unwrap();
+        db.execute("BEGIN").unwrap();
+        for chunk in 0..20 {
+            let mut ins = String::from("INSERT INTO big(v) VALUES ");
+            ins.push_str(
+                &(0..1000)
+                    .map(|i| format!("('r{}')", chunk * 1000 + i))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            db.execute(&ins).unwrap();
+        }
+        db.execute("COMMIT").unwrap();
+        // Warm the statement cache once.
+        db.page("big", 0, 150).unwrap();
+        let n = 120i64;
+        let t0 = std::time::Instant::now();
+        for i in 0..n {
+            db.page("big", i * 150, 150).unwrap();
+        }
+        let avg = t0.elapsed() / n as u32;
+        eprintln!("perf budget: avg embedded page {avg:?}");
+        assert!(
+            avg < Duration::from_millis(2),
+            "embedded page budget blown: {avg:?} (target < 1 ms)"
+        );
+    }
+
+    /// #23: worker-thread round-trip overhead stays small in release.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn perf_budget_worker_roundtrip() {
+        use std::time::Duration;
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(x)").unwrap();
+        let handle = crate::worker::spawn(Box::new(db));
+        let n = 1_000i64;
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            handle.query("SELECT 1").unwrap();
+        }
+        let avg = t0.elapsed() / n as u32;
+        eprintln!("perf budget: avg worker round-trip {avg:?}");
+        assert!(
+            avg < Duration::from_millis(2),
+            "worker round-trip budget blown: {avg:?}"
+        );
     }
 
     /// CASCADE deletes shift OTHER tables' positions: any write drops
@@ -1063,24 +1151,34 @@ mod tests {
                 ))
                 .unwrap();
             (
-                q.rows.iter().map(|r| match r[0] {
-                    PValue::Int(id) => id,
-                    _ => panic!(),
-                }).collect(),
-                q.rows.iter().map(|r| match &r[1] {
-                    PValue::Text(t) => t.clone(),
-                    _ => panic!(),
-                }).collect(),
+                q.rows
+                    .iter()
+                    .map(|r| match r[0] {
+                        PValue::Int(id) => id,
+                        _ => panic!(),
+                    })
+                    .collect(),
+                q.rows
+                    .iter()
+                    .map(|r| match &r[1] {
+                        PValue::Text(t) => t.clone(),
+                        _ => panic!(),
+                    })
+                    .collect(),
             )
         };
         for offset in [0, 1, 63, 64, 65, 100, 150, 200, 299, 300, 999] {
             let page = db.page("k", offset, 50).unwrap();
             let (ids, vals) = truth(offset, 50);
             assert_eq!(page.rowids, Some(ids), "rowids at {offset}");
-            let got: Vec<String> = page.rows.iter().map(|r| match &r[0] {
-                PValue::Text(t) => t.clone(),
-                _ => panic!(),
-            }).collect();
+            let got: Vec<String> = page
+                .rows
+                .iter()
+                .map(|r| match &r[0] {
+                    PValue::Text(t) => t.clone(),
+                    _ => panic!(),
+                })
+                .collect();
             assert_eq!(got, vals, "rows at {offset}");
         }
     }
@@ -1092,7 +1190,12 @@ mod tests {
         let (db, _) = EmbeddedDb::open(":memory:").unwrap();
         db.execute("CREATE TABLE k(v TEXT)").unwrap();
         let mut ins = String::from("INSERT INTO k(v) VALUES ");
-        ins.push_str(&(0..300).map(|i| format!("('r{i}')")).collect::<Vec<_>>().join(","));
+        ins.push_str(
+            &(0..300)
+                .map(|i| format!("('r{i}')"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
         db.execute(&ins).unwrap();
         // Fly forward in windows like PgDn-hold does.
         let mut off = 0;
@@ -1115,21 +1218,28 @@ mod tests {
         let (db, _) = EmbeddedDb::open(":memory:").unwrap();
         db.execute("CREATE TABLE k(v TEXT)").unwrap();
         db.execute("INSERT INTO k(v) VALUES ('a'), ('b')").unwrap();
-        db.execute("CREATE VIEW v AS SELECT v AS letter FROM k").unwrap();
+        db.execute("CREATE VIEW v AS SELECT v AS letter FROM k")
+            .unwrap();
         db.page("k", 0, 10).unwrap();
         assert!(db.anchors.lock().unwrap().contains_key("k"));
         // A view page records nothing (no rowids to anchor on).
         db.page("v", 0, 10).unwrap();
         assert!(!db.anchors.lock().unwrap().contains_key("v"));
         db.delete_row("k", 1).unwrap();
-        assert!(!db.anchors.lock().unwrap().contains_key("k"), "delete voids");
+        assert!(
+            !db.anchors.lock().unwrap().contains_key("k"),
+            "delete voids"
+        );
         // Content after the gap: positions shift, rowids show the hole.
         let page = db.page("k", 0, 10).unwrap();
         assert_eq!(page.rowids, Some(vec![2]));
         assert_eq!(page.rows.len(), 1);
         db.page("k", 0, 10).unwrap();
         db.execute("INSERT INTO k(v) VALUES ('z')").unwrap();
-        assert!(!db.anchors.lock().unwrap().contains_key("k"), "execute voids");
+        assert!(
+            !db.anchors.lock().unwrap().contains_key("k"),
+            "execute voids"
+        );
     }
 
     /// Anchor memory stays bounded no matter how far the flight goes.
@@ -1146,7 +1256,8 @@ mod tests {
     }
 
     #[test]
-    fn open_window_matches_page_plus_count() {        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+    fn open_window_matches_page_plus_count() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
         db.execute(
             "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
              INSERT INTO t(v) VALUES ('a'), ('b'), ('c');",
@@ -1158,12 +1269,14 @@ mod tests {
         assert_eq!(page.rows.len(), 2);
         assert_eq!(page.rowids, Some(vec![2, 3]));
         // Rowid-less view: no rowids, total still rides along.
-        db.execute("CREATE VIEW v AS SELECT v AS letter FROM t").unwrap();
+        db.execute("CREATE VIEW v AS SELECT v AS letter FROM t")
+            .unwrap();
         let (page, total) = db.open_window("v", 0, 10).unwrap();
         assert_eq!((total, page.rows.len()), (3, 3));
         assert_eq!(page.rowids, None);
         // Empty table at offset 0: total exactly 0, no count query.
-        db.execute("CREATE TABLE e(id INTEGER PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE e(id INTEGER PRIMARY KEY)")
+            .unwrap();
         let (page, total) = db.open_window("e", 0, 10).unwrap();
         assert_eq!((total, page.rows.len()), (0, 0));
         // Past-the-end window falls back to count (total still right).
@@ -1209,7 +1322,9 @@ mod tests {
             PValue::Null,
             PValue::Blob(vec![0xab, 0x12]),
         ];
-        for needle in ["ada", "LACE", "42", "100", "∅", "x'ab", "zzz", "", "nan", "inf", "-inf"] {
+        for needle in [
+            "ada", "LACE", "42", "100", "∅", "x'ab", "zzz", "", "nan", "inf", "-inf",
+        ] {
             let lc = needle.to_ascii_lowercase();
             let has_alpha = lc.bytes().any(|b| b.is_ascii_alphabetic());
             for v in &cases {
@@ -1244,7 +1359,14 @@ mod tests {
         .unwrap();
         let mut links = db.child_links("customers");
         links.sort();
-        assert_eq!(links, [("orders".to_owned(), "customer_id".to_owned(), "id".to_owned())]);
+        assert_eq!(
+            links,
+            [(
+                "orders".to_owned(),
+                "customer_id".to_owned(),
+                "id".to_owned()
+            )]
+        );
         assert!(db.child_links("orphan").is_empty());
     }
 

@@ -6,9 +6,11 @@
 //! PHOSPHOR_EXT=/path/to/libtimeless_ext.so loads the timeless extension
 //! into embedded connections (enables dbhealth + telemetry vtabs).
 
+mod advisor;
 mod app;
 mod appsgen;
 mod creator;
+mod csv_io;
 mod db;
 mod forms;
 mod help;
@@ -39,6 +41,8 @@ USAGE
 OPTIONS
     --app [NAME]   boot into an application menu crafted with the
                    Applications Generator (A inside phosphor)
+    --readonly     with --app: a kiosk; browses and reports work,
+                   every write is refused
     --manual       print the full manual as markdown and exit
     -h, --help     this help
     -V, --version  version
@@ -67,6 +71,9 @@ fn main() -> std::io::Result<()> {
         print!("{}", help::manual_markdown());
         return Ok(());
     }
+    // Strip `--readonly` before `--app` parses its optional name.
+    let readonly = args.iter().any(|a| a == "--readonly");
+    args.retain(|a| a != "--readonly");
     let mut app_mode = false;
     let mut app_name: Option<String> = None;
     if let Some(i) = args.iter().position(|a| a == "--app") {
@@ -77,10 +84,7 @@ fn main() -> std::io::Result<()> {
             app_name = Some(args.remove(i));
         }
     }
-    let path = args
-        .first()
-        .cloned()
-        .unwrap_or_else(|| ":memory:".into());
+    let path = args.first().cloned().unwrap_or_else(|| ":memory:".into());
     // `phosphor file.db` = embedded; `phosphor http://host:8880` = sqld
     // over Hrana HTTP (PHOSPHOR_TOKEN for authenticated servers).
     let (link, warning): (Box<dyn DbLink>, Option<String>) =
@@ -102,18 +106,16 @@ fn main() -> std::io::Result<()> {
             }
         };
     let mut app = App::new(link, warning);
+    app.readonly = readonly;
     if app_mode {
         // The database IS the application (DESIGN.md phase 5).
-        app.app_home = app_name.clone().or_else(|| {
-            crate::appsgen::list_apps(app.db.link()).into_iter().next()
-        });
+        app.app_home = app_name
+            .clone()
+            .or_else(|| crate::appsgen::list_apps(app.db.link()).into_iter().next());
         app.apply(app::Command::OpenAppMenu(app.app_home.clone()));
     }
 
-    fn finish(
-        _terminal: ratatui::DefaultTerminal,
-        r: std::io::Result<()>,
-    ) -> std::io::Result<()> {
+    fn finish(_terminal: ratatui::DefaultTerminal, r: std::io::Result<()>) -> std::io::Result<()> {
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
             ratatui::crossterm::event::DisableMouseCapture

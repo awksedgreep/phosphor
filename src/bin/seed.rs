@@ -16,10 +16,7 @@ use rand::Rng;
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().unwrap_or_else(|| "big.db".into());
-    let n: usize = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(2000);
+    let n: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(2000);
 
     let conn = rusqlite::Connection::open(&path).expect("open db");
     // Fast-load PRAGMAs: this is a throwaway bulk fill, not a ledger.

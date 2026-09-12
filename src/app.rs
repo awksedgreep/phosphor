@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::creator::CreateState;
 use crate::db::{ColumnInfo, DbLink, DbResult, PValue, TableInfo};
-use crate::forms::{BoxItem, FormSpec, FormState, PaintState, TextItem};
+use crate::forms::{apply_mask, mask_ok, BoxItem, FormSpec, FormState, PaintState, TextItem};
 use crate::help::{self, HelpState};
 use crate::qbe::{QbeSpec, QbeState};
 use crate::report::{self, PagerState, ReportSpec, ReportState};
@@ -31,6 +31,10 @@ pub enum Focus {
     Prompt,
 }
 
+// The design states differ widely in size (a full EDIT form vs a small
+// help cursor); they live one-at-a-time in one App field, so the enum
+// being as large as its biggest variant is fine.
+#[allow(clippy::large_enum_variant)]
 pub enum Overlay {
     None,
     Help(HelpState),
@@ -86,6 +90,10 @@ pub struct EditState {
     pub labels: Vec<String>,
     /// Required-ness per field (from the crafted form; save enforces).
     pub required: Vec<bool>,
+    /// PICTURE mask per field (from the crafted form; empty = free text).
+    pub masks: Vec<String>,
+    /// Computed expression per field; Some = read-only calculated value.
+    pub computed: Vec<Option<String>>,
     /// Edited text per field; None = untouched.
     pub inputs: Vec<Option<String>>,
     pub cursor: usize,
@@ -93,12 +101,30 @@ pub struct EditState {
     pub editing: Option<String>,
     /// Child panes from declared FKs pointing at this table.
     pub links: Vec<LinkPane>,
+    /// (parent table, parent key column) per field when the column is a
+    /// declared outgoing FK — the target of `F7` value lookup.
+    pub pickers: Vec<Option<(String, String)>>,
+    /// The open FK picker, if any (drawn over the form).
+    pub picker: Option<PickerState>,
 }
 
 impl EditState {
     pub fn dirty(&self) -> bool {
         self.inputs.iter().any(Option::is_some)
     }
+}
+
+/// A value-lookup pop-up for a foreign-key field (dBASE-style `F7`):
+/// pick a parent row and the key value is written into the field.
+pub struct PickerState {
+    pub title: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<PValue>>,
+    pub cursor: usize,
+    /// Index of the EDIT field this picker fills.
+    pub field: usize,
+    /// Index of the key column within `columns`.
+    pub key_col: usize,
 }
 
 pub enum GridSource {
@@ -205,13 +231,24 @@ pub enum Command {
     CreateRefs,
     /// Open link pane N as a filtered BROWSE of the child table.
     EditOpenLink(usize),
+    /// F7 on a foreign-key field: open the parent-row value picker.
+    EditPick,
+    /// Move the open picker's cursor.
+    PickerMove(i64),
+    /// Write the picked key value into the field and close.
+    PickerCommit,
+    /// Close the picker without changing the field.
+    PickerCancel,
     Focus(Focus),
     Back,
     Help,
     Refresh,
     SidebarMove(i64),
     OpenSelected,
-    GridMove { dr: i64, dc: i64 },
+    GridMove {
+        dr: i64,
+        dc: i64,
+    },
     GridPage(i64),
     GridEdge(bool),
     GridTop,
@@ -248,8 +285,17 @@ pub enum Command {
     DesignerDelete,
     DesignerSwap(i64),
     DesignerEditAlt,
+    /// Forms: edit the selected field's PICTURE mask (`m`).
+    DesignerEditMask,
+    /// Forms: edit the selected field's computed expression (`c`).
+    DesignerEditComputed,
+    /// QBE: cycle the FK-driven JOIN on/off (`J`).
+    DesignerJoin,
+    /// QBE: cycle the GROUP BY column on/off (`g`).
+    DesignerGroup,
     PagerScroll(i64),
     PagerWrite,
+    PagerPrint,
     OpenForm(Option<String>),
     OpenApps(Option<String>),
     OpenAppMenu(Option<String>),
@@ -261,7 +307,10 @@ pub enum Command {
     PromptClear,
     PromptDeleteWord,
     PromptComplete,
-    PaintMove { dx: i64, dy: i64 },
+    PaintMove {
+        dx: i64,
+        dy: i64,
+    },
     PaintPlace,
     PaintBox,
     PaintText,
@@ -280,6 +329,8 @@ pub enum Command {
     /// Toggle the split-view detail pane (SET RELATION on one screen).
     /// Cycles among a table's related children; 'v' again closes.
     ToggleSplit,
+    /// Flip the split orientation between side-by-side and stacked ('H').
+    ToggleSplitDir,
     /// The TABLE EDITOR: open the selected table's structure for
     /// changes (add / rename / drop columns), applied as ALTERs.
     OpenTableEditor,
@@ -289,7 +340,9 @@ pub enum Command {
     SidebarClick(usize),
     /// Place the focused pane's cursor on absolute row N; clicking
     /// the master's selection again opens EDIT.
-    GridClick { row: i64 },
+    GridClick {
+        row: i64,
+    },
     /// Scroll the pane under the wheel by N rows.
     GridScroll(i64),
     /// A worker response arrived (main loop polls, tests pump): the
@@ -310,7 +363,12 @@ enum PendingOp {
     /// Ad-hoc SELECT: build a query grid on arrival.
     Select { seq: u64 },
     /// Refresh: total + window into the live grid, then re-seek.
-    Refill { name: String, row: i64, col: usize, want_start: i64 },
+    Refill {
+        name: String,
+        row: i64,
+        col: usize,
+        want_start: i64,
+    },
     /// Scroll window: installs into the live grid when still wanted.
     Page { table: String, want_start: i64 },
     /// Find scan: one table window per response; hits jump, misses
@@ -346,7 +404,16 @@ pub struct App {
     pub db: DbHandle,
     /// Set by `--app`: Esc at top level returns to this app's menu.
     pub app_home: Option<String>,
+    /// `--app --readonly`: a kiosk that browses and runs reports but
+    /// refuses every write. Set by main before the loop starts.
+    pub readonly: bool,
+    /// Split orientation: false = side by side (default), true = master
+    /// stacked above the detail pane (`H` toggles; remembered).
+    pub split_horizontal: bool,
     pub theme: &'static Theme,
+    /// CRT scanline affectation (DESIGN.md): dims every other screen
+    /// row. Off by default; persisted per database.
+    pub shimmer: bool,
     pub focus: Focus,
     pub overlay: Overlay,
     pub tables: Vec<TableInfo>,
@@ -395,6 +462,8 @@ pub struct App {
     columns_cache: HashMap<String, Vec<ColumnInfo>>,
     form_cache: HashMap<String, Option<FormSpec>>,
     links_cache: HashMap<String, Vec<(String, String, String)>>,
+    /// Outgoing FK targets per table — the F7 pickers' fuel.
+    fks_cache: HashMap<String, Vec<(String, String, Option<String>)>>,
     /// Pane previews keyed by (child, child_col, key_sql): flipping
     /// back across records reuses them instead of re-querying.
     /// Cleared on writes (counts/previews may change) and capped.
@@ -425,7 +494,10 @@ impl App {
             // db call below round-trips to it (slice 1: blocking parity).
             db: crate::worker::spawn(db),
             app_home: None,
+            readonly: false,
+            split_horizontal: false,
             theme: &theme::GREEN,
+            shimmer: false,
             focus: Focus::Sidebar,
             overlay: Overlay::None,
             tables: Vec::new(),
@@ -457,6 +529,7 @@ impl App {
             columns_cache: HashMap::new(),
             form_cache: HashMap::new(),
             links_cache: HashMap::new(),
+            fks_cache: HashMap::new(),
             pane_cache: HashMap::new(),
             pending: HashMap::new(),
             pending_page: None,
@@ -468,6 +541,13 @@ impl App {
         };
         app.reload_tables();
         app.health = app.db.health();
+        // Restore persisted appearance (read-only path: a database with
+        // no prefs table simply keeps the defaults).
+        if let Some(t) = store::pref_get(app.db.link(), "theme").and_then(|n| Theme::by_name(&n)) {
+            app.theme = t;
+        }
+        app.shimmer = store::pref_get(app.db.link(), "shimmer").as_deref() == Some("on");
+        app.split_horizontal = store::pref_get(app.db.link(), "split:dir").as_deref() == Some("h");
         app
     }
 
@@ -503,7 +583,10 @@ impl App {
                 return;
             }
             if std::time::Instant::now() > deadline {
-                panic!("db worker did not answer {} pending job(s)", self.pending.len());
+                panic!(
+                    "db worker did not answer {} pending job(s)",
+                    self.pending.len()
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -624,10 +707,7 @@ impl App {
                 }
                 Err(e) => self.err(e),
             },
-            (
-                PendingOp::Page { table, want_start },
-                DbResponse::Page(r),
-            ) => match r {
+            (PendingOp::Page { table, want_start }, DbResponse::Page(r)) => match r {
                 Ok(page) => {
                     // Latest window wins; older arrivals drop.
                     if self.pending_page != Some((tag, table.clone(), want_start)) {
@@ -679,7 +759,10 @@ impl App {
                         return; // user moved on; drop the stale window
                     }
                     for (i, row) in page.rows.iter().enumerate() {
-                        if row.iter().any(|v| v.contains_ci(&needle_lc, needle_has_alpha)) {
+                        if row
+                            .iter()
+                            .any(|v| v.contains_ci(&needle_lc, needle_has_alpha))
+                        {
                             let abs = offset + i as i64;
                             self.grid_jump(abs);
                             self.focus = Focus::Grid;
@@ -722,7 +805,11 @@ impl App {
                 Err(e) => self.err(e),
             },
             (
-                PendingOp::Health { sampled, seq, overlay },
+                PendingOp::Health {
+                    sampled,
+                    seq,
+                    overlay,
+                },
                 DbResponse::HealthConsole(r),
             ) => match r {
                 Ok(h) => {
@@ -730,8 +817,7 @@ impl App {
                         return; // user moved on; silent drop, no yank
                     }
                     self.health = h.health.clone();
-                    self.health_cache =
-                        Some((h.health, std::time::Instant::now()));
+                    self.health_cache = Some((h.health, std::time::Instant::now()));
                     self.last_auto_sample = std::time::Instant::now();
                     self.last_ms = Some(took.as_secs_f64() * 1000.0);
                     self.overlay = Overlay::Health(HealthView {
@@ -745,17 +831,16 @@ impl App {
                 }
                 Err(e) => self.err(e),
             },
-            (
-                PendingOp::Detail { want_key },
-                DbResponse::Detail(r),
-            ) => match r {
+            (PendingOp::Detail { want_key }, DbResponse::Detail(r)) => match r {
                 Ok(d) => {
                     // Latest fetch wins; older arrivals drop.
                     if self.pending_detail.as_ref() != Some(&(tag, want_key.clone())) {
                         return;
                     }
                     self.pending_detail = None;
-                    let Some(state) = &mut self.detail else { return };
+                    let Some(state) = &mut self.detail else {
+                        return;
+                    };
                     let (parent, child, child_col) = match &state.grid.source {
                         GridSource::Detail {
                             parent,
@@ -795,11 +880,19 @@ impl App {
         let n = t.name.as_str();
         n.starts_with('_')
             || [
-                "_chunks", "_meta", "_series", "_blocks", "_terms", "_trace_blocks",
+                "_chunks",
+                "_meta",
+                "_series",
+                "_blocks",
+                "_terms",
+                "_trace_blocks",
             ]
             .iter()
             .any(|suf| n.ends_with(suf))
-            || (t.is_view && ["_report", "_now", "_trends"].iter().any(|s| n.ends_with(s)))
+            || (t.is_view
+                && ["_report", "_now", "_trends"]
+                    .iter()
+                    .any(|s| n.ends_with(s)))
     }
 
     /// The tables the sidebar shows, honoring the internals toggle.
@@ -846,6 +939,7 @@ impl App {
         self.columns_cache.clear();
         self.form_cache.clear();
         self.links_cache.clear();
+        self.fks_cache.clear();
         self.pane_cache.clear();
         self.health_cache = None;
     }
@@ -911,6 +1005,16 @@ impl App {
         links
     }
 
+    /// Cached outgoing-FK targets: one probe per table per schema epoch.
+    fn cached_outgoing_fks(&mut self, table: &str) -> Vec<(String, String, Option<String>)> {
+        if let Some(f) = self.fks_cache.get(table) {
+            return f.clone();
+        }
+        let fks = self.db.outgoing_fks(table);
+        self.fks_cache.insert(table.to_owned(), fks.clone());
+        fks
+    }
+
     // ── key → command (pure mapping; no state changes here) ──────────
 
     pub fn map_key(&self, key: KeyEvent) -> Option<Command> {
@@ -919,6 +1023,17 @@ impl App {
             return Some(Command::Quit);
         }
         if let Overlay::Edit(ed) = &self.overlay {
+            // The FK picker, when open, owns the keyboard.
+            if ed.picker.is_some() {
+                return Some(match key.code {
+                    Up | Char('k') => Command::PickerMove(-1),
+                    Down | Char('j') => Command::PickerMove(1),
+                    Enter => Command::PickerCommit,
+                    Esc | Char('q') => Command::PickerCancel,
+                    F(1) => Command::Help,
+                    _ => return None,
+                });
+            }
             return Some(match (&ed.editing, key.code) {
                 (Some(_), Enter) => Command::EditCommitField,
                 (Some(_), Esc) => Command::Back,
@@ -950,11 +1065,14 @@ impl App {
                 (None, F(4)) => Command::EditOpenLink(0),
                 (None, F(5)) => Command::EditOpenLink(1),
                 (None, F(6)) => Command::EditOpenLink(2),
+                (None, F(7)) => Command::EditPick,
                 (None, Esc) => Command::Back,
                 // The form is LIVE, 1988-style: land on a field and
                 // just type — no Enter required to begin.
                 (None, Char(c))
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     Command::EditType(c)
                 }
@@ -993,6 +1111,8 @@ impl App {
                 (None, Down | Char('j')) => Command::DesignerMove(1),
                 (None, Char(' ')) => Command::DesignerToggle,
                 (None, Char('s')) => Command::DesignerCycle,
+                (None, Char('J')) => Command::DesignerJoin,
+                (None, Char('g')) => Command::DesignerGroup,
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
                 (None, F(6)) => Command::DesignerSave,
@@ -1043,7 +1163,9 @@ impl App {
                 (None, Esc) => Command::Back,
                 // Plain letters TYPE the field (or table) name.
                 (None, Char(c))
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     Command::CreateType(c)
                 }
@@ -1060,6 +1182,7 @@ impl App {
                 Home | Char('g') => Command::PagerScroll(i64::MIN / 2),
                 End | Char('G') => Command::PagerScroll(i64::MAX / 2),
                 Char('w') => Command::PagerWrite,
+                Char('p') => Command::PagerPrint,
                 F(1) => Command::Help,
                 _ => return None,
             });
@@ -1074,6 +1197,8 @@ impl App {
                 (None, Down | Char('j')) => Command::DesignerMove(1),
                 (None, Char(' ')) => Command::DesignerToggle,
                 (None, Char('r')) => Command::DesignerCycle,
+                (None, Char('m')) => Command::DesignerEditMask,
+                (None, Char('c')) => Command::DesignerEditComputed,
                 (None, Char('[')) => Command::DesignerSwap(-1),
                 (None, Char(']')) => Command::DesignerSwap(1),
                 (None, Enter) => Command::DesignerEditBegin,
@@ -1199,6 +1324,7 @@ impl App {
             Focus::Grid => Some(match key.code {
                 Esc => Command::Back,
                 Char('v') => Command::ToggleSplit,
+                Char('H') => Command::ToggleSplitDir,
                 Char('E') => Command::OpenTableEditor,
                 Up | Char('k') => Command::GridMove { dr: -1, dc: 0 },
                 Down | Char('j') => Command::GridMove { dr: 1, dc: 0 },
@@ -1235,6 +1361,7 @@ impl App {
             Focus::Detail => Some(match key.code {
                 Esc => Command::Back,
                 Char('v') => Command::ToggleSplit,
+                Char('H') => Command::ToggleSplitDir,
                 Up | Char('k') => Command::GridMove { dr: -1, dc: 0 },
                 Down | Char('j') => Command::GridMove { dr: 1, dc: 0 },
                 Left | Char('h') => Command::GridMove { dr: 0, dc: -1 },
@@ -1255,10 +1382,34 @@ impl App {
 
     // ── the bus ──────────────────────────────────────────────────────
 
+    /// Commands that mutate the database (or open an editor whose only
+    /// purpose is to). Used by the `--readonly` kiosk guard.
+    fn is_write_command(cmd: &Command) -> bool {
+        matches!(
+            cmd,
+            Command::OpenInsert
+                | Command::EditSave
+                | Command::EditCommitField
+                | Command::EditPage(_)
+                | Command::DeleteRow
+                | Command::DesignerSave
+                | Command::DesignerAdd
+                | Command::DesignerDelete
+                | Command::DesignerSwap(_)
+                | Command::DesignerCommit
+        )
+    }
+
     pub fn apply(&mut self, cmd: Command) {
         // The command bus is the ONLY place state changes, so one flag
         // here drives the main loop's dirty-flag redraw (main.rs).
         self.dirty = true;
+        // Read-only kiosk (`--app --readonly`): every write-shaped
+        // command is refused centrally, before any mutation.
+        if self.readonly && Self::is_write_command(&cmd) {
+            self.err("read-only mode: this application does not allow edits");
+            return;
+        }
         let is_delete = matches!(cmd, Command::DeleteRow);
         match cmd {
             Command::Quit => self.quit = true,
@@ -1282,16 +1433,54 @@ impl App {
                     Overlay::Edit(ed) => ed.links.get(i).map(|l| {
                         let qc = l.child.replace('"', "\"\"");
                         let qk = l.child_col.replace('"', "\"\"");
-                        format!(
-                            "SELECT * FROM \"{qc}\" WHERE \"{qk}\" = {}",
-                            l.key_sql
-                        )
+                        format!("SELECT * FROM \"{qc}\" WHERE \"{qk}\" = {}", l.key_sql)
                     }),
                     _ => None,
                 };
                 if let Some(sql) = link {
                     self.overlay = Overlay::None;
                     self.run_select(&sql);
+                }
+            }
+            Command::EditPick => self.open_picker(),
+            Command::PickerMove(d) => {
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    if let Some(p) = &mut ed.picker {
+                        let n = p.rows.len();
+                        if n > 0 {
+                            p.cursor = (p.cursor as i64 + d).rem_euclid(n as i64) as usize;
+                        }
+                    }
+                }
+            }
+            Command::PickerCancel => {
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    ed.picker = None;
+                }
+            }
+            Command::PickerCommit => {
+                let picked = match &self.overlay {
+                    Overlay::Edit(ed) => ed.picker.as_ref().and_then(|p| {
+                        p.rows
+                            .get(p.cursor)
+                            .and_then(|r| r.get(p.key_col))
+                            .map(|v| {
+                                (
+                                    p.field,
+                                    match v {
+                                        PValue::Null => String::new(),
+                                        v => v.render(),
+                                    },
+                                )
+                            })
+                    }),
+                    _ => None,
+                };
+                if let (Some((field, value)), Overlay::Edit(ed)) = (picked, &mut self.overlay) {
+                    if field < ed.inputs.len() {
+                        ed.inputs[field] = Some(value);
+                    }
+                    ed.picker = None;
                 }
             }
             Command::CreateType(c) => {
@@ -1319,12 +1508,24 @@ impl App {
             Command::SidebarMove(d) => {
                 let n = self.visible_tables().len() as i64;
                 if n > 0 {
-                    self.sidebar_idx =
-                        (self.sidebar_idx as i64 + d).rem_euclid(n) as usize;
+                    self.sidebar_idx = (self.sidebar_idx as i64 + d).rem_euclid(n) as usize;
                 }
             }
             Command::OpenSelected => self.open_selected(),
             Command::ToggleSplit => self.toggle_split(),
+            Command::ToggleSplitDir => {
+                self.split_horizontal = !self.split_horizontal;
+                store::pref_set(
+                    self.db.link(),
+                    "split:dir",
+                    if self.split_horizontal { "h" } else { "v" },
+                );
+                self.say(if self.split_horizontal {
+                    "split: stacked (master above detail)"
+                } else {
+                    "split: side by side"
+                });
+            }
             Command::OpenTableEditor => self.open_table_editor(),
             Command::SidebarClick(idx) => {
                 let n = self.visible_tables().len();
@@ -1381,12 +1582,20 @@ impl App {
                 if self.focus == Focus::Detail {
                     if let Some(state) = &mut self.detail {
                         let g = &mut state.grid;
-                        g.cur_col = if end { g.columns.len().saturating_sub(1) } else { 0 };
+                        g.cur_col = if end {
+                            g.columns.len().saturating_sub(1)
+                        } else {
+                            0
+                        };
                     }
                     self.detail_move(0, 0);
                 } else {
                     if let Some(g) = &mut self.grid {
-                        g.cur_col = if end { g.columns.len().saturating_sub(1) } else { 0 };
+                        g.cur_col = if end {
+                            g.columns.len().saturating_sub(1)
+                        } else {
+                            0
+                        };
                     }
                     self.grid_move(0, 0);
                 }
@@ -1411,32 +1620,55 @@ impl App {
             Command::EditMove(d) => {
                 self.fold_editing_buffer();
                 if let Overlay::Edit(ed) = &mut self.overlay {
-                    let n = ed.fields.len() as i64;
-                    if n > 0 {
-                        ed.cursor = (ed.cursor as i64 + d).rem_euclid(n) as usize;
+                    let n = ed.fields.len();
+                    if n > 0 && d != 0 {
+                        // Move `d` fields, skipping computed (read-only)
+                        // columns: you can't type into a calculated one.
+                        let step = d.signum();
+                        let mut cur = ed.cursor;
+                        for _ in 0..d.unsigned_abs() {
+                            for _ in 0..n {
+                                cur = (cur as i64 + step).rem_euclid(n as i64) as usize;
+                                if !matches!(ed.computed.get(cur), Some(Some(_))) {
+                                    break;
+                                }
+                            }
+                        }
+                        ed.cursor = cur;
                     }
                 }
             }
             Command::EditBegin => {
                 if let Overlay::Edit(ed) = &mut self.overlay {
+                    if matches!(ed.computed.get(ed.cursor), Some(Some(_))) {
+                        self.say("computed field — read-only");
+                        return;
+                    }
                     let current = ed.inputs[ed.cursor].clone().unwrap_or_else(|| {
                         match &ed.fields[ed.cursor].1 {
                             PValue::Null => String::new(),
                             v => v.render(),
                         }
                     });
-                    ed.editing = Some(current);
+                    let mask = ed.masks.get(ed.cursor).cloned().unwrap_or_default();
+                    ed.editing = Some(apply_mask(&mask, &current));
                     self.editor_fresh = true;
                 }
             }
             Command::EditChar(c) => {
                 let fresh = std::mem::take(&mut self.editor_fresh);
                 if let Overlay::Edit(ed) = &mut self.overlay {
+                    let mask = ed.masks.get(ed.cursor).cloned().unwrap_or_default();
                     if let Some(buf) = &mut ed.editing {
                         if fresh {
                             buf.clear(); // first keystroke replaces prefill
                         }
                         buf.push(c);
+                        // A PICTURE mask reflows as you type (literals
+                        // inserted, non-fitting characters dropped).
+                        if !mask.is_empty() {
+                            *buf = apply_mask(&mask, buf);
+                        }
                     }
                 }
             }
@@ -1453,7 +1685,8 @@ impl App {
                 // SAVES the record when it validates (user preference:
                 // Enter is the save key; F10/Ctrl-S remain save-and-
                 // close). During a NEW record with required fields still
-                // empty, the save quietly waits for them.
+                // empty, the save quietly waits for them — no error toast
+                // until an explicit save/leave is attempted.
                 self.fold_editing_buffer();
                 if let Overlay::Edit(ed) = &mut self.overlay {
                     let n = ed.fields.len();
@@ -1462,7 +1695,10 @@ impl App {
                     }
                 }
                 if self.edit_required_ok() {
-                    self.commit_edit();
+                    // Already validated quietly; skip the loud re-check
+                    // inside commit_edit to avoid a second PValue::parse
+                    // per required field.
+                    self.commit_edit_inner(true);
                 }
             }
             Command::EditSave => self.edit_save(),
@@ -1498,9 +1734,10 @@ impl App {
                         if byte >= len {
                             break;
                         }
-                        byte += self.prompt.input[byte..].chars().next().map_or(1, |c| {
-                            c.len_utf8()
-                        });
+                        byte += self.prompt.input[byte..]
+                            .chars()
+                            .next()
+                            .map_or(1, |c| c.len_utf8());
                     }
                 } else {
                     for _ in 0..-d {
@@ -1525,6 +1762,8 @@ impl App {
             Command::DesignerMove(d) => self.designer_move(d),
             Command::DesignerToggle => self.designer_toggle(),
             Command::DesignerCycle => self.designer_cycle(),
+            Command::DesignerJoin => self.designer_join(),
+            Command::DesignerGroup => self.designer_group(),
             Command::DesignerEditBegin => self.designer_edit_begin(),
             Command::DesignerChar(c) => self.designer_char(c),
             Command::DesignerBackspace => self.designer_backspace(),
@@ -1545,10 +1784,20 @@ impl App {
                     }
                 }
             }
+            Command::PagerPrint => {
+                if let Overlay::Pager(p) = &self.overlay {
+                    match p.print_via_lp() {
+                        Ok(msg) => self.say(msg),
+                        Err(e) => self.err(e),
+                    }
+                }
+            }
             Command::DesignerAdd => self.designer_add(),
             Command::DesignerDelete => self.designer_delete(),
             Command::DesignerSwap(d) => self.designer_swap(d),
             Command::DesignerEditAlt => self.designer_edit_alt(),
+            Command::DesignerEditMask => self.designer_edit_mask(),
+            Command::DesignerEditComputed => self.designer_edit_computed(),
             Command::OpenForm(t) => self.open_form(t),
             Command::OpenApps(name) => self.open_apps(name),
             Command::OpenAppMenu(name) => self.open_app_menu(name),
@@ -1638,13 +1887,13 @@ impl App {
             Overlay::Paint(st) if st.pending_box.is_some() => st.pending_box = None,
             Overlay::Paint(_) => {
                 // Painter backs out to the list designer, same spec.
-                if let Overlay::Paint(st) =
-                    std::mem::replace(&mut self.overlay, Overlay::None)
-                {
+                if let Overlay::Paint(st) = std::mem::replace(&mut self.overlay, Overlay::None) {
                     self.overlay = Overlay::Form(FormState {
                         spec: st.spec,
                         cursor: 0,
                         editing: None,
+                        editing_mask: false,
+                        editing_computed: false,
                     });
                 }
             }
@@ -1708,8 +1957,15 @@ impl App {
             }));
             match submitted {
                 Some(tag) => {
-                    self.pending
-                        .insert(tag, PendingOp::Refill { name, row, col, want_start });
+                    self.pending.insert(
+                        tag,
+                        PendingOp::Refill {
+                            name,
+                            row,
+                            col,
+                            want_start,
+                        },
+                    );
                 }
                 None => self.err("database worker is gone"),
             }
@@ -1784,9 +2040,7 @@ impl App {
     /// The whole health console in one worker job: base discovery,
     /// report, sparklines, and dot. Pure function of the link, so the
     /// UI thread never blocks on its (up to 4) round-trips.
-    fn fetch_health_console(
-        db: &dyn DbLink,
-    ) -> DbResult<crate::worker::HealthData> {
+    fn fetch_health_console(db: &dyn DbLink) -> DbResult<crate::worker::HealthData> {
         let view: String = db
             .query(
                 "SELECT name FROM sqlite_master \
@@ -1806,10 +2060,7 @@ impl App {
                  CREATE VIRTUAL TABLE dbhealth USING timeless_health"
                     .to_owned()
             })?;
-        let base = view
-            .strip_suffix("_report")
-            .unwrap_or(&view)
-            .to_owned();
+        let base = view.strip_suffix("_report").unwrap_or(&view).to_owned();
         let report = db
             .query(&format!(
                 "SELECT \"check\", status, value, advice FROM {}",
@@ -1817,9 +2068,7 @@ impl App {
             ))?
             .rows
             .into_iter()
-            .map(|r| {
-                [0, 1, 2, 3].map(|i| r.get(i).map(PValue::render).unwrap_or_default())
-            })
+            .map(|r| [0, 1, 2, 3].map(|i| r.get(i).map(PValue::render).unwrap_or_default()))
             .collect();
 
         // Sparklines: preferred series first, then whatever else exists.
@@ -1846,7 +2095,9 @@ impl App {
         )) {
             Ok(q) => {
                 for r in q.rows {
-                    let Some(PValue::Text(name)) = r.first() else { continue };
+                    let Some(PValue::Text(name)) = r.first() else {
+                        continue;
+                    };
                     let v = match r.get(1) {
                         Some(PValue::Real(f)) => *f,
                         Some(PValue::Int(i)) => *i as f64,
@@ -1928,12 +2179,9 @@ impl App {
         // The overlay discriminant guards stale installs (user moved on).
         let seq = self.status_seq;
         let overlay = std::mem::discriminant(&self.overlay);
-        match self
-            .db
-            .submit(Box::new(move |db| {
-                DbResponse::HealthConsole(Self::fetch_health_console(db))
-            }))
-        {
+        match self.db.submit(Box::new(move |db| {
+            DbResponse::HealthConsole(Self::fetch_health_console(db))
+        })) {
             Some(tag) => {
                 self.pending.insert(
                     tag,
@@ -1949,7 +2197,12 @@ impl App {
     }
 
     fn health_sample(&mut self) {
-        let Overlay::Health(hv) = &self.overlay else { return };
+        if self.readonly {
+            return self.err("read-only mode: cannot take a health sample");
+        }
+        let Overlay::Health(hv) = &self.overlay else {
+            return;
+        };
         let t = Self::quote_ident(&hv.table);
         match self
             .db
@@ -2022,7 +2275,9 @@ impl App {
             Some(g) => match &g.source {
                 GridSource::Table { name, .. } => name.clone(),
                 _ => {
-                    return self.say("the table editor works on a table (query results have no structure)");
+                    return self.say(
+                        "the table editor works on a table (query results have no structure)",
+                    );
                 }
             },
             None => match self.visible_tables().get(self.sidebar_idx) {
@@ -2067,8 +2322,8 @@ impl App {
             return self.err("report: no table selected (report <table-or-saved-name>)");
         };
         // A saved report by this name wins; otherwise start from the table.
-        let spec = ReportSpec::load(self.db.link(), &name)
-            .unwrap_or_else(|| ReportSpec::for_table(&name));
+        let spec =
+            ReportSpec::load(self.db.link(), &name).unwrap_or_else(|| ReportSpec::for_table(&name));
         let columns = self.source_columns(&spec);
         self.overlay = Overlay::Report(ReportState {
             spec,
@@ -2142,9 +2397,7 @@ impl App {
                     Some(cur) => {
                         let idx = st.columns.iter().position(|c| c == cur);
                         match idx {
-                            Some(i) if i + 1 < st.columns.len() => {
-                                Some(st.columns[i + 1].clone())
-                            }
+                            Some(i) if i + 1 < st.columns.len() => Some(st.columns[i + 1].clone()),
                             _ => None,
                         }
                     }
@@ -2153,6 +2406,48 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// QBE `J`: cycle through the FK-driven joins (off → each → off).
+    fn designer_join(&mut self) {
+        let Overlay::Qbe(st) = &mut self.overlay else {
+            return;
+        };
+        if st.spec.relations.is_empty() {
+            self.say("no declared foreign keys reach this table");
+            return;
+        }
+        let next = match &st.spec.join {
+            None => Some(st.spec.relations[0].clone()),
+            Some(cur) => {
+                let i = st.spec.relations.iter().position(|r| r == cur);
+                match i {
+                    Some(i) if i + 1 < st.spec.relations.len() => {
+                        Some(st.spec.relations[i + 1].clone())
+                    }
+                    _ => None,
+                }
+            }
+        };
+        st.spec.join = next;
+    }
+
+    /// QBE `g`: cycle GROUP BY through the columns (off → each → off).
+    fn designer_group(&mut self) {
+        let Overlay::Qbe(st) = &mut self.overlay else {
+            return;
+        };
+        let next = match &st.spec.group_by {
+            None => st.spec.cols.first().map(|c| c.name.clone()),
+            Some(cur) => {
+                let i = st.spec.cols.iter().position(|c| &c.name == cur);
+                match i {
+                    Some(i) if i + 1 < st.spec.cols.len() => Some(st.spec.cols[i + 1].name.clone()),
+                    _ => None,
+                }
+            }
+        };
+        st.spec.group_by = next;
     }
 
     fn designer_cycle(&mut self) {
@@ -2196,11 +2491,14 @@ impl App {
                 st.editing = Some(match st.cursor {
                     0 => st.spec.title.clone(),
                     1 => st.spec.source.clone(),
-                    _ => return, // group_by cycles with Space instead
+                    // Space still cycles columns; Enter types an expression.
+                    _ => st.spec.group_by.clone().unwrap_or_default(),
                 });
             }
             Overlay::Form(st) => {
                 if let Some(f) = st.spec.fields.get(st.cursor) {
+                    st.editing_mask = false;
+                    st.editing_computed = false;
                     st.editing = Some(f.label.clone());
                 }
             }
@@ -2214,7 +2512,12 @@ impl App {
                 st.slot = crate::creator::EditSlot::Name;
                 st.editing = Some(match st.field_idx() {
                     None => st.draft.table.clone(),
-                    Some(i) => st.draft.fields.get(i).map(|f| f.name.clone()).unwrap_or_default(),
+                    Some(i) => st
+                        .draft
+                        .fields
+                        .get(i)
+                        .map(|f| f.name.clone())
+                        .unwrap_or_default(),
                 });
             }
             _ => {}
@@ -2239,6 +2542,30 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Forms `m`: edit the selected field's PICTURE mask.
+    fn designer_edit_mask(&mut self) {
+        self.editor_fresh = true;
+        if let Overlay::Form(st) = &mut self.overlay {
+            if let Some(f) = st.spec.fields.get(st.cursor) {
+                st.editing_mask = true;
+                st.editing_computed = false;
+                st.editing = Some(f.mask.clone());
+            }
+        }
+    }
+
+    /// Forms `c`: edit the selected field's computed expression.
+    fn designer_edit_computed(&mut self) {
+        self.editor_fresh = true;
+        if let Overlay::Form(st) = &mut self.overlay {
+            if let Some(f) = st.spec.fields.get(st.cursor) {
+                st.editing_computed = true;
+                st.editing_mask = false;
+                st.editing = Some(f.computed.clone());
+            }
         }
     }
 
@@ -2308,21 +2635,11 @@ impl App {
                 st.spec.texts.remove(i);
                 return;
             }
-            if let Some(f) = st
-                .spec
-                .fields
-                .iter_mut()
-                .find(|f| f.pos == Some((cx, cy)))
-            {
+            if let Some(f) = st.spec.fields.iter_mut().find(|f| f.pos == Some((cx, cy))) {
                 f.pos = None;
                 return;
             }
-            if let Some(i) = st
-                .spec
-                .boxes
-                .iter()
-                .position(|b| (b.x, b.y) == (cx, cy))
-            {
+            if let Some(i) = st.spec.boxes.iter().position(|b| (b.x, b.y) == (cx, cy)) {
                 st.spec.boxes.remove(i);
             }
         }
@@ -2383,7 +2700,11 @@ impl App {
                             st.spec.source = buf;
                             st.spec.group_by = None;
                         }
-                        _ => {}
+                        // Typed grouping expression; empty clears it.
+                        _ => {
+                            let g = buf.trim().to_owned();
+                            st.spec.group_by = (!g.is_empty()).then_some(g);
+                        }
                     }
                     if st.cursor == 1 {
                         let cols = self.source_columns_of_overlay();
@@ -2397,7 +2718,15 @@ impl App {
             Overlay::Form(st) => {
                 if let Some(buf) = st.editing.take() {
                     if let Some(f) = st.spec.fields.get_mut(st.cursor) {
-                        f.label = buf;
+                        if st.editing_mask {
+                            f.mask = buf.trim().to_owned();
+                        } else if st.editing_computed {
+                            f.computed = buf.trim().to_owned();
+                        } else {
+                            f.label = buf;
+                        }
+                        st.editing_mask = false;
+                        st.editing_computed = false;
                     }
                 }
             }
@@ -2465,6 +2794,11 @@ impl App {
     }
 
     fn designer_run(&mut self) {
+        // The table designer/editor's F2 is DDL; a readonly kiosk
+        // never gets there.
+        if self.readonly && matches!(self.overlay, Overlay::Create(_)) {
+            return self.err("read-only mode: cannot change table structure");
+        }
         match &self.overlay {
             Overlay::Qbe(st) => {
                 let sql = st.spec.sql();
@@ -2530,8 +2864,7 @@ impl App {
                                 let sql = lines.join(";\n");
                                 match self.db.execute(&sql) {
                                     Ok((_, elapsed)) => {
-                                        self.last_ms =
-                                            Some(elapsed.as_secs_f64() * 1000.0);
+                                        self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
                                         self.overlay = Overlay::None;
                                         self.columns_cache.remove(&table);
                                         self.reload_tables();
@@ -2546,9 +2879,8 @@ impl App {
                                         // roll back so nothing partial
                                         // stays, and restore FK enforcement
                                         // (the rebuild toggles it OFF).
-                                        let _ = self
-                                            .db
-                                            .execute("ROLLBACK; PRAGMA foreign_keys = ON");
+                                        let _ =
+                                            self.db.execute("ROLLBACK; PRAGMA foreign_keys = ON");
                                         self.err(e);
                                     }
                                 }
@@ -2570,9 +2902,7 @@ impl App {
             }
             Overlay::Form(_) => {
                 // F2 in the list designer: enter the painter.
-                if let Overlay::Form(st) =
-                    std::mem::replace(&mut self.overlay, Overlay::None)
-                {
+                if let Overlay::Form(st) = std::mem::replace(&mut self.overlay, Overlay::None) {
                     self.overlay = Overlay::Paint(PaintState::new(st.spec));
                 }
             }
@@ -2591,18 +2921,16 @@ impl App {
                 self.overlay = Overlay::None;
                 self.open_table(&table);
             }
-            ActionKind::Query => {
-                match QbeSpec::saved_sql(self.db.link(), &item.action_ref) {
-                    Some(sql) => {
-                        self.overlay = Overlay::None;
-                        self.run_select(&sql);
-                    }
-                    None => self.err(format!(
-                        "no saved query named {:?} (QBE F6 saves one)",
-                        item.action_ref
-                    )),
+            ActionKind::Query => match QbeSpec::saved_sql(self.db.link(), &item.action_ref) {
+                Some(sql) => {
+                    self.overlay = Overlay::None;
+                    self.run_select(&sql);
                 }
-            }
+                None => self.err(format!(
+                    "no saved query named {:?} (QBE F6 saves one)",
+                    item.action_ref
+                )),
+            },
             ActionKind::Report => {
                 let spec = ReportSpec::load(self.db.link(), &item.action_ref)
                     .unwrap_or_else(|| ReportSpec::for_table(&item.action_ref));
@@ -2618,17 +2946,23 @@ impl App {
                     Err(e) => self.err(e),
                 }
             }
-            ActionKind::Sql => match self.db.execute(&item.action_ref) {
-                Ok((n, elapsed)) => {
-                    self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
-                    self.reload_tables();
-                    self.say(match n {
-                        -1 => "ok".to_owned(),
-                        n => format!("ok, {n} row(s) affected"),
-                    });
+            ActionKind::Sql => {
+                if self.readonly {
+                    self.err("read-only mode: this action writes SQL");
+                } else {
+                    match self.db.execute(&item.action_ref) {
+                        Ok((n, elapsed)) => {
+                            self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
+                            self.reload_tables();
+                            self.say(match n {
+                                -1 => "ok".to_owned(),
+                                n => format!("ok, {n} row(s) affected"),
+                            });
+                        }
+                        Err(e) => self.err(e),
+                    }
                 }
-                Err(e) => self.err(e),
-            },
+            }
         }
     }
 
@@ -2641,9 +2975,10 @@ impl App {
             Overlay::Report(st) => {
                 let spec = st.spec.clone();
                 match spec.save(self.db.link()) {
-                    Ok(()) => {
-                        self.say(format!("saved report {:?} (report {})", spec.name, spec.name))
-                    }
+                    Ok(()) => self.say(format!(
+                        "saved report {:?} (report {})",
+                        spec.name, spec.name
+                    )),
                     Err(e) => self.err(e),
                 }
             }
@@ -2794,6 +3129,8 @@ impl App {
                     spec,
                     cursor: 0,
                     editing: None,
+                    editing_mask: false,
+                    editing_computed: false,
                 })
             }
             Err(e) => self.err(e),
@@ -2825,8 +3162,10 @@ impl App {
         if items.is_empty() {
             return self.err(format!("app {name:?} has no items yet — A to design"));
         }
+        let version = appsgen::app_version(self.db.link(), &name);
         self.overlay = Overlay::AppMenu(AppMenuState {
             app: name,
+            version,
             items,
             cursor: 0,
         });
@@ -2886,7 +3225,9 @@ impl App {
                 _ => None,
             });
             let pos = cycle.iter().position(|l| {
-                current.as_ref().is_some_and(|(c, k)| c == &l.0 && k == &l.1)
+                current
+                    .as_ref()
+                    .is_some_and(|(c, k)| c == &l.0 && k == &l.1)
             });
             if let Some(next) = pos.and_then(|i| cycle.get(i + 1)) {
                 let (child, col, pcol) = next.clone();
@@ -2897,17 +3238,20 @@ impl App {
             }
             return;
         }
-        // Opening: the layout needs room for two grids side by side
-        // (visible_cols_width is the master panel's inner width).
-        if self.visible_cols_width < 74 {
+        // Opening: side-by-side needs width; stacked needs height.
+        if self.split_horizontal {
+            if self.visible_rows < 8 {
+                return self.say("stacked split needs more rows");
+            }
+        } else if self.visible_cols_width < 74 {
             return self.say("split view needs a wider terminal (100+ cols)");
         }
         // The cycle: the remembered link fronts it, the rest follow in
         // declaration order — a past choice reorders, never hides. v
         // walks cycle[0] → cycle[1] → … → close → cycle[0]…
         let links = self.cached_links(&parent);
-        let remembered = store::pref_get(self.db.link(), &format!("split:{parent}"))
-            .and_then(|v| {
+        let remembered =
+            store::pref_get(self.db.link(), &format!("split:{parent}")).and_then(|v| {
                 let (c, k) = v.split_once('\u{1}')?;
                 links
                     .iter()
@@ -3032,7 +3376,11 @@ impl App {
             .get(table)
             .and_then(|cols| cols.first())
             .is_some_and(|c| c.pk);
-        match (pk_is_first, row.first(), g.rowids.as_ref().and_then(|r| r.get(idx))) {
+        match (
+            pk_is_first,
+            row.first(),
+            g.rowids.as_ref().and_then(|r| r.get(idx)),
+        ) {
             (true, Some(PValue::Int(id)), _) => Some(id.to_string()),
             (_, _, Some(id)) => Some(id.to_string()),
             _ => None,
@@ -3049,7 +3397,11 @@ impl App {
         let want_key = key_sql.to_owned();
         match self.db.submit(Box::new(move |db| {
             let where_clause = format!("\"{}\" = {}", child_col.replace('"', "\"\""), key_sql);
-            let order = if db.has_rowid(&child) { " ORDER BY rowid" } else { "" };
+            let order = if db.has_rowid(&child) {
+                " ORDER BY rowid"
+            } else {
+                ""
+            };
             let q = db.query(&format!(
                 "SELECT * FROM \"{}\" WHERE {}{} LIMIT {}",
                 child.replace('"', "\"\""),
@@ -3066,10 +3418,14 @@ impl App {
                 (Ok(q), Ok(t)) => Ok(crate::worker::DetailData {
                     columns: q.columns,
                     rows: q.rows,
-                    total: t.rows.first().and_then(|r| r.first()).map_or(0, |v| match v {
-                        PValue::Int(n) => *n,
-                        _ => 0,
-                    }),
+                    total: t
+                        .rows
+                        .first()
+                        .and_then(|r| r.first())
+                        .map_or(0, |v| match v {
+                            PValue::Int(n) => *n,
+                            _ => 0,
+                        }),
                 }),
                 (Err(e), _) | (_, Err(e)) => Err(e),
             })
@@ -3092,7 +3448,10 @@ impl App {
         let Some(state) = &self.detail else { return };
         let (child, child_col, key_sql) = match &state.grid.source {
             GridSource::Detail {
-                child, child_col, key_sql, ..
+                child,
+                child_col,
+                key_sql,
+                ..
             } => (child.clone(), child_col.clone(), key_sql.clone()),
             _ => return,
         };
@@ -3116,7 +3475,9 @@ impl App {
             .as_ref()
             .map(|d| d.visible_rows.max(1))
             .unwrap_or(1);
-        let Some(state) = &mut self.detail else { return };
+        let Some(state) = &mut self.detail else {
+            return;
+        };
         let g = &mut state.grid;
         if g.total == 0 {
             return;
@@ -3148,15 +3509,18 @@ impl App {
     // ── mouse: hit-testing → the same bus commands as keys ───────────
 
     fn contains(r: Option<ratatui::layout::Rect>, col: u16, row: u16) -> bool {
-        r.is_some_and(|r| {
-            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
-        })
+        r.is_some_and(|r| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
     }
 
     /// Route a left-click / wheel event through the command bus.
     /// Click selects; clicking the sidebar selection again opens it;
     /// clicking the master's cursor row again opens EDIT.
-    pub fn on_mouse(&mut self, kind: &ratatui::crossterm::event::MouseEventKind, col: u16, row: u16) {
+    pub fn on_mouse(
+        &mut self,
+        kind: &ratatui::crossterm::event::MouseEventKind,
+        col: u16,
+        row: u16,
+    ) {
         use ratatui::crossterm::event::MouseEventKind as K;
         match kind {
             K::ScrollUp | K::ScrollDown => {
@@ -3179,10 +3543,7 @@ impl App {
                 } else if Self::contains(self.hit.detail, col, row) {
                     self.apply(Command::Focus(Focus::Detail));
                     let r = self.hit.detail.unwrap();
-                    let off = self
-                        .detail
-                        .as_ref()
-                        .map_or(0, |d| d.grid.row_off);
+                    let off = self.detail.as_ref().map_or(0, |d| d.grid.row_off);
                     self.apply(Command::GridClick {
                         row: off + (row - r.y - 1) as i64,
                     });
@@ -3230,7 +3591,13 @@ impl App {
         }));
         match submitted {
             Some(tag) => {
-                self.pending.insert(tag, PendingOp::Open { name: name.to_owned(), seq });
+                self.pending.insert(
+                    tag,
+                    PendingOp::Open {
+                        name: name.to_owned(),
+                        seq,
+                    },
+                );
             }
             None => self.err("database worker is gone"),
         }
@@ -3262,10 +3629,7 @@ impl App {
             g.col_off = g.cur_col;
         }
         while g.col_off < g.cur_col {
-            let used: u16 = g.widths[g.col_off..=g.cur_col]
-                .iter()
-                .map(|w| w + 1)
-                .sum();
+            let used: u16 = g.widths[g.col_off..=g.cur_col].iter().map(|w| w + 1).sum();
             if used <= self.visible_cols_width {
                 break;
             }
@@ -3310,7 +3674,10 @@ impl App {
             Some(tag) => {
                 self.pending.insert(
                     tag,
-                    PendingOp::Page { table: name.clone(), want_start },
+                    PendingOp::Page {
+                        table: name.clone(),
+                        want_start,
+                    },
                 );
                 self.pending_page = Some((tag, name, want_start));
             }
@@ -3338,7 +3705,10 @@ impl App {
             Some(tag) => {
                 self.pending.insert(
                     tag,
-                    PendingOp::Page { table: name.clone(), want_start },
+                    PendingOp::Page {
+                        table: name.clone(),
+                        want_start,
+                    },
                 );
                 self.pending_page = Some((tag, name, want_start));
             }
@@ -3456,7 +3826,9 @@ impl App {
         // cursor with the form so context follows the flip.
         self.grid_jump(abs);
         let Some(g) = &self.grid else { return };
-        let GridSource::Table { name, .. } = &g.source else { return };
+        let GridSource::Table { name, .. } = &g.source else {
+            return;
+        };
         let idx = abs - g.cache_start;
         let (Some(row), Some(rowids)) = (g.row(abs), &g.rowids) else {
             self.pending_edit = Some(abs);
@@ -3472,17 +3844,29 @@ impl App {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
-        let mut fields: Vec<(ColumnInfo, PValue)> =
-            cols.into_iter().zip(row).collect();
+        let mut fields: Vec<(ColumnInfo, PValue)> = cols.into_iter().zip(row).collect();
         let mut labels: Vec<String> = fields.iter().map(|(c, _)| c.name.clone()).collect();
         let mut required: Vec<bool> = vec![false; fields.len()];
+        let mut masks: Vec<String> = vec![String::new(); fields.len()];
+        let mut computed: Vec<Option<String>> = vec![None; fields.len()];
 
-        // A crafted form (phase 5) reorders, relabels, hides, requires;
-        // a PAINTED one also brings its 2D layout for rendering.
-        let painted = self.apply_crafted_form(&name, &mut fields, &mut labels, &mut required);
+        // A crafted form (phase 5) reorders, relabels, hides, requires,
+        // masks, and adds computed columns; a PAINTED one also brings its
+        // 2D layout.
+        let painted = self.apply_crafted_form(
+            &name,
+            &mut fields,
+            &mut labels,
+            &mut required,
+            &mut masks,
+            &mut computed,
+        );
+        // Derived values are read-only; compute them for this record.
+        self.eval_computed(&name, rowid, &computed, &mut fields);
 
         let n = fields.len();
         let links = self.build_link_panes(&name, &fields, rowid);
+        let pickers = self.build_pickers(&name, &fields);
         // Preserve the field cursor across a page flip.
         let keep_cursor = match &self.overlay {
             Overlay::Edit(prev) if !prev.inserting => prev.cursor.min(n.saturating_sub(1)),
@@ -3497,11 +3881,89 @@ impl App {
             fields,
             labels,
             required,
+            masks,
+            computed,
             inputs: vec![None; n],
             cursor: keep_cursor,
             editing: None,
             links,
+            pickers,
+            picker: None,
         });
+    }
+
+    /// For each field, the FK parent a picker would read from (F7), or
+    /// None for ordinary columns. One cached introspection per table,
+    /// then a pk fallback for bare `REFERENCES parent`.
+    fn build_pickers(
+        &mut self,
+        table: &str,
+        fields: &[(ColumnInfo, PValue)],
+    ) -> Vec<Option<(String, String)>> {
+        let fks = self.cached_outgoing_fks(table);
+        let mut out = Vec::with_capacity(fields.len());
+        for (c, _) in fields {
+            let hit = fks
+                .iter()
+                .find(|(from, _, _)| from.eq_ignore_ascii_case(&c.name))
+                .cloned();
+            let resolved = match hit {
+                None => None,
+                Some((_, to_table, to_col)) => {
+                    let key = match to_col {
+                        Some(col) => col,
+                        None => self
+                            .cached_columns(&to_table)
+                            .ok()
+                            .and_then(|cs| cs.iter().find(|c| c.pk).map(|c| c.name.clone()))
+                            .unwrap_or_else(|| "rowid".into()),
+                    };
+                    Some((to_table, key))
+                }
+            };
+            out.push(resolved);
+        }
+        out
+    }
+
+    /// F7: open the value picker for the field under the cursor when it
+    /// is a declared foreign key; list the parent rows and let the user
+    /// pick one. Looks up `(parent, key column) -> rows`.
+    fn open_picker(&mut self) {
+        let (parent, keycol, field) = match &self.overlay {
+            Overlay::Edit(ed) => match ed.pickers.get(ed.cursor) {
+                Some(Some((t, k))) => (t.clone(), k.clone(), ed.cursor),
+                _ => {
+                    return self.say("F7 picks values for foreign-key fields only");
+                }
+            },
+            _ => return,
+        };
+        let sql = format!(
+            "SELECT {} AS \"{}\", * FROM {} ORDER BY {} LIMIT 200",
+            Self::quote_ident(&keycol),
+            keycol,
+            Self::quote_ident(&parent),
+            Self::quote_ident(&keycol)
+        );
+        match self.db.query(&sql) {
+            Ok(q) => {
+                if q.rows.is_empty() {
+                    return self.say(format!("{parent} has no rows to pick"));
+                }
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    ed.picker = Some(PickerState {
+                        title: format!(" PICK · {parent} "),
+                        columns: q.columns,
+                        rows: q.rows,
+                        cursor: 0,
+                        field,
+                        key_col: 0,
+                    });
+                }
+            }
+            Err(e) => self.err(e),
+        }
     }
 
     /// SET RELATION, reborn: one pane per declared FK pointing at this
@@ -3514,10 +3976,8 @@ impl App {
     ) -> Vec<LinkPane> {
         let mut out = Vec::new();
         // Column index once (was a linear find per pane per flip).
-        let by_name: HashMap<&str, &PValue> = fields
-            .iter()
-            .map(|(c, v)| (c.name.as_str(), v))
-            .collect();
+        let by_name: HashMap<&str, &PValue> =
+            fields.iter().map(|(c, v)| (c.name.as_str(), v)).collect();
         let pk_val = fields.iter().find(|(c, _)| c.pk).map(|(_, v)| v);
         for (child, child_col, parent_col) in self.cached_links(parent) {
             // The parent-side key: the named column, or the pk (whose
@@ -3682,12 +4142,15 @@ impl App {
     /// Apply the saved form for `table` (order/labels/hide/required) to
     /// the parallel field vectors; returns the spec when it is PAINTED
     /// so EDIT can render the 2D layout.
+    #[allow(clippy::too_many_arguments)]
     fn apply_crafted_form(
         &mut self,
         table: &str,
         fields: &mut Vec<(ColumnInfo, PValue)>,
         labels: &mut Vec<String>,
         required: &mut Vec<bool>,
+        masks: &mut Vec<String>,
+        computed: &mut Vec<Option<String>>,
     ) -> Option<FormSpec> {
         let spec = self.cached_form(table)?;
         // Column index once (was O(F*C) position() scans per record).
@@ -3699,19 +4162,88 @@ impl App {
         let mut ordered = Vec::new();
         let mut new_labels = Vec::new();
         let mut new_required = Vec::new();
+        let mut new_masks = Vec::new();
+        let mut new_computed = Vec::new();
         for f in spec.fields.iter().filter(|f| f.include) {
             if let Some(&idx) = index.get(f.column.as_str()) {
                 ordered.push(fields[idx].clone());
                 new_labels.push(f.label.clone());
                 new_required.push(f.required);
+                new_masks.push(f.mask.clone());
+                new_computed.push(None);
+            } else if !f.computed.is_empty() {
+                // A derived column: not in the table, shown read-only.
+                let alias = if f.column.is_empty() {
+                    f.label.clone()
+                } else {
+                    f.column.clone()
+                };
+                ordered.push((
+                    ColumnInfo {
+                        name: alias,
+                        decl_type: String::new(),
+                        notnull: false,
+                        pk: false,
+                        dflt_value: None,
+                    },
+                    PValue::Null,
+                ));
+                new_labels.push(f.label.clone());
+                new_required.push(false);
+                new_masks.push(String::new());
+                new_computed.push(Some(f.computed.clone()));
             }
         }
         if !ordered.is_empty() {
             *fields = ordered;
             *labels = new_labels;
             *required = new_required;
+            *masks = new_masks;
+            *computed = new_computed;
         }
         spec.painted().then_some(spec)
+    }
+
+    /// Evaluate every computed field for `rowid` in one query; on error
+    /// the cells show `err: …` rather than silently going blank.
+    fn eval_computed(
+        &self,
+        table: &str,
+        rowid: i64,
+        computed: &[Option<String>],
+        fields: &mut [(ColumnInfo, PValue)],
+    ) {
+        let idxs: Vec<usize> = computed
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.as_ref().map(|_| i))
+            .collect();
+        if idxs.is_empty() || rowid == 0 {
+            return;
+        }
+        let select: Vec<String> = idxs
+            .iter()
+            .map(|&i| format!("({})", computed[i].as_deref().unwrap_or("NULL")))
+            .collect();
+        let sql = format!(
+            "SELECT {} FROM {} WHERE rowid = {rowid}",
+            select.join(", "),
+            Self::quote_ident(table)
+        );
+        match self.db.query(&sql) {
+            Ok(q) => {
+                if let Some(row) = q.rows.first() {
+                    for (j, &i) in idxs.iter().enumerate() {
+                        fields[i].1 = row.get(j).cloned().unwrap_or(PValue::Null);
+                    }
+                }
+            }
+            Err(e) => {
+                for &i in &idxs {
+                    fields[i].1 = PValue::Text(format!("err: {e}"));
+                }
+            }
+        }
     }
 
     /// 'a' in BROWSE: a blank record form; save INSERTs (crafted forms
@@ -3736,7 +4268,17 @@ impl App {
             cols.into_iter().map(|c| (c, PValue::Null)).collect();
         let mut labels: Vec<String> = fields.iter().map(|(c, _)| c.name.clone()).collect();
         let mut required: Vec<bool> = vec![false; fields.len()];
-        let painted = self.apply_crafted_form(&name, &mut fields, &mut labels, &mut required);
+        let mut masks: Vec<String> = vec![String::new(); fields.len()];
+        let mut computed: Vec<Option<String>> = vec![None; fields.len()];
+        let painted = self.apply_crafted_form(
+            &name,
+            &mut fields,
+            &mut labels,
+            &mut required,
+            &mut masks,
+            &mut computed,
+        );
+        let pickers = self.build_pickers(&name, &fields);
         let n = fields.len();
         self.overlay = Overlay::Edit(EditState {
             table: name,
@@ -3748,9 +4290,13 @@ impl App {
             fields,
             labels,
             required,
+            masks,
+            computed,
             inputs: vec![None; n],
             cursor: 0,
             editing: None,
+            pickers,
+            picker: None,
         });
     }
 
@@ -3850,15 +4396,16 @@ impl App {
         let Some(table) = table else {
             // Query results live in memory: synchronous scan, unchanged.
             let g = self.grid.as_ref().unwrap();
-            let hit = (start..total)
-                .find(|&abs| g.row(abs).is_some_and(|row| matches(row)));
+            let hit = (start..total).find(|&abs| g.row(abs).is_some_and(|row| matches(row)));
             return match hit {
                 Some(abs) => {
                     self.grid_jump(abs);
                     self.focus = Focus::Grid;
                     self.say(format!("found at row {}", abs + 1));
                 }
-                None => self.say(format!("{needle:?} not found below (g for top, n to retry)")),
+                None => self.say(format!(
+                    "{needle:?} not found below (g for top, n to retry)"
+                )),
             };
         };
         // Table scan, async: submit the first window; each response
@@ -3901,15 +4448,33 @@ impl App {
     /// and prompt commands. Borrows candidates (no per-Tab Vec<String>).
     fn prompt_complete(&mut self) {
         let (head, token) = match self.prompt.input.rfind(char::is_whitespace) {
-            Some(i) => (self.prompt.input[..=i].to_owned(), self.prompt.input[i + 1..].to_owned()),
+            Some(i) => (
+                self.prompt.input[..=i].to_owned(),
+                self.prompt.input[i + 1..].to_owned(),
+            ),
             None => (String::new(), self.prompt.input.clone()),
         };
         if token.is_empty() {
             return;
         }
         const COMMANDS: &[&str] = &[
-            "select", "help", "tables", "health", "qbe", "report", "labels", "quit", "form",
-            "apps", "app", "run", "find", "set theme",
+            "select",
+            "help",
+            "tables",
+            "health",
+            "qbe",
+            "report",
+            "labels",
+            "quit",
+            "form",
+            "apps",
+            "app",
+            "run",
+            "find",
+            "import",
+            "export",
+            "advise",
+            "set theme",
         ];
         let matches: Vec<&str> = self
             .tables
@@ -3940,7 +4505,9 @@ impl App {
     /// Quietly true when every required field of the open EDIT has a
     /// value (the loud version lives in commit_edit).
     fn edit_required_ok(&self) -> bool {
-        let Overlay::Edit(ed) = &self.overlay else { return false };
+        let Overlay::Edit(ed) = &self.overlay else {
+            return false;
+        };
         ed.required.iter().enumerate().all(|(i, req)| {
             !req || match &ed.inputs[i] {
                 Some(text) => PValue::parse(text, &ed.fields[i].0.decl_type) != PValue::Null,
@@ -3963,24 +4530,45 @@ impl App {
     /// record is clean afterwards (saved, or nothing to save). Does NOT
     /// close the overlay — F10 closes, paging keeps flying.
     fn commit_edit(&mut self) -> bool {
+        self.commit_edit_inner(false)
+    }
+
+    fn commit_edit_inner(&mut self, skip_required_check: bool) -> bool {
         self.fold_editing_buffer();
         // Required validation (crafted forms): the FINAL value of every
         // required field must be non-NULL, edited or not.
+        if !skip_required_check {
+            if let Overlay::Edit(ed) = &self.overlay {
+                for (i, req) in ed.required.iter().enumerate() {
+                    if !req {
+                        continue;
+                    }
+                    let is_null = match &ed.inputs[i] {
+                        Some(text) => {
+                            PValue::parse(text, &ed.fields[i].0.decl_type) == PValue::Null
+                        }
+                        None => ed.fields[i].1 == PValue::Null,
+                    };
+                    if is_null {
+                        let label = ed.labels[i].clone();
+                        self.err(format!("{label:?} is required"));
+                        return false;
+                    }
+                }
+            }
+        }
+        // PICTURE masks: an entered value must fit its mask.
         if let Overlay::Edit(ed) = &self.overlay {
-            for (i, req) in ed.required.iter().enumerate() {
-                if !req {
+            for (i, mask) in ed.masks.iter().enumerate() {
+                if mask.is_empty() {
                     continue;
                 }
-                let is_null = match &ed.inputs[i] {
-                    Some(text) => {
-                        PValue::parse(text, &ed.fields[i].0.decl_type) == PValue::Null
+                if let Some(text) = &ed.inputs[i] {
+                    if !mask_ok(mask, text) {
+                        let label = ed.labels[i].clone();
+                        self.err(format!("{label:?} must match {mask}"));
+                        return false;
                     }
-                    None => ed.fields[i].1 == PValue::Null,
-                };
-                if is_null {
-                    let label = ed.labels[i].clone();
-                    self.err(format!("{label:?} is required"));
-                    return false;
                 }
             }
         }
@@ -3990,11 +4578,13 @@ impl App {
                 let changes: Vec<(String, PValue)> = ed
                     .fields
                     .iter()
-                    .zip(&ed.inputs)
-                    .filter_map(|((col, _), input)| {
-                        input.as_ref().map(|text| {
-                            (col.name.clone(), PValue::parse(text, &col.decl_type))
-                        })
+                    .enumerate()
+                    // Computed columns are shown, never written.
+                    .filter(|(i, _)| !matches!(ed.computed.get(*i), Some(Some(_))))
+                    .filter_map(|(i, (col, _))| {
+                        ed.inputs[i]
+                            .as_ref()
+                            .map(|text| (col.name.clone(), PValue::parse(text, &col.decl_type)))
                     })
                     .collect();
                 Some((ed.table.clone(), ed.rowid, changes, ed.inserting))
@@ -4048,8 +4638,7 @@ impl App {
                     if let Overlay::Edit(ed) = &mut self.overlay {
                         for (i, input) in ed.inputs.iter_mut().enumerate() {
                             if let Some(text) = input.take() {
-                                ed.fields[i].1 =
-                                    PValue::parse(&text, &ed.fields[i].0.decl_type);
+                                ed.fields[i].1 = PValue::parse(&text, &ed.fields[i].0.decl_type);
                             }
                         }
                     }
@@ -4106,7 +4695,8 @@ impl App {
             return match Theme::by_name(rest.trim()) {
                 Some(t) => {
                     self.theme = t;
-                    self.say(format!("theme: {}", t.name));
+                    store::pref_set(self.db.link(), "theme", t.name);
+                    self.say(format!("theme: {} (remembered)", t.name));
                 }
                 None => self.err(format!(
                     "unknown theme {:?}; themes: green, amber, paper, blue",
@@ -4114,15 +4704,46 @@ impl App {
                 )),
             };
         }
+        if let Some(rest) = line.strip_prefix("set shimmer ") {
+            return match rest.trim().to_ascii_lowercase().as_str() {
+                "on" => {
+                    self.shimmer = true;
+                    store::pref_set(self.db.link(), "shimmer", "on");
+                    self.say("shimmer: on (remembered)");
+                }
+                "off" => {
+                    self.shimmer = false;
+                    store::pref_set(self.db.link(), "shimmer", "off");
+                    self.say("shimmer: off (remembered)");
+                }
+                other => self.err(format!("set shimmer on|off (got {other:?})")),
+            };
+        }
         if line == "help" {
             return self.open_help();
         }
         // dBASE ended sessions with QUIT; honor it (and friends).
-        if ["quit", "exit", "q"].iter().any(|w| line.eq_ignore_ascii_case(w)) {
+        if ["quit", "exit", "q"]
+            .iter()
+            .any(|w| line.eq_ignore_ascii_case(w))
+        {
             return self.apply(Command::Quit);
         }
         if line == "health" {
             return self.open_health();
+        }
+        if line == "advise" || line == "advisor" {
+            return match crate::advisor::advise(self.db.link()) {
+                Ok(lines) => {
+                    self.overlay = Overlay::Pager(PagerState {
+                        title: " ADVISOR ".into(),
+                        lines,
+                        offset: 0,
+                        file_stem: "advisor".into(),
+                    });
+                }
+                Err(e) => self.err(e),
+            };
         }
         if let Some(rest) = line.strip_prefix("qbe") {
             let t = rest.trim();
@@ -4145,12 +4766,25 @@ impl App {
         }
         {
             let toks: Vec<&str> = line.split_whitespace().collect();
-            if toks.first().is_some_and(|t| t.eq_ignore_ascii_case("create")) && toks.len() <= 2 {
+            if toks
+                .first()
+                .is_some_and(|t| t.eq_ignore_ascii_case("create"))
+                && toks.len() <= 2
+            {
                 let second = toks.get(1).map(|t| t.to_ascii_lowercase());
                 let sql_word = matches!(
                     second.as_deref(),
-                    Some("table" | "virtual" | "view" | "index" | "trigger"
-                        | "temp" | "temporary" | "unique" | "if")
+                    Some(
+                        "table"
+                            | "virtual"
+                            | "view"
+                            | "index"
+                            | "trigger"
+                            | "temp"
+                            | "temporary"
+                            | "unique"
+                            | "if"
+                    )
                 );
                 if !sql_word {
                     // `create` / `create gadgets` → the TABLE DESIGNER.
@@ -4185,14 +4819,25 @@ impl App {
             self.focus = Focus::Sidebar;
             return;
         }
+        if line.starts_with("import") {
+            return self.handle_import(&line);
+        }
+        if line.starts_with("export") {
+            return self.handle_export(&line);
+        }
 
         let head = line
             .split_whitespace()
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        if matches!(head.as_str(), "select" | "with" | "pragma" | "explain" | "values") {
+        if matches!(
+            head.as_str(),
+            "select" | "with" | "pragma" | "explain" | "values"
+        ) {
             self.run_select(&line);
+        } else if self.readonly {
+            self.err("read-only mode: only SELECT is allowed");
         } else {
             match self.db.execute(&line) {
                 Ok((n, elapsed)) => {
@@ -4207,6 +4852,80 @@ impl App {
                 Err(e) => self.err(e),
             }
         }
+    }
+
+    fn handle_import(&mut self, line: &str) {
+        if self.readonly {
+            return self.err("read-only mode: import is disabled");
+        }
+        let mut rest = line["import".len()..].trim();
+        if rest.to_ascii_lowercase().starts_with("csv") {
+            rest = rest[3..].trim();
+            if rest.starts_with(char::is_whitespace) {
+                rest = rest.trim_start();
+            }
+        }
+        // table and path are last two whitespace-separated tokens; path may be quoted
+        let mut parts = rest.rsplitn(2, char::is_whitespace);
+        let raw_path = parts.next().unwrap_or("").trim();
+        let raw_table = parts.next().unwrap_or("").trim();
+        let path = strip_quotes(raw_path);
+        let table = strip_quotes(raw_table);
+        if table.is_empty() || path.is_empty() {
+            self.err("usage: import <table> <path>  — e.g. import customers ./data.csv");
+            return;
+        }
+        match crate::csv_io::import_csv(self.db.link(), table, path) {
+            Ok(msg) => {
+                self.reload_tables();
+                self.refresh_health();
+                self.say(msg);
+            }
+            Err(e) => self.err(e),
+        }
+    }
+
+    fn handle_export(&mut self, line: &str) {
+        let mut rest = line["export".len()..].trim();
+        if rest.to_ascii_lowercase().starts_with("csv") {
+            rest = rest[3..].trim();
+            if rest.starts_with(char::is_whitespace) {
+                rest = rest.trim_start();
+            }
+        }
+        let idx = rest.rfind(char::is_whitespace);
+        let (raw_source, raw_path) = match idx {
+            Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
+            None => {
+                self.err(
+                    "usage: export <table|SELECT> <path>  — e.g. export customers ./out.csv or export \"select * from customers\" ./out.csv",
+                );
+                return;
+            }
+        };
+        let source = strip_quotes(raw_source);
+        let path = strip_quotes(raw_path);
+        if source.is_empty() || path.is_empty() {
+            self.err("usage: export <table|SELECT> <path>");
+            return;
+        }
+        match crate::csv_io::export_csv(self.db.link(), source, path) {
+            Ok(msg) => self.say(msg),
+            Err(e) => self.err(e),
+        }
+    }
+}
+
+/// Strip one matching pair of surrounding quotes. Only the SAME quote
+/// character is removed from both ends — so `"select 'Ada'"` keeps its
+/// inner single quotes (a `trim_matches` over both kinds ate the closing
+/// `'`).
+fn strip_quotes(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        &s[1..s.len() - 1]
+    } else {
+        s
     }
 }
 
@@ -4304,7 +5023,11 @@ mod tests {
         assert_eq!(hv.table, "m");
         assert_eq!(hv.report.len(), 1);
         assert_eq!(hv.sparks.len(), 2);
-        let hits = hv.sparks.iter().find(|(n, _, _)| n == "cache_hits").unwrap();
+        let hits = hv
+            .sparks
+            .iter()
+            .find(|(n, _, _)| n == "cache_hits")
+            .unwrap();
         assert_eq!(hits.1, vec![1.0, 2.0, 3.0], "chronological after reverse");
     }
 
@@ -4426,6 +5149,55 @@ mod tests {
         assert_eq!(a.grid.as_ref().unwrap().total, 1);
     }
 
+    /// #16: QBE cycles an FK join (`J`) and GROUP BY (`g`) through the
+    /// bus, and the generated SQL actually runs into the grid.
+    #[test]
+    fn qbe_join_and_group_through_the_bus() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY,
+                 customer_id INTEGER REFERENCES customers(id), amount REAL);
+             INSERT INTO customers(name) VALUES ('Ada'), ('Grace');
+             INSERT INTO orders(customer_id, amount) VALUES (1,10.0),(1,20.0),(2,5.0);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenQbe(Some("orders".into())));
+        a.apply(Command::DesignerJoin);
+        let Overlay::Qbe(st) = &a.overlay else {
+            panic!("qbe closed")
+        };
+        assert_eq!(
+            st.spec.join.as_ref().map(|j| j.table.as_str()),
+            Some("customers")
+        );
+        a.apply(Command::DesignerRun);
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().total, 3, "join keeps all orders");
+
+        // Group by customer_id: one row per customer with a count.
+        a.apply(Command::OpenQbe(Some("orders".into())));
+        a.apply(Command::DesignerGroup); // first column = id? cycle to customer_id
+        if let Overlay::Qbe(st) = &mut a.overlay {
+            st.spec.group_by = Some("customer_id".into());
+        }
+        a.apply(Command::DesignerRun);
+        a.sync();
+        let g = a.grid.as_ref().unwrap();
+        assert_eq!(g.total, 2, "two customer groups");
+        assert_eq!(g.columns.last().map(String::as_str), Some("n"));
+        let counts: Vec<i64> = g
+            .cache
+            .iter()
+            .filter_map(|r| match r.last() {
+                Some(PValue::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(counts, vec![2, 1]);
+    }
+
     #[test]
     fn report_preview_through_the_bus() {
         let mut a = app();
@@ -4441,6 +5213,90 @@ mod tests {
         // The pk column is an identifier, not a quantity: its 1..=500
         // sum (125250) must NOT appear anywhere in the report.
         assert!(!text.contains("125250"), "pk column must not be totaled");
+    }
+
+    /// #17: the report designer's group-by cell accepts a typed SQL
+    /// expression and the preview bands on it.
+    #[test]
+    fn report_group_by_expression_through_the_bus() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE sales(region TEXT, amount REAL);
+             INSERT INTO sales VALUES ('east',10.0),('east',20.0),('west',5.0);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenReport(Some("sales".into())));
+        // cursor 0 → title, 1 → source, 2 → group by
+        a.apply(Command::DesignerMove(2));
+        a.apply(Command::DesignerEditBegin);
+        for c in "substr(region,1,1)".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        let Overlay::Report(st) = &a.overlay else {
+            panic!("designer closed")
+        };
+        assert_eq!(st.spec.group_by.as_deref(), Some("substr(region,1,1)"));
+        a.apply(Command::DesignerRun);
+        let Overlay::Pager(p) = &a.overlay else {
+            panic!("expected pager")
+        };
+        let text = p.lines.join("\n");
+        assert!(text.contains("▌ substr(region,1,1) = e"), "{text}");
+        assert!(text.contains("▌ substr(region,1,1) = w"), "{text}");
+        assert!(text.contains("TOTAL (3 rows)"), "{text}");
+    }
+
+    /// #15: a PICTURE mask set in the form designer formats the live
+    /// edit buffer and refuses a value that does not fit.
+    #[test]
+    fn picture_mask_through_the_bus() {
+        let mut a = app();
+        // Craft a mask on column b.
+        a.apply(Command::OpenForm(Some("t".into())));
+        a.apply(Command::DesignerMove(1));
+        a.apply(Command::DesignerEditMask);
+        for c in "999-99-9999".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        a.apply(Command::DesignerSave);
+        a.apply(Command::Back);
+        let spec = crate::forms::FormSpec::load(a.db.link(), "t").unwrap();
+        assert_eq!(spec.fields[1].mask, "999-99-9999");
+
+        // Editing formats as you type.
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        for c in "123456789".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("edit closed")
+        };
+        assert_eq!(ed.editing.as_deref(), Some("123-45-6789"));
+        a.apply(Command::EditCommitField);
+        let q = a.db.query("SELECT b FROM t WHERE a = 1").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Text("123-45-6789".into()));
+
+        // An incomplete value is refused.
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        for c in "12".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        assert!(
+            a.status
+                .as_ref()
+                .is_some_and(|(m, e)| *e && m.contains("must match")),
+            "status: {:?}",
+            a.status
+        );
     }
 
     #[test]
@@ -4478,8 +5334,10 @@ mod tests {
             matches!(a.overlay, Overlay::Edit(_)),
             "save must be refused while required field is blank"
         );
-        assert!(a.status.as_ref().is_some_and(|(m, err)| *err
-            && m.contains("required")));
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, err)| *err && m.contains("required")));
     }
 
     #[test]
@@ -4792,10 +5650,25 @@ mod tests {
         // master content at y=1 (header at y=0).
         use ratatui::layout::Rect;
         a.hit = HitRects {
-            sidebar: Some(Rect { x: 0, y: 1, width: 22, height: 10 }),
-            master: Some(Rect { x: 25, y: 1, width: 40, height: 20 }),
+            sidebar: Some(Rect {
+                x: 0,
+                y: 1,
+                width: 22,
+                height: 10,
+            }),
+            master: Some(Rect {
+                x: 25,
+                y: 1,
+                width: 40,
+                height: 20,
+            }),
             detail: None,
-            prompt: Some(Rect { x: 0, y: 28, width: 100, height: 1 }),
+            prompt: Some(Rect {
+                x: 0,
+                y: 28,
+                width: 100,
+                height: 1,
+            }),
         };
         use ratatui::crossterm::event::MouseEventKind as K;
         // Click sidebar row 2 (orders): selects, second click opens.
@@ -4810,11 +5683,24 @@ mod tests {
         ));
         // Refresh rects (draw would): click master row 0 (Ada, y=2 is
         // the first data row — y=1 is the header), then row 1 (Grace).
-        a.hit.master = Some(Rect { x: 25, y: 1, width: 40, height: 20 });
-        a.on_mouse(&K::Down(ratatui::crossterm::event::MouseButton::Left), 30, 2);
+        a.hit.master = Some(Rect {
+            x: 25,
+            y: 1,
+            width: 40,
+            height: 20,
+        });
+        a.on_mouse(
+            &K::Down(ratatui::crossterm::event::MouseButton::Left),
+            30,
+            2,
+        );
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 0);
         assert_eq!(a.focus, Focus::Grid);
-        a.on_mouse(&K::Down(ratatui::crossterm::event::MouseButton::Left), 30, 3);
+        a.on_mouse(
+            &K::Down(ratatui::crossterm::event::MouseButton::Left),
+            30,
+            3,
+        );
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 1);
         // Wheel scrolls the master.
         a.on_mouse(&K::ScrollDown, 30, 2);
@@ -4822,7 +5708,11 @@ mod tests {
         a.on_mouse(&K::ScrollUp, 30, 2);
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 1);
         // Click prompt focuses it.
-        a.on_mouse(&K::Down(ratatui::crossterm::event::MouseButton::Left), 50, 28);
+        a.on_mouse(
+            &K::Down(ratatui::crossterm::event::MouseButton::Left),
+            50,
+            28,
+        );
         assert_eq!(a.focus, Focus::Prompt);
     }
 
@@ -4871,7 +5761,9 @@ mod tests {
         b.apply(Command::ToggleSplit);
         b.sync();
         let d = b.detail.as_ref().expect("remembered split restored");
-        let GridSource::Detail { child, .. } = &d.grid.source else { panic!() };
+        let GridSource::Detail { child, .. } = &d.grid.source else {
+            panic!()
+        };
         assert_eq!(child, &second_child, "remembered link wins");
         let _ = std::fs::remove_file(&file);
     }
@@ -5047,6 +5939,36 @@ mod tests {
         assert_eq!(a.theme.name, "amber");
     }
 
+    /// #22: theme and shimmer persist in _phosphor_prefs and come back
+    /// for the next session on the same file.
+    #[test]
+    fn theme_and_shimmer_persist_across_sessions() {
+        let file = std::env::temp_dir().join(format!("phosphor-prefs-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap().to_owned();
+        {
+            let (db, _) = EmbeddedDb::open(&path).unwrap();
+            let mut a = App::new(Box::new(db), None);
+            for c in "set theme paper".chars() {
+                a.apply(Command::PromptChar(c));
+            }
+            a.apply(Command::PromptRun);
+            a.sync();
+            assert_eq!(a.theme.name, "paper");
+            for c in "set shimmer on".chars() {
+                a.apply(Command::PromptChar(c));
+            }
+            a.apply(Command::PromptRun);
+            a.sync();
+            assert!(a.shimmer);
+        }
+        let (db2, _) = EmbeddedDb::open(&path).unwrap();
+        let b = App::new(Box::new(db2), None);
+        assert_eq!(b.theme.name, "paper", "theme remembered");
+        assert!(b.shimmer, "shimmer remembered");
+        let _ = std::fs::remove_file(&file);
+    }
+
     #[test]
     fn help_is_context_sensitive() {
         let mut a = app();
@@ -5060,7 +5982,9 @@ mod tests {
         // Topics cycle; scroll clamps at zero.
         a.apply(Command::HelpTopic(1));
         a.apply(Command::HelpScroll(-5));
-        let Overlay::Help(st) = &a.overlay else { panic!() };
+        let Overlay::Help(st) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(crate::help::TOPICS[st.topic].key, "reports");
         assert_eq!(st.scroll, 0);
         // Esc closes back toward where the user was.
@@ -5069,7 +5993,9 @@ mod tests {
         // From the prompt, F1 lands on the prompt topic.
         a.apply(Command::Focus(Focus::Prompt));
         a.apply(Command::Help);
-        let Overlay::Help(st) = &a.overlay else { panic!() };
+        let Overlay::Help(st) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(crate::help::TOPICS[st.topic].key, "prompt");
     }
 
@@ -5107,7 +6033,10 @@ mod tests {
             .unwrap();
         a.tick();
         assert!(count(&a) > before, "due tick takes a sample");
-        assert!(matches!(a.overlay, Overlay::Health(_)), "console stays open");
+        assert!(
+            matches!(a.overlay, Overlay::Health(_)),
+            "console stays open"
+        );
     }
 
     #[test]
@@ -5117,11 +6046,12 @@ mod tests {
             .execute("CREATE TABLE zeta(x); CREATE TABLE t_chunks(x); CREATE TABLE _phosphor_apps(id INTEGER)")
             .unwrap();
         a.apply(Command::Refresh);
-        let names: Vec<String> =
-            a.visible_tables().iter().map(|t| t.name.clone()).collect();
+        let names: Vec<String> = a.visible_tables().iter().map(|t| t.name.clone()).collect();
         assert!(names.contains(&"t".into()) && names.contains(&"zeta".into()));
         assert!(
-            !names.iter().any(|n| n == "t_chunks" || n == "_phosphor_apps"),
+            !names
+                .iter()
+                .any(|n| n == "t_chunks" || n == "_phosphor_apps"),
             "internals hidden by default: {names:?}"
         );
         // First-letter seek jumps to zeta.
@@ -5130,8 +6060,7 @@ mod tests {
         assert_eq!(vis[a.sidebar_idx].name, "zeta");
         // Toggle reveals everything.
         a.apply(Command::ToggleInternals);
-        let all: Vec<String> =
-            a.visible_tables().iter().map(|t| t.name.clone()).collect();
+        let all: Vec<String> = a.visible_tables().iter().map(|t| t.name.clone()).collect();
         assert!(all.iter().any(|n| n == "_phosphor_apps"), "{all:?}");
     }
 
@@ -5162,13 +6091,17 @@ mod tests {
         a.apply(Command::OpenSelected);
         a.sync();
         a.apply(Command::OpenEdit);
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.row_abs, 0);
         assert_eq!(ed.fields[1].1, PValue::Text("row1".into()));
 
         // Page forward: same overlay, next record.
         a.apply(Command::EditPage(1));
-        let Overlay::Edit(ed) = &a.overlay else { panic!("form closed") };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("form closed")
+        };
         assert_eq!(ed.row_abs, 1);
         assert_eq!(ed.fields[1].1, PValue::Text("row2".into()));
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 1, "grid follows");
@@ -5184,7 +6117,9 @@ mod tests {
         }
         a.apply(Command::EditCommitField);
         a.apply(Command::EditPage(1));
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.row_abs, 2);
         let q = a.db.query("SELECT b FROM t WHERE a = 2").unwrap();
         assert_eq!(q.rows[0][0], PValue::Text("paged-save".into()));
@@ -5194,7 +6129,9 @@ mod tests {
             a.apply(Command::EditPage(1));
         }
         a.sync();
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.row_abs, 499);
         a.apply(Command::EditPage(1));
         assert!(a.status.as_ref().is_some_and(|(m, _)| m == "last record"));
@@ -5217,7 +6154,9 @@ mod tests {
         for c in "live".chars() {
             a.apply(Command::EditType(c));
         }
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.editing.as_deref(), Some("live"), "typed straight in");
         a.apply(Command::Back);
         a.apply(Command::Back);
@@ -5228,7 +6167,9 @@ mod tests {
             a.apply(Command::CreateType(c));
         }
         a.apply(Command::DesignerCommit);
-        let Overlay::Create(st) = &a.overlay else { panic!() };
+        let Overlay::Create(st) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(st.draft.fields[1].name, "city", "no Enter, no backspacing");
     }
 
@@ -5279,10 +6220,20 @@ mod tests {
         assert!(matches!(a.overlay, Overlay::None), "editor closed");
         let cols = a.db.columns("clients").unwrap();
         let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["id", "name", "locality", "balance"], "renamed+added+dropped");
-        let q = a.db.query("SELECT name, locality FROM clients ORDER BY name").unwrap();
+        assert_eq!(
+            names,
+            ["id", "name", "locality", "balance"],
+            "renamed+added+dropped"
+        );
+        let q =
+            a.db.query("SELECT name, locality FROM clients ORDER BY name")
+                .unwrap();
         assert_eq!(q.rows[0][0], PValue::Text("Ada".into()));
-        assert_eq!(q.rows[0][1], PValue::Text("London".into()), "data survived the rename");
+        assert_eq!(
+            q.rows[0][1],
+            PValue::Text("London".into()),
+            "data survived the rename"
+        );
     }
 
     /// The editor declines a type change on an existing column with a
@@ -5292,7 +6243,8 @@ mod tests {
         let (db, _) = EmbeddedDb::open(":memory:").unwrap();
         db.execute("CREATE TABLE things(id INTEGER PRIMARY KEY, size TEXT);")
             .unwrap();
-        db.execute("INSERT INTO things(size) VALUES ('big')").unwrap();
+        db.execute("INSERT INTO things(size) VALUES ('big')")
+            .unwrap();
         let mut a = App::new(Box::new(db), None);
         a.apply(Command::OpenSelected);
         a.sync();
@@ -5306,7 +6258,176 @@ mod tests {
         assert_eq!(cols[1].decl_type.to_ascii_uppercase(), "REAL");
         let q = a.db.query("SELECT size FROM things").unwrap();
         assert_eq!(q.rows[0][0], PValue::Text("big".into()));
-        assert!(a.status.as_ref().is_some_and(|(m, _)| m.contains("applied")));
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("applied")));
+    }
+
+    /// #15: a computed field shows a calculated, read-only value and is
+    /// never written back.
+    #[test]
+    fn computed_field_is_readonly_and_accurate() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE orders(id INTEGER PRIMARY KEY, qty INTEGER, price REAL);
+             INSERT INTO orders(qty, price) VALUES (3, 4.0);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        // Craft a form with a computed column `total`.
+        a.apply(Command::OpenForm(Some("orders".into())));
+        if let Overlay::Form(st) = &mut a.overlay {
+            st.spec.fields.push(crate::forms::FormField {
+                column: "total".into(),
+                label: "Total".into(),
+                include: true,
+                required: false,
+                pos: None,
+                width: 12,
+                mask: String::new(),
+                computed: "qty * price".into(),
+            });
+        }
+        a.apply(Command::DesignerSave);
+        a.apply(Command::Back);
+
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("edit closed")
+        };
+        let i = ed
+            .fields
+            .iter()
+            .position(|(c, _)| c.name == "total")
+            .unwrap();
+        assert_eq!(ed.computed[i].as_deref(), Some("qty * price"));
+        assert_eq!(ed.fields[i].1, PValue::Real(12.0), "3 * 4.0");
+        // Navigation skips the computed field.
+        a.apply(Command::EditMove(1)); // from id → qty
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
+        assert_eq!(ed.cursor, 1);
+        // Typing at it is refused.
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.cursor = i;
+        }
+        a.apply(Command::EditType('9'));
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
+        assert!(ed.editing.is_none(), "computed field not editable");
+        // Save writes qty/price only; `total` is not a column.
+        a.apply(Command::EditSave);
+        let err = a.db.query("SELECT total FROM orders").unwrap_err();
+        assert!(err.contains("no such column"), "{err}");
+    }
+
+    /// #18: `H` flips the split orientation and it is remembered.
+    #[test]
+    fn split_orientation_toggles_and_persists() {
+        let file =
+            std::env::temp_dir().join(format!("phosphor-splitdir-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap().to_owned();
+        {
+            let (db, _) = EmbeddedDb::open(&path).unwrap();
+            db.execute(
+                "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+                 CREATE TABLE orders(id INTEGER PRIMARY KEY,
+                     customer_id INTEGER REFERENCES customers(id));
+                 INSERT INTO customers VALUES (1, 'Ada');",
+            )
+            .unwrap();
+            let mut a = App::new(Box::new(db), None);
+            assert!(!a.split_horizontal, "default is side-by-side");
+            a.apply(Command::ToggleSplitDir);
+            assert!(a.split_horizontal);
+            a.apply(Command::OpenSelected);
+            a.sync();
+            a.visible_rows = 20; // stacked needs height, not width
+            a.apply(Command::ToggleSplit);
+            a.sync();
+            assert!(a.detail.is_some(), "stacked split opens");
+        }
+        let (db2, _) = EmbeddedDb::open(&path).unwrap();
+        let b = App::new(Box::new(db2), None);
+        assert!(b.split_horizontal, "orientation remembered");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// #21: `--readonly` refuses every write shape through the bus.
+    #[test]
+    fn readonly_kiosk_refuses_writes() {
+        let mut a = app();
+        a.readonly = true;
+        a.apply(Command::OpenSelected);
+        a.sync();
+        // Insert form never opens.
+        a.apply(Command::OpenInsert);
+        assert!(matches!(a.overlay, Overlay::None), "insert blocked");
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, e)| *e && m.contains("read-only")));
+        // Delete blocked; nothing armed.
+        a.apply(Command::DeleteRow);
+        assert!(a.pending_delete.is_none());
+        // A writing prompt statement is refused.
+        for c in "insert into t(b) values ('x')".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, e)| *e && m.contains("read-only")));
+        let n = a.db.query("SELECT count(*) FROM t").unwrap();
+        assert_eq!(n.rows[0][0], PValue::Int(500), "no row written");
+    }
+
+    /// #15: F7 on an FK field opens a picker over the parent table and
+    /// writes the chosen key into the field.
+    #[test]
+    fn fk_picker_fills_the_field() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY, product TEXT,
+                                 customer_id INTEGER REFERENCES customers(id));
+             INSERT INTO customers(name) VALUES ('Ada'), ('Grace');
+             INSERT INTO orders(product) VALUES ('modem');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        // seek orders (only 'o' table), browse, edit the row
+        a.apply(Command::SidebarSeek('o'));
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(2)); // customer_id field
+        a.apply(Command::EditPick);
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("edit closed")
+        };
+        let p = ed.picker.as_ref().expect("picker opened");
+        assert_eq!(p.rows.len(), 2);
+        assert_eq!(p.columns[0], "id", "key column first");
+        // Pick Grace (row 1) and commit.
+        a.apply(Command::PickerMove(1));
+        a.apply(Command::PickerCommit);
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("edit closed")
+        };
+        assert!(ed.picker.is_none(), "picker closed");
+        assert_eq!(ed.inputs[2].as_deref(), Some("2"), "Grace's id written");
+        a.apply(Command::EditSave);
+        let q = a.db.query("SELECT customer_id FROM orders").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Int(2));
     }
 
     #[test]
@@ -5324,19 +6445,25 @@ mod tests {
         let mut a = App::new(Box::new(db), None);
         a.apply(Command::OpenSelected); // customers (alphabetical first)
         a.sync();
-        a.apply(Command::OpenEdit);     // Ada
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        a.apply(Command::OpenEdit); // Ada
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.links.len(), 1, "the declared FK is discovered");
         assert_eq!(ed.links[0].child, "orders");
         assert_eq!(ed.links[0].total, 2, "Ada has two orders");
         assert!(ed.links[0].rows.iter().any(|r| r.contains(&"coax".into())));
         // Paging to Grace refreshes the pane.
         a.apply(Command::EditPage(1));
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.links[0].total, 1, "Grace has one order");
         // Back to Ada: the pane comes from the per-key cache, same picture.
         a.apply(Command::EditPage(-1));
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.links[0].total, 2, "Ada again, cached");
         assert!(ed.links[0].rows.iter().any(|r| r.contains(&"modem".into())));
         // F4 jumps into a filtered BROWSE of the children.
@@ -5345,7 +6472,8 @@ mod tests {
         let g = a.grid.as_ref().expect("filtered child browse");
         assert_eq!(g.total, 2, "only Ada's orders");
         // FKs are ENFORCED on the embedded backend now.
-        let bad = a.db.execute("INSERT INTO orders(product, customer_id) VALUES ('x', 99)");
+        let bad =
+            a.db.execute("INSERT INTO orders(product, customer_id) VALUES ('x', 99)");
         assert!(bad.is_err(), "orphan insert must be rejected");
     }
 
@@ -5376,7 +6504,7 @@ mod tests {
                 a.apply(Command::PromptChar(c));
             }
             a.apply(Command::PromptRun);
-        a.sync();
+            a.sync();
             assert!(a.quit, "{word:?} must quit");
         }
     }
@@ -5392,7 +6520,9 @@ mod tests {
         let cmd = a.map_key(KeyEvent::from(KeyCode::Tab)).unwrap();
         assert!(matches!(cmd, Command::EditMove(1)), "Tab must move fields");
         a.apply(cmd);
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.cursor, 1);
         // Mid-edit: Tab commits-and-advances; Shift-Tab keeps the text.
         a.apply(Command::EditBegin);
@@ -5402,12 +6532,20 @@ mod tests {
         let cmd = a.map_key(KeyEvent::from(KeyCode::BackTab)).unwrap();
         assert!(matches!(cmd, Command::EditMove(-1)));
         a.apply(cmd);
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.cursor, 0, "Shift-Tab steps back");
-        assert_eq!(ed.inputs[1].as_deref(), Some("kept"), "typing folded, not dropped");
+        assert_eq!(
+            ed.inputs[1].as_deref(),
+            Some("kept"),
+            "typing folded, not dropped"
+        );
         let cmd = a.map_key(KeyEvent::from(KeyCode::Tab)).unwrap();
         a.apply(cmd);
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.cursor, 1, "Tab advances again");
     }
 
@@ -5450,7 +6588,9 @@ mod tests {
         assert!(matches!(a.overlay, Overlay::Edit(_)), "form stays open");
         let q = a.db.query("SELECT b FROM t WHERE a = 1").unwrap();
         assert_eq!(q.rows[0][0], PValue::Text("enter-saved".into()));
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.cursor, 0, "advanced (wrapped) to the next field");
         assert!(!ed.dirty(), "record is clean after the Enter-save");
     }
@@ -5470,7 +6610,9 @@ mod tests {
             a.apply(Command::EditChar(c));
         }
         a.apply(Command::EditCommitField); // Enter inserts...
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert!(!ed.inserting, "form flipped onto the inserted record");
         a.apply(Command::EditMove(0));
         a.apply(Command::EditBegin);
@@ -5481,7 +6623,9 @@ mod tests {
             a.apply(Command::EditChar(c));
         }
         a.apply(Command::EditCommitField); // ...and Enter again UPDATES it
-        let q = a.db.query("SELECT count(*) FROM t WHERE b IN ('once','twice')").unwrap();
+        let q =
+            a.db.query("SELECT count(*) FROM t WHERE b IN ('once','twice')")
+                .unwrap();
         assert_eq!(q.rows[0][0], PValue::Int(1), "no duplicate insert");
     }
 
@@ -5507,15 +6651,19 @@ mod tests {
         a.apply(Command::DesignerRun);
         a.sync();
         assert!(matches!(a.overlay, Overlay::None), "designer closed");
-        assert!(matches!(
-            &a.grid,
-            Some(Grid { source: GridSource::Table { name, .. }, .. }) if name == "gadgets"
-        ), "opened BROWSE on the new table");
-        let sql = a
-            .db
-            .query("SELECT sql FROM sqlite_master WHERE name = 'gadgets'")
-            .unwrap();
-        let PValue::Text(ddl) = &sql.rows[0][0] else { panic!() };
+        assert!(
+            matches!(
+                &a.grid,
+                Some(Grid { source: GridSource::Table { name, .. }, .. }) if name == "gadgets"
+            ),
+            "opened BROWSE on the new table"
+        );
+        let sql =
+            a.db.query("SELECT sql FROM sqlite_master WHERE name = 'gadgets'")
+                .unwrap();
+        let PValue::Text(ddl) = &sql.rows[0][0] else {
+            panic!()
+        };
         assert!(ddl.contains("\"id\" INTEGER PRIMARY KEY"), "{ddl}");
         assert!(ddl.contains("\"label\" TEXT NOT NULL"), "{ddl}");
         assert!(ddl.contains("\"field3\" REAL DEFAULT 1"), "{ddl}");
@@ -5546,7 +6694,9 @@ mod tests {
             a.apply(Command::EditChar(c));
         }
         a.apply(Command::EditCommitField); // advance + UPDATE
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert!(ed.inputs.iter().all(|i| i.is_none()), "record is clean");
         let shown: Vec<&PValue> = ed.fields.iter().map(|(_, v)| v).collect();
         assert!(
@@ -5562,11 +6712,13 @@ mod tests {
         a.sync();
         a.apply(Command::OpenEdit);
         a.apply(Command::EditMove(1)); // b = "row1"
-        a.apply(Command::EditBegin);   // prefilled with "row1"
+        a.apply(Command::EditBegin); // prefilled with "row1"
         for c in "fresh".chars() {
             a.apply(Command::EditChar(c));
         }
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(
             ed.editing.as_deref(),
             Some("fresh"),
@@ -5577,7 +6729,9 @@ mod tests {
         a.apply(Command::EditBegin);
         a.apply(Command::EditBackspace);
         a.apply(Command::EditChar('X'));
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.editing.as_deref(), Some("rowX"));
         a.apply(Command::Back);
         a.apply(Command::Back);
@@ -5590,7 +6744,9 @@ mod tests {
             a.apply(Command::DesignerChar(c));
         }
         a.apply(Command::DesignerCommit);
-        let Overlay::Create(st) = &a.overlay else { panic!() };
+        let Overlay::Create(st) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(st.draft.fields[1].name, "qty", "no backspacing required");
     }
 
@@ -5606,15 +6762,17 @@ mod tests {
             a.apply(Command::EditPage(1));
         }
         a.sync();
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.row_abs, 90, "held paging must accelerate");
         // A pause resets the streak back to single-stepping.
-        a.last_edit_page = Some(
-            std::time::Instant::now() - std::time::Duration::from_millis(400),
-        );
+        a.last_edit_page = Some(std::time::Instant::now() - std::time::Duration::from_millis(400));
         a.apply(Command::EditPage(1));
         a.sync();
-        let Overlay::Edit(ed) = &a.overlay else { panic!() };
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
         assert_eq!(ed.row_abs, 91, "a pause resets to stride 1");
     }
 
@@ -5721,3 +6879,59 @@ fn alter_added_column_edits_cleanly() {
     assert_eq!(g.row(0).unwrap()[3], PValue::Real(120.5));
 }
 
+/// #14: `import <table> <path>` and `export <table|SELECT> <path>` run
+/// through the prompt and the real DbLink; empty CSV fields become NULL.
+#[test]
+fn prompt_import_export_csv() {
+    use crate::db::EmbeddedDb;
+    let dir = std::env::temp_dir();
+    let csv_in = dir.join(format!("phosphor-app-import-{}.csv", std::process::id()));
+    let csv_out = dir.join(format!("phosphor-app-export-{}.csv", std::process::id()));
+    std::fs::write(&csv_in, "name,city\nAda,London\nGrace,\n").unwrap();
+
+    let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+    db.execute("CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT, city TEXT)")
+        .unwrap();
+    let mut a = App::new(Box::new(db), None);
+
+    let cmd = format!("import people {}", csv_in.display());
+    for c in cmd.chars() {
+        a.apply(Command::PromptChar(c));
+    }
+    a.apply(Command::PromptRun);
+    a.sync();
+    assert!(
+        a.status
+            .as_ref()
+            .is_some_and(|(m, e)| !*e && m.contains("2 row(s)")),
+        "status: {:?}",
+        a.status
+    );
+    let q =
+        a.db.query("SELECT name, city FROM people ORDER BY name")
+            .unwrap();
+    assert_eq!(q.rows[0][1], PValue::Text("London".into()));
+    assert_eq!(q.rows[1][1], PValue::Null, "empty CSV field is NULL");
+
+    let cmd = format!(
+        "export \"select name from people where name='Ada'\" {}",
+        csv_out.display()
+    );
+    for c in cmd.chars() {
+        a.apply(Command::PromptChar(c));
+    }
+    a.apply(Command::PromptRun);
+    a.sync();
+    assert!(
+        a.status
+            .as_ref()
+            .is_some_and(|(m, e)| !*e && m.contains("1 row(s)")),
+        "status: {:?}",
+        a.status
+    );
+    let out = std::fs::read_to_string(&csv_out).unwrap();
+    assert!(out.contains("Ada") && !out.contains("Grace"), "{out:?}");
+
+    let _ = std::fs::remove_file(&csv_in);
+    let _ = std::fs::remove_file(&csv_out);
+}

@@ -100,7 +100,10 @@ fn fk_of(f: &FieldDef) -> Option<(String, Option<String>)> {
         return None;
     }
     match raw.split_once('(') {
-        Some((t, rest)) => Some((t.trim().to_owned(), Some(rest.trim_end_matches(')').trim().to_owned()))),
+        Some((t, rest)) => Some((
+            t.trim().to_owned(),
+            Some(rest.trim_end_matches(')').trim().to_owned()),
+        )),
         None => Some((raw.to_owned(), None)),
     }
 }
@@ -245,7 +248,10 @@ impl TableDraft {
                 c.push_str(&format!(" DEFAULT {}", default_sql(&f.default)));
             }
             if !f.references.trim().is_empty() {
-                c.push_str(&format!(" REFERENCES {}", references_sql(f.references.trim())));
+                c.push_str(&format!(
+                    " REFERENCES {}",
+                    references_sql(f.references.trim())
+                ));
             }
             cols.push(c);
         }
@@ -307,7 +313,11 @@ impl TableDraft {
     /// (new table, copy, drop, swap) wrapped in a transaction.
     /// Empty result = no changes. `index_sql`: captured CREATE INDEX
     /// statements for the table, re-run after a rebuild.
-    pub fn apply_script(&self, schema: &EditorSchema, index_sql: &[String]) -> DbResult<Vec<String>> {
+    pub fn apply_script(
+        &self,
+        schema: &EditorSchema,
+        index_sql: &[String],
+    ) -> DbResult<Vec<String>> {
         let orig_table = schema.table.as_str();
         let renamed_table = !self.table.eq_ignore_ascii_case(orig_table);
 
@@ -336,13 +346,12 @@ impl TableDraft {
         // so a drop pair only forms when types agree too.
         for &ni in &unmatched_new {
             let f = &self.fields[ni];
-            if let Some(pos) = unmatched_orig
-                .iter()
-                .position(|&oi| {
-                    schema.columns[oi].decl_type.eq_ignore_ascii_case(f.ftype.as_str())
-                        && schema.columns[oi].pk == f.pk
-                })
-            {
+            if let Some(pos) = unmatched_orig.iter().position(|&oi| {
+                schema.columns[oi]
+                    .decl_type
+                    .eq_ignore_ascii_case(f.ftype.as_str())
+                    && schema.columns[oi].pk == f.pk
+            }) {
                 let oi = unmatched_orig[pos];
                 if !self
                     .fields
@@ -361,18 +370,22 @@ impl TableDraft {
         let mut drop_lines: Vec<String> = Vec::new();
         let mut add_lines: Vec<String> = Vec::new();
         let q_old = quote_ident(orig_table);
+        let q_new = quote_ident(&self.table);
+        // After a table rename, subsequent ALTERs must target the new name.
+        let q_live = if renamed_table {
+            q_new.clone()
+        } else {
+            q_old.clone()
+        };
 
         // Table rename is always an ALTER.
         if renamed_table {
-            alter_lines.push(format!(
-                "ALTER TABLE {q_old} RENAME TO {}",
-                quote_ident(&self.table)
-            ));
+            alter_lines.push(format!("ALTER TABLE {q_old} RENAME TO {q_new}",));
         }
         // Drop columns that no draft field claims.
         for &oi in &unmatched_orig {
             drop_lines.push(format!(
-                "ALTER TABLE {q_old} DROP COLUMN {}",
+                "ALTER TABLE {q_live} DROP COLUMN {}",
                 quote_ident(&schema.columns[oi].name)
             ));
         }
@@ -393,7 +406,8 @@ impl TableDraft {
                 }
                 if f.notnull && f.default.trim().is_empty() {
                     return Err(format!(
-                        "adding NOT NULL {} needs a DEFAULT for the existing rows", f.name
+                        "adding NOT NULL {} needs a DEFAULT for the existing rows",
+                        f.name
                     ));
                 }
                 let mut c = format!("{} {}", quote_ident(&f.name), f.ftype.as_str());
@@ -409,16 +423,12 @@ impl TableDraft {
                         references_sql(f.references.trim())
                     ));
                 }
-                add_lines.push(format!("ALTER TABLE {q_old} ADD COLUMN {c}"));
+                add_lines.push(format!("ALTER TABLE {q_live} ADD COLUMN {c}"));
                 continue;
             };
             let orig = &schema.columns[oi];
             if !f.name.eq_ignore_ascii_case(&orig.name) {
-                let q_cur = if renamed_table {
-                    quote_ident(&self.table)
-                } else {
-                    q_old.clone()
-                };
+                let q_cur = q_live.clone();
                 alter_lines.push(format!(
                     "ALTER TABLE {q_cur} RENAME COLUMN {} TO {}",
                     quote_ident(&orig.name),
@@ -442,10 +452,7 @@ impl TableDraft {
             // tables stay referenced and named correctly after the
             // final swap. Lines are semicolon-free; the caller joins.
             const SHADOW: &str = "__phosphor_rebuild";
-            let mut lines = vec![
-                "PRAGMA foreign_keys = OFF".to_owned(),
-                "BEGIN".to_owned(),
-            ];
+            let mut lines = vec!["PRAGMA foreign_keys = OFF".to_owned(), "BEGIN".to_owned()];
             lines.push(self.sql_for(SHADOW));
             let targets: Vec<(String, String)> = self
                 .fields
@@ -490,7 +497,10 @@ impl TableDraft {
             lines.push("PRAGMA foreign_key_check".to_owned());
             lines.push("PRAGMA foreign_keys = ON".to_owned());
             // Semicolon-free lines; the caller joins with ";\n".
-            return Ok(lines.into_iter().map(|l| l.trim_end_matches(';').to_owned()).collect());
+            return Ok(lines
+                .into_iter()
+                .map(|l| l.trim_end_matches(';').to_owned())
+                .collect());
         }
 
         let mut out = alter_lines;
@@ -605,7 +615,10 @@ mod editor_tests {
     /// Adding a column compiles to ADD COLUMN (with its default).
     #[test]
     fn editor_add_column() {
-        let cols = vec![col("id", "INTEGER", true, false), col("name", "TEXT", false, false)];
+        let cols = vec![
+            col("id", "INTEGER", true, false),
+            col("name", "TEXT", false, false),
+        ];
         let sch = schema(cols.clone());
         let mut d = TableDraft::from_live(&sch);
         let mut bal = FieldDef::new("balance", FType::Real);
@@ -650,8 +663,14 @@ mod editor_tests {
         let mut d = TableDraft::from_live(&sch);
         d.fields[0].ftype = FType::Text;
         let script = d.apply_script(&sch, &[]).unwrap();
-        assert!(script.iter().any(|l| l.contains("INSERT INTO")), "{script:?}");
-        assert!(script.iter().any(|l| l.contains("DROP TABLE")), "{script:?}");
+        assert!(
+            script.iter().any(|l| l.contains("INSERT INTO")),
+            "{script:?}"
+        );
+        assert!(
+            script.iter().any(|l| l.contains("DROP TABLE")),
+            "{script:?}"
+        );
     }
 
     /// The editor round-trips a table's real schema: open a live
@@ -671,6 +690,50 @@ mod editor_tests {
         };
         let d = TableDraft::from_live(&sch);
         assert!(d.apply_script(&sch, &[]).unwrap().is_empty());
+    }
+
+    /// Renaming the table and dropping/adding columns in one edit must
+    /// target the NEW table name after the rename (regression for the
+    /// `q_old` vs `q_live` bug).
+    #[test]
+    fn editor_rename_table_with_drop_and_add() {
+        let cols = vec![
+            col("id", "INTEGER", true, false),
+            col("old_col", "TEXT", false, false),
+            col("city", "TEXT", false, false),
+        ];
+        let sch = schema(cols);
+        let mut d = TableDraft::from_live(&sch);
+        d.table = "renamed".into();
+        d.fields.retain(|f| f.name != "old_col");
+        let mut extra = FieldDef::new("extra", FType::Integer);
+        extra.default = "1".into();
+        d.fields.push(extra);
+        let script = d.apply_script(&sch, &[]).unwrap();
+        assert_eq!(script[0], "ALTER TABLE \"t\" RENAME TO \"renamed\"");
+        assert!(
+            script
+                .iter()
+                .any(|s| s == "ALTER TABLE \"renamed\" DROP COLUMN \"old_col\""),
+            "drop must target renamed table: {script:?}"
+        );
+        assert!(
+            script
+                .iter()
+                .any(|s| s == "ALTER TABLE \"renamed\" ADD COLUMN \"extra\" INTEGER DEFAULT 1"),
+            "add must target renamed table: {script:?}"
+        );
+        // Verify the script actually runs.
+        let (db, _) = crate::db::EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, old_col TEXT, city TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO t(old_col, city) VALUES ('a', 'b')")
+            .unwrap();
+        let sql = script.join("; ");
+        db.execute(&sql).unwrap();
+        let cols = db.columns("renamed").unwrap();
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "city", "extra"]);
     }
 }
 
@@ -725,7 +788,10 @@ mod tests {
         d.fields[g].references = "customers".into(); // bare → pk
         let sql = d.sql();
         assert!(sql.contains("REFERENCES \"customers\"(\"id\")"), "{sql}");
-        assert!(sql.contains("\"note\" TEXT REFERENCES \"customers\"\n"), "{sql}");
+        assert!(
+            sql.contains("\"note\" TEXT REFERENCES \"customers\"\n"),
+            "{sql}"
+        );
         d.create(&db).unwrap();
         // The declared FK is discoverable — the fuel for linked forms.
         let q = db
@@ -775,7 +841,8 @@ mod tests {
         d.fields[g].default = "ensign".into();
         d.create(&db).unwrap();
         // Defaults apply; the inline pk keeps it rowid-editable.
-        db.execute("INSERT INTO crew(name) VALUES ('Saavik')").unwrap();
+        db.execute("INSERT INTO crew(name) VALUES ('Saavik')")
+            .unwrap();
         let q = db.query("SELECT rank FROM crew").unwrap();
         assert_eq!(q.rows[0][0], crate::db::PValue::Text("ensign".into()));
         assert!(db.has_rowid("crew"));

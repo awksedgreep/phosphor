@@ -21,7 +21,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use crate::db::{ColumnInfo, DbLink, DbResult, Page, PValue, QueryResult, TableInfo};
+use crate::db::{ColumnInfo, DbLink, DbResult, PValue, Page, QueryResult, TableInfo};
 
 pub type Token = u64;
 
@@ -170,8 +170,6 @@ pub struct DbHandle {
     next: Cell<Token>,
 }
 
-
-
 /// Spawn the worker owning `link`; returns the UI-side handle.
 pub fn spawn(link: Box<dyn DbLink>) -> DbHandle {
     let backend = link.backend();
@@ -229,20 +227,16 @@ impl DbHandle {
             // Position computed under a short borrow (scrutinee
             // temporaries in `if let` live through the block — never
             // overlap the borrow_mut below).
-            let hit = self
-                .buffer
-                .borrow()
-                .iter()
-                .position(|(t, _, _)| *t == tag);
+            let hit = self.buffer.borrow().iter().position(|(t, _, _)| *t == tag);
             if let Some(i) = hit {
                 return self.buffer.borrow_mut().remove(i).2;
             }
             match self.rx.recv() {
-                Ok((t, _, r)) => {
+                Ok((t, took, r)) => {
                     if t == tag {
                         return r;
                     }
-                    self.buffer.borrow_mut().push((t, std::time::Duration::ZERO, r));
+                    self.buffer.borrow_mut().push((t, took, r));
                 }
                 Err(_) => return DbResponse::Gone,
             }
@@ -281,17 +275,20 @@ impl DbLink for DbHandle {
     }
 
     fn tables(&self) -> DbResult<Vec<TableInfo>> {
-        self.call(Box::new(|db| DbResponse::Tables(db.tables()))).tables()
+        self.call(Box::new(|db| DbResponse::Tables(db.tables())))
+            .tables()
     }
 
     fn columns(&self, table: &str) -> DbResult<Vec<ColumnInfo>> {
         let t = table.to_owned();
-        self.call(Box::new(move |db| DbResponse::Columns(db.columns(&t)))).columns()
+        self.call(Box::new(move |db| DbResponse::Columns(db.columns(&t))))
+            .columns()
     }
 
     fn count(&self, table: &str) -> DbResult<i64> {
         let t = table.to_owned();
-        self.call(Box::new(move |db| DbResponse::Count(db.count(&t)))).count()
+        self.call(Box::new(move |db| DbResponse::Count(db.count(&t))))
+            .count()
     }
 
     fn has_rowid(&self, table: &str) -> bool {
@@ -304,7 +301,10 @@ impl DbLink for DbHandle {
 
     fn page(&self, table: &str, offset: i64, limit: i64) -> DbResult<Page> {
         let t = table.to_owned();
-        self.call(Box::new(move |db| DbResponse::Page(db.page(&t, offset, limit)))).page()
+        self.call(Box::new(move |db| {
+            DbResponse::Page(db.page(&t, offset, limit))
+        }))
+        .page()
     }
 
     fn open_window(&self, table: &str, offset: i64, limit: i64) -> DbResult<(Page, i64)> {
@@ -317,32 +317,38 @@ impl DbLink for DbHandle {
 
     fn query(&self, sql: &str) -> DbResult<QueryResult> {
         let s = sql.to_owned();
-        self.call(Box::new(move |db| DbResponse::Query(db.query(&s)))).query()
+        self.call(Box::new(move |db| DbResponse::Query(db.query(&s))))
+            .query()
     }
 
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)> {
         let s = sql.to_owned();
-        self.call(Box::new(move |db| DbResponse::Execute(db.execute(&s)))).execute()
+        self.call(Box::new(move |db| DbResponse::Execute(db.execute(&s))))
+            .execute()
     }
 
-    fn update_row(
-        &self,
-        table: &str,
-        rowid: i64,
-        changes: &[(String, PValue)],
-    ) -> DbResult<()> {
+    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
         let (t, c) = (table.to_owned(), changes.to_vec());
-        self.call(Box::new(move |db| DbResponse::Unit(db.update_row(&t, rowid, &c)))).unit()
+        self.call(Box::new(move |db| {
+            DbResponse::Unit(db.update_row(&t, rowid, &c))
+        }))
+        .unit()
     }
 
     fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64> {
         let (t, c) = (table.to_owned(), changes.to_vec());
-        self.call(Box::new(move |db| DbResponse::Insert(db.insert_row(&t, &c)))).insert()
+        self.call(Box::new(move |db| {
+            DbResponse::Insert(db.insert_row(&t, &c))
+        }))
+        .insert()
     }
 
     fn delete_row(&self, table: &str, rowid: i64) -> DbResult<()> {
         let t = table.to_owned();
-        self.call(Box::new(move |db| DbResponse::Unit(db.delete_row(&t, rowid)))).unit()
+        self.call(Box::new(move |db| {
+            DbResponse::Unit(db.delete_row(&t, rowid))
+        }))
+        .unit()
     }
 
     fn health(&self) -> Option<String> {

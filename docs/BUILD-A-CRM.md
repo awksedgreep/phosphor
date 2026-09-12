@@ -61,6 +61,20 @@ live as you page, and `F4` opens it as a filtered BROWSE.
 *(Watch it: [relations.gif](demo/ui/relations.gif))* That rule came free from `NOT NULL`; you'll add your
 own rules next. *(Watch it: [crud.gif](demo/ui/crud.gif))*
 
+> **Moving data in and out.** Got customers in a spreadsheet? `export`
+> from the old tool, then at the prompt:
+>
+> ```text
+> import customers ./customers.csv
+> export customers ./backup.csv
+> ```
+>
+> The CSV needs a header row; column names match the table
+> case-insensitively, empty fields become NULL. `export` takes any
+> table *or* a `SELECT`. phosphor reads and writes SQLite/libSQL —
+> native `.dbf` files are deliberately not supported (CSV is the
+> migration path).
+
 ## 3 · Craft the entry form
 
 Your team shouldn't see raw column names. On `customers`, press **`F`**:

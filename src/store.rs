@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS _phosphor_forms (
   id INTEGER PRIMARY KEY, table_ref TEXT UNIQUE NOT NULL,
   layout_json TEXT NOT NULL, version INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS _phosphor_apps (
-  id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT);
+  id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT,
+  version INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS _phosphor_items (
   id INTEGER PRIMARY KEY, app_id INTEGER NOT NULL,
   label TEXT NOT NULL, action_kind TEXT NOT NULL, action_ref TEXT,
@@ -132,11 +133,6 @@ pub fn names(db: &dyn DbLink, table: &str, name_col: &str) -> Vec<String> {
     db.query(&format!(
         "SELECT {name_col} FROM {table} ORDER BY {name_col} LIMIT 1000"
     ))
-        .map(|out| {
-            out.rows
-                .into_iter()
-                .map(|r| text(r.first()))
-                .collect()
-        })
-        .unwrap_or_default()
+    .map(|out| out.rows.into_iter().map(|r| text(r.first())).collect())
+    .unwrap_or_default()
 }

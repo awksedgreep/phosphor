@@ -31,20 +31,25 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
 
     // Mouse hit rects (content only, borders excluded).
     let inner1 = |r: ratatui::layout::Rect| -> Option<ratatui::layout::Rect> {
-        (r.width >= 2 && r.height >= 2).then(|| {
-            ratatui::layout::Rect {
-                x: r.x + 1,
-                y: r.y + 1,
-                width: r.width - 2,
-                height: r.height - 2,
-            }
+        (r.width >= 2 && r.height >= 2).then(|| ratatui::layout::Rect {
+            x: r.x + 1,
+            y: r.y + 1,
+            width: r.width - 2,
+            height: r.height - 2,
         })
     };
-    let split = app.detail.is_some() && main.width >= 76;
-    let (master_area, detail_area) = if split {
+    // Split layout: side by side (default) or master stacked above the
+    // detail pane (`H`), each with its own minimum viable size.
+    let want_split = app.detail.is_some();
+    let side_by_side = want_split && !app.split_horizontal && main.width >= 76;
+    let stacked = want_split && app.split_horizontal && main.height >= 10;
+    let (master_area, detail_area) = if side_by_side {
+        let [m, d] = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .areas(main);
+        (m, Some(d))
+    } else if stacked {
         let [m, d] =
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .areas(main);
+            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(main);
         (m, Some(d))
     } else {
         (main, None)
@@ -55,23 +60,6 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
         detail: detail_area.and_then(inner1),
         prompt: Some(prompt_line),
     };
-
-    let split = app.detail.is_some() && main.width >= 76;
-    let (master_area, detail_area) = if split {
-        let [m, d] =
-            Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
-                .areas(main);
-        (m, Some(d))
-    } else {
-        (main, None)
-    };
-    app.hit = crate::app::HitRects {
-        sidebar: inner1(sidebar),
-        master: inner1(master_area),
-        detail: detail_area.and_then(inner1),
-        prompt: Some(prompt_line),
-    };
-
     draw_sidebar(f, app, sidebar);
     draw_main(f, app, master_area);
     if let (Some(d_area), Some(_)) = (detail_area, &app.detail) {
@@ -95,12 +83,33 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
         Overlay::Create(_) => draw_create(f, app),
         Overlay::None => {}
     }
+    // The FK value picker draws over the record form (same overlay).
+    if let Overlay::Edit(ed) = &app.overlay {
+        if ed.picker.is_some() {
+            draw_picker(f, app, ed);
+        }
+    }
+    // Optional CRT scanlines (DESIGN.md "CRT affectations"): dim every
+    // other screen row. A no-op unless the user opted in.
+    if app.shimmer {
+        let buf = f.buffer_mut();
+        let area = buf.area;
+        for y in (1..area.height).step_by(2) {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell_mut((area.x + x, area.y + y)) {
+                    cell.modifier |= ratatui::style::Modifier::DIM;
+                }
+            }
+        }
+    }
     app.visible_rows != old_rows || app.visible_cols_width != old_cols
 }
 
 fn draw_create(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Create(st) = &app.overlay else { return };
+    let Overlay::Create(st) = &app.overlay else {
+        return;
+    };
     let is_editor = st.original.is_some();
     let title_text = if is_editor {
         format!(" TABLE EDITOR · {} ", st.draft.table)
@@ -135,11 +144,18 @@ fn draw_create(f: &mut Frame, app: &App) {
         (true, EditSlot::Name, Some(buf)) => editing_span(buf, 17, th),
         _ => Span::styled(
             st.draft.table.clone(),
-            if name_selected { th.cursor() } else { th.bright() },
+            if name_selected {
+                th.cursor()
+            } else {
+                th.bright()
+            },
         ),
     };
     lines.push(Line::from(vec![
-        Span::styled(pad("NAME", 17), if name_selected { th.bright() } else { th.dim() }),
+        Span::styled(
+            pad("NAME", 17),
+            if name_selected { th.bright() } else { th.dim() },
+        ),
         name_span,
     ]));
     lines.push(Line::raw(""));
@@ -262,7 +278,9 @@ fn paint_spec(
     for b in &spec.boxes {
         if let Some(r) = canvas_rect(inner, b.x, b.y, b.w, b.h) {
             f.render_widget(
-                Block::default().borders(Borders::ALL).border_style(th.dim()),
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(th.dim()),
                 r,
             );
         }
@@ -298,7 +316,9 @@ fn paint_spec(
 
 fn draw_paint(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Paint(st) = &app.overlay else { return };
+    let Overlay::Paint(st) = &app.overlay else {
+        return;
+    };
     let (cw, ch) = st.spec.size;
     let area = centered(f.area(), cw + 2, ch + 2);
     f.render_widget(Clear, area);
@@ -343,10 +363,7 @@ fn draw_paint(f: &mut Frame, app: &App) {
         // Live text entry rendered at the cursor.
         let w = (buf.chars().count() as u16 + 1).max(1);
         if let Some(r) = canvas_rect(inner, st.cursor.0, st.cursor.1, w, 1) {
-            f.render_widget(
-                Paragraph::new(Line::from(editing_span(buf, w, th))),
-                r,
-            );
+            f.render_widget(Paragraph::new(Line::from(editing_span(buf, w, th))), r);
         }
     } else if let Some(r) = canvas_rect(inner, st.cursor.0, st.cursor.1, 1, 1) {
         // Invert the glyph under the cursor instead of blotting it out
@@ -380,10 +397,12 @@ fn draw_paint(f: &mut Frame, app: &App) {
 
 fn draw_form(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Form(st) = &app.overlay else { return };
+    let Overlay::Form(st) = &app.overlay else {
+        return;
+    };
     let area = centered(
         f.area(),
-        66,
+        88,
         (st.spec.fields.len() as u16 + 6).min(f.area().height),
     );
     f.render_widget(Clear, area);
@@ -396,7 +415,7 @@ fn draw_form(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " Space show · Enter label · r req · [ ] order · F2 PAINT · F6 save ",
+            " Space show · Enter label · m mask · c computed · r req · [ ] order · F2 PAINT · F6 save ",
             th.dim(),
         ));
     let inner = block.inner(area);
@@ -406,19 +425,34 @@ fn draw_form(f: &mut Frame, app: &App) {
         Span::styled(pad("FIELD", 16), th.dim()),
         Span::styled(pad("SHOW", 5), th.dim()),
         Span::styled(pad("REQ", 4), th.dim()),
+        Span::styled(pad("PICTURE", 14), th.dim()),
+        Span::styled(pad("COMPUTED", 18), th.dim()),
         Span::styled("LABEL", th.dim()),
     ])];
     for (i, field) in st.spec.fields.iter().enumerate() {
         let selected = i == st.cursor;
         let style = if selected { th.cursor() } else { th.base() };
-        let label: Span = match (selected, &st.editing) {
+        let label: Span = match (
+            selected && !st.editing_mask && !st.editing_computed,
+            &st.editing,
+        ) {
             (true, Some(buf)) => editing_span(buf, 0, th),
             _ => Span::styled(field.label.clone(), style),
+        };
+        let mask: Span = match (selected && st.editing_mask, &st.editing) {
+            (true, Some(buf)) => editing_span(buf, 14, th),
+            _ => Span::styled(pad(&field.mask, 14), style),
+        };
+        let computed: Span = match (selected && st.editing_computed, &st.editing) {
+            (true, Some(buf)) => editing_span(buf, 18, th),
+            _ => Span::styled(pad(&field.computed, 18), style),
         };
         lines.push(Line::from(vec![
             Span::styled(pad(&field.column, 16), style),
             Span::styled(pad(if field.include { "▪" } else { " " }, 5), style),
             Span::styled(pad(if field.required { "*" } else { " " }, 4), style),
+            mask,
+            computed,
             label,
         ]));
     }
@@ -427,7 +461,9 @@ fn draw_form(f: &mut Frame, app: &App) {
 
 fn draw_apps(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Apps(st) = &app.overlay else { return };
+    let Overlay::Apps(st) = &app.overlay else {
+        return;
+    };
     let area = centered(
         f.area(),
         72,
@@ -485,7 +521,9 @@ fn draw_apps(f: &mut Frame, app: &App) {
 
 fn draw_app_menu(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::AppMenu(st) = &app.overlay else { return };
+    let Overlay::AppMenu(st) = &app.overlay else {
+        return;
+    };
     let width = 46u16;
     let area = centered(
         f.area(),
@@ -493,16 +531,21 @@ fn draw_app_menu(f: &mut Frame, app: &App) {
         (st.items.len() as u16 * 2 + 6).min(f.area().height),
     );
     f.render_widget(Clear, area);
+    let title = if st.version > 1 {
+        format!(" ▓▓ {} v{} ▓▓ ", st.app.to_uppercase(), st.version)
+    } else {
+        format!(" ▓▓ {} ▓▓ ", st.app.to_uppercase())
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(th.bright())
         .style(th.base())
-        .title(Span::styled(
-            format!(" ▓▓ {} ▓▓ ", st.app.to_uppercase()),
-            th.bright(),
-        ))
+        .title(Span::styled(title, th.bright()))
         .title_alignment(Alignment::Center)
-        .title_bottom(Line::styled(" ↑↓ + Enter · hotkey letters · Esc ", th.dim()));
+        .title_bottom(Line::styled(
+            " ↑↓ + Enter · hotkey letters · Esc ",
+            th.dim(),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -516,14 +559,7 @@ fn draw_app_menu(f: &mut Frame, app: &App) {
         let rest: String = chars.collect();
         lines.push(Line::from(vec![
             Span::styled("   ", style),
-            Span::styled(
-                first,
-                if selected {
-                    th.cursor()
-                } else {
-                    th.bright()
-                },
-            ),
+            Span::styled(first, if selected { th.cursor() } else { th.bright() }),
             Span::styled(pad(&rest, width.saturating_sub(8)), style),
         ]));
         lines.push(Line::raw(""));
@@ -535,12 +571,20 @@ fn draw_app_menu(f: &mut Frame, app: &App) {
 /// columns to its right hold still while you type (they used to slide
 /// with every keystroke — the designer's "drifting type" bug).
 fn editing_span<'a>(buf: &'a str, width: u16, th: &crate::theme::Theme) -> Span<'a> {
-    Span::styled(pad(&format!("{buf}▏"), width.max(buf.chars().count() as u16 + 1)), th.cursor())
+    Span::styled(
+        pad(
+            &format!("{buf}▏"),
+            width.max(buf.chars().count() as u16 + 1),
+        ),
+        th.cursor(),
+    )
 }
 
 fn draw_qbe(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Qbe(st) = &app.overlay else { return };
+    let Overlay::Qbe(st) = &app.overlay else {
+        return;
+    };
     let area = centered(
         f.area(),
         76,
@@ -556,7 +600,7 @@ fn draw_qbe(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " Space show · Enter filter · s sort · F2 run · F6 save · Esc ",
+            " Space show · Enter filter · s sort · J join · g group · F2 run · F6 save ",
             th.dim(),
         ));
     let inner = block.inner(area);
@@ -580,6 +624,24 @@ fn draw_qbe(f: &mut Frame, app: &App) {
             Span::styled(pad(if col.show { "▪" } else { " " }, 5), row_style),
             Span::styled(pad(col.sort.glyph(), 5), row_style),
             filter,
+        ]));
+    }
+    if let Some(j) = &st.spec.join {
+        lines.push(Line::from(vec![
+            Span::styled("JOIN  ", th.dim()),
+            Span::styled(
+                format!(
+                    "{} ON {}.{} = {}.{}",
+                    j.table, st.spec.table, j.left, j.table, j.right
+                ),
+                th.bright(),
+            ),
+        ]));
+    }
+    if let Some(g) = &st.spec.group_by {
+        lines.push(Line::from(vec![
+            Span::styled("GROUP ", th.dim()),
+            Span::styled(format!("{g}  · count(*) AS n"), th.bright()),
         ]));
     }
     lines.push(Line::raw(""));
@@ -608,7 +670,9 @@ fn draw_qbe(f: &mut Frame, app: &App) {
 
 fn draw_report(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Report(st) = &app.overlay else { return };
+    let Overlay::Report(st) = &app.overlay else {
+        return;
+    };
     let area = centered(f.area(), 76, 12);
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -662,7 +726,9 @@ fn draw_report(f: &mut Frame, app: &App) {
 
 fn draw_pager(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Pager(p) = &app.overlay else { return };
+    let Overlay::Pager(p) = &app.overlay else {
+        return;
+    };
     let area = f.area().inner(ratatui::layout::Margin {
         horizontal: 2,
         vertical: 1,
@@ -729,7 +795,9 @@ fn sparkline(values: &[f64], width: usize) -> (String, bool) {
 
 fn draw_health(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Health(hv) = &app.overlay else { return };
+    let Overlay::Health(hv) = &app.overlay else {
+        return;
+    };
     let area = f.area().inner(ratatui::layout::Margin {
         horizontal: 3,
         vertical: 1,
@@ -771,10 +839,7 @@ fn draw_health(f: &mut Frame, app: &App) {
             Span::styled(pad(&format!("● {status}"), 8), th.health(status)),
             Span::styled(pad(check, 19), th.bright()),
             Span::styled(pad(value, 22), th.base()),
-            Span::styled(
-                advice.chars().take(advice_w).collect::<String>(),
-                th.dim(),
-            ),
+            Span::styled(advice.chars().take(advice_w).collect::<String>(), th.dim()),
         ]));
     }
     f.render_widget(Paragraph::new(lines), report_area);
@@ -814,28 +879,26 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .title(Span::styled(" Data ", focus_style(app, Focus::Sidebar)));
     let visible = app.visible_tables();
     let hidden = app.tables.len() - visible.len();
-    let items: Vec<ListItem> = visible
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let marker = if t.is_view { "◇ " } else { "▪ " };
-            let internal = crate::app::App::is_internal(t);
-            let style = if i == app.sidebar_idx {
-                th.cursor()
-            } else if internal || t.is_view {
-                th.dim()
-            } else {
-                th.base()
-            };
-            ListItem::new(Line::styled(format!("{marker}{}", t.name), style))
-        })
-        .chain((hidden > 0 && !app.show_internals).then(|| {
-            ListItem::new(Line::styled(
-                format!("  … {hidden} internal (i)"),
-                th.dim(),
-            ))
-        }))
-        .collect();
+    let items: Vec<ListItem> =
+        visible
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let marker = if t.is_view { "◇ " } else { "▪ " };
+                let internal = crate::app::App::is_internal(t);
+                let style = if i == app.sidebar_idx {
+                    th.cursor()
+                } else if internal || t.is_view {
+                    th.dim()
+                } else {
+                    th.base()
+                };
+                ListItem::new(Line::styled(format!("{marker}{}", t.name), style))
+            })
+            .chain((hidden > 0 && !app.show_internals).then(|| {
+                ListItem::new(Line::styled(format!("  … {hidden} internal (i)"), th.dim()))
+            }))
+            .collect();
     let empty = app.tables.is_empty();
     f.render_widget(List::new(items).block(block), area);
     if empty {
@@ -878,7 +941,11 @@ fn master_title(g: &Grid) -> String {
 
 fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
-    let title = app.grid.as_ref().map(master_title).unwrap_or_else(|| " phosphor ".to_owned());
+    let title = app
+        .grid
+        .as_ref()
+        .map(master_title)
+        .unwrap_or_else(|| " phosphor ".to_owned());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_style(app, Focus::Grid))
@@ -919,9 +986,7 @@ fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
     let header = Line::from(
         cols.iter()
-            .map(|&c| {
-                Span::styled(pad(&g.columns[c], g.widths[c]), th.bright())
-            })
+            .map(|&c| Span::styled(pad(&g.columns[c], g.widths[c]), th.bright()))
             .collect::<Vec<_>>(),
     );
     lines.push(header);
@@ -936,10 +1001,7 @@ fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
             Some(row) => cols
                 .iter()
                 .map(|&c| {
-                    let text = row
-                        .get(c)
-                        .map(PValue::render)
-                        .unwrap_or_default();
+                    let text = row.get(c).map(PValue::render).unwrap_or_default();
                     let style = if abs == g.cur_row && c == g.cur_col {
                         th.cursor()
                     } else if abs == g.cur_row {
@@ -978,10 +1040,7 @@ fn draw_detail_panel(f: &mut Frame, app: &App, state: &DetailState, area: Rect) 
         .borders(Borders::ALL)
         .border_style(focus_style(app, Focus::Detail))
         .title(Span::styled(title, focus_style(app, Focus::Detail)))
-        .title_bottom(Line::styled(
-            " Tab master · v close · read-only ",
-            th.dim(),
-        ));
+        .title_bottom(Line::styled(" Tab master · v close · read-only ", th.dim()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let visible = inner.height.saturating_sub(1).max(1) as i64; // minus header
@@ -1097,10 +1156,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         )),
         _ => Cow::Borrowed(""),
     };
-    let ms = app
-        .last_ms
-        .map(|m| format!("{m:.1}ms"))
-        .unwrap_or_default();
+    let ms = app.last_ms.map(|m| format!("{m:.1}ms")).unwrap_or_default();
     let (dot, dot_style) = match &app.health {
         Some(s) => ("●", th.health(s)),
         None => ("○", th.dim()),
@@ -1188,7 +1244,9 @@ fn link_pane_lines(ed: &crate::app::EditState, th: &crate::theme::Theme) -> Vec<
 
 fn draw_edit(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Edit(ed) = &app.overlay else { return };
+    let Overlay::Edit(ed) = &app.overlay else {
+        return;
+    };
     // Painted forms render CREATE SCREEN style; unpainted stay a list.
     if let Some(spec) = &ed.painted {
         let (cw, ch) = spec.size;
@@ -1203,7 +1261,12 @@ fn draw_edit(f: &mut Frame, app: &App) {
         let title = if ed.inserting {
             format!(" NEW {} record{dirty} ", ed.table)
         } else {
-            format!(" EDIT {} · {}/{}{dirty} ", ed.table, ed.row_abs + 1, app.grid.as_ref().map(|g| g.total).unwrap_or(0))
+            format!(
+                " EDIT {} · {}/{}{dirty} ",
+                ed.table,
+                ed.row_abs + 1,
+                app.grid.as_ref().map(|g| g.total).unwrap_or(0)
+            )
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1270,7 +1333,12 @@ fn draw_edit(f: &mut Frame, app: &App) {
     let title = if ed.inserting {
         format!(" NEW {} record{dirty} ", ed.table)
     } else {
-        format!(" EDIT {} · {}/{}{dirty} ", ed.table, ed.row_abs + 1, app.grid.as_ref().map(|g| g.total).unwrap_or(0))
+        format!(
+            " EDIT {} · {}/{}{dirty} ",
+            ed.table,
+            ed.row_abs + 1,
+            app.grid.as_ref().map(|g| g.total).unwrap_or(0)
+        )
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1282,8 +1350,10 @@ fn draw_edit(f: &mut Frame, app: &App) {
 
     let mut lines = Vec::new();
     for (i, (col, original)) in ed.fields.iter().enumerate() {
-        // PICTURE-clause energy: ¶ pk, * NOT NULL / form-required.
-        let marker = if col.pk {
+        // PICTURE-clause energy: ¶ pk, * required, ƒ computed.
+        let marker = if matches!(ed.computed.get(i), Some(Some(_))) {
+            "ƒ"
+        } else if col.pk {
             "¶"
         } else if col.notnull || ed.required[i] {
             "*"
@@ -1326,9 +1396,56 @@ fn draw_edit(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The F7 foreign-key value picker: a scrollable list of parent rows;
+/// the first column is the key that gets written into the field.
+fn draw_picker(f: &mut Frame, app: &App, ed: &crate::app::EditState) {
+    let th = app.theme;
+    let Some(p) = &ed.picker else { return };
+    let area = centered(
+        f.area(),
+        (p.columns.len() as u16 * 20).clamp(40, f.area().width.saturating_sub(4)),
+        (p.rows.len() as u16 + 4)
+            .min(f.area().height.saturating_sub(2))
+            .max(6),
+    );
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(p.title.clone(), th.bright()))
+        .title_bottom(Line::styled(" ↑↓ · Enter pick · Esc ", th.dim()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = vec![Line::from(
+        p.columns
+            .iter()
+            .map(|c| Span::styled(pad(c, 20), th.dim()))
+            .collect::<Vec<_>>(),
+    )];
+    let visible = inner.height.saturating_sub(1).max(1) as usize;
+    let start = p.cursor.saturating_sub(visible.saturating_sub(1));
+    for (i, row) in p.rows.iter().enumerate().skip(start).take(visible) {
+        let style = if i == p.cursor {
+            th.cursor()
+        } else {
+            th.base()
+        };
+        lines.push(Line::from(
+            row.iter()
+                .map(|v| Span::styled(pad(&v.render(), 20), style))
+                .collect::<Vec<_>>(),
+        ));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_help(f: &mut Frame, app: &App) {
     let th = app.theme;
-    let Overlay::Help(st) = &app.overlay else { return };
+    let Overlay::Help(st) = &app.overlay else {
+        return;
+    };
     let topics = crate::help::TOPICS;
     let topic = &topics[st.topic.min(topics.len() - 1)];
 
@@ -1373,7 +1490,7 @@ fn draw_help(f: &mut Frame, app: &App) {
         Line::raw(""),
     ];
     body_lines.extend(topic.body.lines().map(|l| Line::styled(l, th.base())));
-    let scroll = (st.scroll as usize)
-        .min(body_lines.len().saturating_sub(body.height as usize / 2)) as u16;
+    let scroll =
+        (st.scroll as usize).min(body_lines.len().saturating_sub(body.height as usize / 2)) as u16;
     f.render_widget(Paragraph::new(body_lines).scroll((scroll, 0)), body);
 }

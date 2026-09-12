@@ -85,7 +85,8 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   (PICTURE-style ¶ pk / * not-null markers, typed parsing), `a`dd and
   `x`-twice-delete rows, `find <text>` + `n` to seek, a live **dot
   prompt** (`.`) running real SQL with history, Tab completion, and
-  Ctrl-A/E/U/W line editing, four themes
+  Ctrl-A/E/U/W line editing, **CSV import/export**
+  (`import <table> <path>` / `export <table|SELECT> <path>`), four themes
   (`set theme green|amber|paper|blue`), F1 help, query latency in the
   status bar. **F1 anywhere** opens context-sensitive help written in
   English — the topic for the screen you are on, ←→ to wander the manual.
@@ -98,11 +99,14 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   telemetry: the plain-language health report (worst first), sparkline
   trends fed from the compressed series, and `s` to take a live sample
   right there — works identically over a file or over sqld. The status
-  bar carries the health dot at all times.
+  bar carries the health dot at all times. `advise` at the prompt lists
+  foreign-key columns missing an index (with the exact `CREATE INDEX`)
+  and a VACUUM nudge when the file is bloated.
 - **The builders** — `Q`uery By Example (fill the grid, watch the SQL it
   writes, F2 runs, F6 saves), `R`eports (banded: page headers, group
   bands with subtotals, automatic totals on numeric columns, grand
-  totals; preview in a pager, `w` writes the file), `L`abels
+  totals; preview in a pager, `w` writes the file, `p` prints via
+  `lp`/`$PHOSPHOR_PRINT`), `L`abels
   (three-across, zero config), and `F`orms — reorder, relabel, hide,
   and require fields, then press **F2 for the FORM PAINTER**: place
   fields anywhere on a canvas, add title texts, draw boxes
@@ -114,11 +118,45 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   database itself. Then:
 
   ```sh
-  phosphor --app crm.db      # your team's CRM, hotkeys and all
+  phosphor --app crm.db               # your team's CRM, hotkeys and all
+  phosphor --app --readonly crm.db    # kiosk: browsable, no writes
   ```
 
   Copy the file, you copied the app. Replicate it with libSQL, you
   deployed it.
+
+## The CRM user story — empty file to running app in 5 minutes
+
+The founding test from `DESIGN.md`: *a person who is not a programmer
+sits down with phosphor, creates tables, paints an entry form, defines
+two reports and a menu — and their team uses that application daily.*
+This is that story, every keystroke captured and verified:
+
+> `phosphor crm.db` on an empty file → 11 chapters, no SQL files,
+> no code — copy the `.db` and you shipped the app.
+
+![the CRM story: empty db to working app](docs/demo/crm.gif)
+
+| ch | what happens | on film |
+|---|---|---|
+| 01 | `C` → TABLE DESIGNER: `customers` with `name`/`city`, five records typed live | ![01](docs/demo/crm/01-customers.gif) |
+| 02 | `C` → `orders` with `customer_id INTEGER REFERENCES customers(id)` — FK enforcement on, orphan rejected, then bulk insert | ![02](docs/demo/crm/02-orders-fk.gif) |
+| 03 | `ALTER TABLE` adds `balance`, a `leads` table is created and dropped — schema evolution without leaving the UI | ![03](docs/demo/crm/03-evolution.gif) |
+| 04 | `contacts` + `interactions` (both FK → customers) and `v` cycling `contacts → interactions → orders` | ![04](docs/demo/crm/04-contacts-split.gif) |
+| 05 | `F` → `F2` FORM PAINTER: place fields, `CUSTOMER CARD` title, box, `F6` save — `a` now shows the painted card, required `name` enforced | ![05](docs/demo/crm/05-painted-form.gif) |
+| 06 | `v` split driven by keys *and mouse*: click Grace, `PgDn`, `Tab` into detail, `v` cycles | ![06](docs/demo/crm/06-split-mouse.gif) |
+| 07 | `Q` QBE: `balance > 0` + sort ▼ → `F2` run, `F6` save as `debtors` | ![07](docs/demo/crm/07-qbe.gif) |
+| 08 | `R` report grouped by `region` → subtotals/grand total, `w` writes `report_orders.txt`; `L` mailing labels | ![08](docs/demo/crm/08-report-labels.gif) |
+| 09 | `.` prompt: `run debtors`, `find Grace` + `n`, `set theme amber/green` | ![09](docs/demo/crm/09-dot-prompt.gif) |
+| 10 | `A` Applications Generator: `Customers` (browse), `Orders by region` (report), `Debtors` (query) → `F2` live menu, hotkeys | ![10](docs/demo/crm/10-app-builder.gif) |
+| 11 | `phosphor --app crm.db` — the database *is* the application | ![11](docs/demo/crm/11-app-boots.gif) |
+
+Every chapter is a separately recorded, separately verified cast
+(`tools/demo/crm.py` replays each through a terminal emulator and asserts
+on-screen text before merging). The full 5-minute cut above is the merge
+`docs/demo/crm.cast` → `crm.gif`.
+
+> Follow along step-by-step: [Build a CRM in ten minutes](docs/BUILD-A-CRM.md).
 
 ## Watch it work
 
@@ -128,7 +166,7 @@ from the real program.
 
 | | |
 |---|---|
-| **The CRM, from nothing** — an empty database becomes a working CRM entirely through the UI: tables, foreign keys, data, a painted form, split views, queries, reports, labels, schema evolution, then boots as `phosphor --app` (~5 min) | ![the CRM story: empty db to working app](docs/demo/crm.gif) |
+| **The CRM, from nothing** — same 5-minute story as above, single GIF | ![the CRM story: empty db to working app](docs/demo/crm.gif) |
 
 <details>
 <summary>CRM chapters (each stage as its own GIF)</summary>

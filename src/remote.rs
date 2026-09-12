@@ -16,9 +16,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde_json::{json, Value as Json};
 
-use crate::db::{
-    ColumnInfo, DbLink, DbResult, Page, PValue, QueryResult, TableInfo, QUERY_CAP,
-};
+use crate::db::{ColumnInfo, DbLink, DbResult, PValue, Page, QueryResult, TableInfo, QUERY_CAP};
 
 pub struct RemoteDb {
     agent: ureq::Agent,
@@ -60,9 +58,7 @@ impl RemoteDb {
     fn pipeline(&self, stmts: &[(&str, Vec<Json>)]) -> DbResult<Vec<StmtOut>> {
         let mut requests: Vec<Json> = stmts
             .iter()
-            .map(|(sql, args)| {
-                json!({"type": "execute", "stmt": {"sql": sql, "args": args}})
-            })
+            .map(|(sql, args)| json!({"type": "execute", "stmt": {"sql": sql, "args": args}}))
             .collect();
         requests.push(json!({"type": "close"}));
 
@@ -150,9 +146,7 @@ fn decode(v: &Json) -> DbResult<PValue> {
             let b64 = v["base64"].as_str().unwrap_or("");
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
-                .or_else(|_| {
-                    base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64)
-                })
+                .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64))
                 .map_err(|e| format!("bad blob base64 from sqld: {e}"))?;
             PValue::Blob(bytes)
         }
@@ -224,7 +218,10 @@ impl DbLink for RemoteDb {
     }
 
     fn columns(&self, table: &str) -> DbResult<Vec<ColumnInfo>> {
-        let out = self.one(&format!("PRAGMA table_info({})", Self::quote(table)), vec![])?;
+        let out = self.one(
+            &format!("PRAGMA table_info({})", Self::quote(table)),
+            vec![],
+        )?;
         Ok(out
             .rows
             .into_iter()
@@ -248,7 +245,10 @@ impl DbLink for RemoteDb {
     }
 
     fn count(&self, table: &str) -> DbResult<i64> {
-        let out = self.one(&format!("SELECT count(*) FROM {}", Self::quote(table)), vec![])?;
+        let out = self.one(
+            &format!("SELECT count(*) FROM {}", Self::quote(table)),
+            vec![],
+        )?;
         match out.rows.first().and_then(|r| r.first()) {
             Some(PValue::Int(n)) => Ok(*n),
             _ => Err("count(*) did not return an integer".into()),
@@ -259,14 +259,30 @@ impl DbLink for RemoteDb {
         if let Some(&known) = self.rowid_cache.lock().unwrap().get(table) {
             return known;
         }
-        let ok = self
-            .one(
-                &format!("SELECT rowid FROM {} LIMIT 0", Self::quote(table)),
-                vec![],
-            )
-            .is_ok();
-        self.rowid_cache.lock().unwrap().insert(table.to_owned(), ok);
-        ok
+        match self.one(
+            &format!("SELECT rowid FROM {} LIMIT 0", Self::quote(table)),
+            vec![],
+        ) {
+            Ok(_) => {
+                self.rowid_cache
+                    .lock()
+                    .unwrap()
+                    .insert(table.to_owned(), true);
+                true
+            }
+            Err(e) => {
+                let lower = e.to_ascii_lowercase();
+                let definitive =
+                    lower.contains("no such column") || lower.contains("has no column");
+                if definitive {
+                    self.rowid_cache
+                        .lock()
+                        .unwrap()
+                        .insert(table.to_owned(), false);
+                }
+                false
+            }
+        }
     }
 
     fn page(&self, table: &str, offset: i64, limit: i64) -> DbResult<Page> {
@@ -314,17 +330,17 @@ impl DbLink for RemoteDb {
         } else {
             format!("SELECT *, count(*) OVER () AS _total FROM {q}")
         };
-        let out = match self.one(
-            &format!("{select} LIMIT {limit} OFFSET {offset}"),
-            vec![],
-        ) {
+        let out = match self.one(&format!("{select} LIMIT {limit} OFFSET {offset}"), vec![]) {
             Ok(o) => o,
             Err(_) => return fallback(),
         };
         let rows = out.rows;
         if rows.is_empty() {
             if offset == 0 && limit > 0 {
-                let page = Page { rows: Vec::new(), rowids: with_rowid.then(Vec::new) };
+                let page = Page {
+                    rows: Vec::new(),
+                    rowids: with_rowid.then(Vec::new),
+                };
                 return Ok((page, 0));
             }
             return fallback();
@@ -366,8 +382,7 @@ impl DbLink for RemoteDb {
         if stmts.is_empty() {
             return Ok((0, start.elapsed()));
         }
-        let calls: Vec<(&str, Vec<Json>)> =
-            stmts.iter().map(|s| (*s, Vec::new())).collect();
+        let calls: Vec<(&str, Vec<Json>)> = stmts.iter().map(|s| (*s, Vec::new())).collect();
         let outs = self.pipeline(&calls)?;
         let n = if outs.len() == 1 {
             outs[0].affected
@@ -379,12 +394,7 @@ impl DbLink for RemoteDb {
         Ok((n, start.elapsed()))
     }
 
-    fn update_row(
-        &self,
-        table: &str,
-        rowid: i64,
-        changes: &[(String, PValue)],
-    ) -> DbResult<()> {
+    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
         if changes.is_empty() {
             return Ok(());
         }
@@ -405,7 +415,10 @@ impl DbLink for RemoteDb {
         if out.affected == 1 {
             Ok(())
         } else {
-            Err(format!("expected to update 1 row, updated {}", out.affected))
+            Err(format!(
+                "expected to update 1 row, updated {}",
+                out.affected
+            ))
         }
     }
 
@@ -414,8 +427,7 @@ impl DbLink for RemoteDb {
             format!("INSERT INTO {} DEFAULT VALUES", Self::quote(table))
         } else {
             let cols: Vec<String> = changes.iter().map(|(c, _)| Self::quote(c)).collect();
-            let marks: Vec<String> =
-                (1..=changes.len()).map(|i| format!("?{i}")).collect();
+            let marks: Vec<String> = (1..=changes.len()).map(|i| format!("?{i}")).collect();
             format!(
                 "INSERT INTO {} ({}) VALUES ({})",
                 Self::quote(table),
@@ -437,7 +449,10 @@ impl DbLink for RemoteDb {
         if out.affected == 1 {
             Ok(())
         } else {
-            Err(format!("expected to delete 1 row, deleted {}", out.affected))
+            Err(format!(
+                "expected to delete 1 row, deleted {}",
+                out.affected
+            ))
         }
     }
 
@@ -453,9 +468,14 @@ impl DbLink for RemoteDb {
             .rows
             .into_iter()
             .next()?;
-        let PValue::Text(view) = &view[0] else { return None };
+        let PValue::Text(view) = &view[0] else {
+            return None;
+        };
         let out = self
-            .one(&format!("SELECT status FROM {} LIMIT 1", Self::quote(view)), vec![])
+            .one(
+                &format!("SELECT status FROM {} LIMIT 1", Self::quote(view)),
+                vec![],
+            )
             .ok()?;
         match out.rows.into_iter().next()?.into_iter().next()? {
             PValue::Text(s) => Some(s),
@@ -533,8 +553,7 @@ impl DbLink for RemoteDb {
             .zip(outs.iter())
         {
             for row in &stmt_out.rows {
-                let (PValue::Text(to_table), PValue::Text(from_col)) = (&row[0], &row[1])
-                else {
+                let (PValue::Text(to_table), PValue::Text(from_col)) = (&row[0], &row[1]) else {
                     continue;
                 };
                 if !to_table.eq_ignore_ascii_case(parent) {
@@ -590,7 +609,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut child = std::process::Command::new(&sqld)
             .current_dir(&dir)
-            .args(["--db-path", "t.sqld", "--http-listen-addr", "127.0.0.1:8871"])
+            .args([
+                "--db-path",
+                "t.sqld",
+                "--http-listen-addr",
+                "127.0.0.1:8871",
+            ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()

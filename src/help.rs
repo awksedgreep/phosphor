@@ -84,7 +84,8 @@ In the grid:
   · Declared FOREIGN KEYS become child panes under the form —
     open a customer and their orders are right there, refreshed
     live as you page. F4/F5/F6 opens a pane as a filtered BROWSE
-    of the child table.
+    of the child table. On a foreign-key FIELD, F7 opens a picker:
+    choose a parent row and its key is written for you.
   · PgUp/PgDn (or ←/→) in the form flip to the previous/next
     RECORD — and holding the key ACCELERATES, up to ten records a
     stride, so a thousand-row file passes in seconds. Unsaved edits
@@ -129,10 +130,14 @@ Beyond SQL, the prompt knows a few short commands:
   form [table]      form designer (F2 inside it paints)
   apps / app        application designer / run an application
   run <name>        run a query saved from QBE
+  import <table> <path>   CSV into a table (header row required)
+  export <table|SELECT> <path>  CSV out (table or query)
   quit / exit       leave phosphor (q and Ctrl-Q work anywhere
                     outside the prompt)
   health            the DBHEALTH console
-  set theme <name>  green, amber, paper, or blue
+  advise            index / vacuum advisor (missing FK indexes)
+  set theme <name>  green, amber, paper, or blue (remembered)
+  set shimmer on|off  CRT scanlines (remembered)
 
 Comforts: Up/Down walk your history, Tab completes table names and
 commands, Ctrl-A/Ctrl-E jump to the ends of the line, Ctrl-U clears
@@ -160,6 +165,14 @@ For each column you can set three things:
 
 Multiple filters combine with AND.
 
+Two more keys teach the rest of SQL:
+
+  J   cycles a JOIN through the foreign keys that reach this table
+      (off, then each related table in turn); the projection is
+      qualified so the SQL stays unambiguous.
+  g   cycles GROUP BY through the columns; grouping collapses the
+      projection to the key plus count(*) AS n.
+
 F2 runs the query into the grid. F6 asks for a name and saves the
 query into the database; after that,  run <name>  at the prompt
 executes it, reports can use it as a source, and application menus
@@ -178,17 +191,19 @@ Three settings, worth exactly three lines on the screen:
 
   title     Enter to edit. Appears on every page.
   source    a table name, a saved query's SQL, or any SELECT.
-  group by  Space cycles through the source's columns. Grouping
-            sorts the report, starts a band at each new value, and
-            prints subtotals per group.
+  group by  Space cycles through the source's columns; Enter lets
+            you type an EXPRESSION instead (substr(city,1,1)).
+            Grouping sorts the report, starts a band at each new
+            value, and prints subtotals per group.
 
 Columns whose values are all numbers total automatically — per
 group and grand. Column widths adapt to the data, and are always
 wide enough for their own totals.
 
 F2 previews the report in a pager: arrows and PgUp/PgDn scroll,
-w writes the report to a text file, Esc returns. F6 saves the
-design; application menus can run it by name.
+w writes the report to a text file, p sends it to a printer
+(lp, or $PHOSPHOR_PRINT), Esc returns. F6 saves the design;
+application menus can run it by name.
 
 Labels: press L on a table for mailing labels, three across, every
 visible column on its own line — Avery energy, zero configuration.",
@@ -203,6 +218,13 @@ column with four properties:
   SHOW      Space — hidden fields disappear from EDIT entirely.
   REQ       r — required fields refuse to save while empty.
   LABEL     Enter — call the column what humans call it.
+  PICTURE   m — a dBASE input mask: 9 = digit, A = letter,
+            X/# = alphanumeric, any other character is a literal.
+            999-99-9999 formats a social security number as you type
+            and refuses a save that does not fit.
+  COMPUTED  c — a SQL expression shown read-only on the form
+            (qty * price). Calculated per record, never saved; EDIT
+            skips over it when you Tab.
   order     [ and ] move the field up and down.
 
 F6 saves; from then on EDIT and NEW use your form for that table.
@@ -323,35 +345,45 @@ Everywhere
 
 Table list
   ↑↓ move · letters seek · i internals · Enter browse
-  C table designer · r refresh · q quit
+  C table designer · E table editor · r refresh · q quit
 
 BROWSE grid
   ↑↓←→ / hjkl move · PgUp PgDn page · g G first/last row
   Home End first/last column · Enter edit row · a add row
   x (twice) delete row · n find next · F5 refresh
-  Q qbe · R report · L labels · F form · A applications
+  v split view · H stack split · Q qbe · R report · L labels
+  F form · A applications · E table editor
 
 EDIT / NEW record
   ↑↓/Tab field · PgUp/PgDn (or ←→) previous/next record
   Enter edit value · Enter again commit + SAVE + next field
+  F7 pick a foreign-key value · F4/F5/F6 child panes
   F10 / Ctrl-S save and close · Esc cancel value, then close
+
+Designers
+  form: Space show · r required · m mask · c computed · Enter label
+        [ ] order · F2 painter · F6 save
+  qbe:  Space show · Enter filter · s sort · J join · g group
+  table: type names · F3 type · F4 pk · F5 not-null · F6 unique
+         F7 default · F8 add · F9 delete · [ ] move · F2 apply
+  report: Enter edit title/source/group · Space cycle · F2 preview
 
 Dot prompt
   Enter run · ↑↓ history · Tab complete
   Ctrl-A/E line ends · Ctrl-U clear · Ctrl-W delete word
+  import/export CSV · run <saved query> · set theme/shimmer
 
 Form painter
   Tab field · arrows cursor · Space place · t text · b box
   x delete · +/- width · F6 save
 
 Pager (reports, labels)
-  ↑↓ PgUp PgDn scroll · g G ends · w write file
+  ↑↓ PgUp PgDn scroll · g G ends · w write file · p print
 
 Help
   ←→ topics · ↑↓ PgUp PgDn scroll · Esc close",
     },
 ];
-
 
 /// Render the whole in-app manual as markdown — `phosphor --manual`.
 /// The web manual is generated FROM the binary, so the two can never
@@ -381,6 +413,21 @@ mod tests {
             assert!(md.contains(&format!("## {}", t.title)), "{} missing", t.key);
         }
         assert!(md.contains("generated from the in-app help"));
+    }
+
+    /// #24: `docs/MANUAL.md` is generated output; it must never drift
+    /// from the in-app help. Regenerate with:
+    /// `cargo run --bin phosphor -- --manual > docs/MANUAL.md`
+    #[test]
+    fn committed_manual_is_in_sync() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/MANUAL.md");
+        let committed = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert_eq!(
+            manual_markdown(),
+            committed,
+            "docs/MANUAL.md is stale — regenerate it from src/help.rs"
+        );
     }
 
     #[test]
