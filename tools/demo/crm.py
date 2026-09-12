@@ -29,6 +29,9 @@ BIN = os.path.join(ROOT, "target/release/phosphor")
 DB = "/tmp/phosphor-crm.db"
 SNAP = os.path.join(ROOT, "docs/demo/crm")
 OUT = os.path.join(ROOT, "docs/demo")
+# cwd for the app under test: report/label writers land here, not in
+# the repo root (they used to dirty tracked files).
+WORK = "/tmp/phosphor-crm-work"
 COLS, ROWS = 140, 40
 FONT = "CaskaydiaMono Nerd Font Mono"
 
@@ -468,7 +471,7 @@ def record_chapter(idx, name, title, argv, tail, build, must, must_not, verify=T
     env = {}
     argv_full = [BIN] + argv + [DB]
     record(argv_full, steps, path, env=env, title=f"phosphor · CRM · {title}",
-           cols=COLS, rows=ROWS, tail=tail)
+           cols=COLS, rows=ROWS, tail=tail, cwd=WORK)
     ok = True
     if verify:
         seen = {m: False for m in must}
@@ -535,6 +538,7 @@ def main():
         start = int(args[args.index("--from") + 1])
     os.makedirs(SNAP, exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
+    os.makedirs(WORK, exist_ok=True)
 
     if not do_merge:
         if not os.path.exists(DB):

@@ -18,6 +18,9 @@ EXT = os.path.abspath(os.path.join(ROOT, "../timeless-libsql/target/release/libd
 ENV = {"PHOSPHOR_EXT": EXT} if os.path.exists(EXT) else {}
 HAS_EXT = bool(ENV)
 OUT = os.path.join(ROOT, "docs/demo")
+# cwd for the app under test: report/label writers land here, not in
+# the repo root (they used to dirty tracked files).
+WORK = "/tmp/phosphor-demo-work"
 
 ESC, ENTER, CTRL_Q = "\x1b", "\r", "\x11"
 F2, F10 = "\x1bOQ", "\x1b[21~"
@@ -47,7 +50,7 @@ def browse():
     typed, t = typing(t + 0.2, "set theme green")
     steps += typed
     steps += [(t + 0.2, ENTER), (t + 1.4, CTRL_Q)]
-    record([BIN, DB], steps, f"{OUT}/browse.cast", env=ENV, title="phosphor · browse")
+    record([BIN, DB], steps, f"{OUT}/browse.cast", env=ENV, title="phosphor · browse", cwd=WORK)
 
 def builders():
     steps, t = taps(0.9, ["c"])                       # seek customers
@@ -84,13 +87,13 @@ def builders():
     t += 2.2
     steps += [(t, ESC)]                                # close pager
     steps += [(t + 1.0, CTRL_Q)]
-    record([BIN, DB], steps, f"{OUT}/builders.cast", env=ENV, title="phosphor · qbe, reports, labels")
+    record([BIN, DB], steps, f"{OUT}/builders.cast", env=ENV, title="phosphor · qbe, reports, labels", cwd=WORK)
 
 def health():
     # dbhealth(every=2) is auto-sampling; the console is live on top.
     steps = [(0.9, F10)]
     steps += [(11.5, "s"), (13.2, ESC), (13.8, CTRL_Q)]
-    record([BIN, DB], steps, f"{OUT}/health.cast", env=ENV, title="phosphor · DBHEALTH live")
+    record([BIN, DB], steps, f"{OUT}/health.cast", env=ENV, title="phosphor · DBHEALTH live", cwd=WORK)
 
 def appmode():
     steps = [(2.4, "b")]                               # hotkey: Balances report
@@ -101,7 +104,7 @@ def appmode():
     steps += [(t + 0.5, ESC), (t + 1.0, ESC)]         # grid → top → menu
     steps += [(t + 2.4, CTRL_Q)]
     record([BIN, "--app", DB], steps, f"{OUT}/appmode.cast", env=ENV,
-           title="phosphor · --app: the database IS the application")
+           title="phosphor · --app: the database IS the application", cwd=WORK)
 
 def split():
     # SET RELATION on one screen: 'v' splits (remembered link first),
@@ -129,10 +132,11 @@ def split():
     steps += [(t, CTRL_Q)]
     record([BIN, DB], steps, f"{OUT}/split.cast", env=ENV,
            title="phosphor · split BROWSE: customer ↔ orders on one screen",
-           cols=140, rows=40)
+           cols=140, rows=40, cwd=WORK)
 
 if __name__ == "__main__":
     os.makedirs(OUT, exist_ok=True)
+    os.makedirs(WORK, exist_ok=True)
     if not HAS_EXT:
         print("skipping health demo: timeless extension not built "
               f"({EXT}); the existing GIF stays as-is")

@@ -490,7 +490,7 @@ pub enum Command {
 /// order and converge on the latest state without generation guards.
 enum PendingOp {
     /// Table open: build + swap in a fresh grid on arrival.
-    Open { name: String, seq: u64 },
+    Open { name: String },
     /// Ad-hoc SELECT: build a query grid on arrival.
     Select { seq: u64 },
     /// Refresh: total + window into the live grid, then re-seek.
@@ -747,7 +747,7 @@ impl App {
             return;
         };
         match (op, resp) {
-            (PendingOp::Open { name, seq }, DbResponse::Opened(r)) => match r {
+            (PendingOp::Open { name }, DbResponse::Opened(r)) => match r {
                 Ok(g) => {
                     // Refresh the schema caches the job already paid for.
                     self.columns_cache.insert(name.clone(), g.columns.clone());
@@ -785,10 +785,10 @@ impl App {
                     self.close_detail(); // the old pane links a different table
                     self.last_ms = Some(took.as_secs_f64() * 1000.0);
                     self.refresh_health();
-                    // Clear only our own (silent) open — a newer message wins.
-                    if self.status_seq == seq {
-                        self.status = None;
-                    }
+                    // Deliberately no status clear: a table open that
+                    // follows "applied N change(s)" (the TABLE EDITOR)
+                    // must not wipe the success message. The next action
+                    // overwrites it as usual.
                 }
                 Err(e) => self.err(e),
             },
@@ -3323,6 +3323,8 @@ impl App {
                         Ok((n, elapsed)) => {
                             self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
                             self.reload_tables();
+                            let sql = item.action_ref.clone();
+                            self.refresh_grid_after_sql(&sql);
                             self.say(match n {
                                 -1 => "ok".to_owned(),
                                 n => format!("ok, {n} row(s) affected"),
@@ -4021,7 +4023,6 @@ impl App {
         // and failures leave the old view intact.
         let table = name.to_owned();
         let limit = self.visible_rows + OVERSCAN;
-        let seq = self.status_seq;
         let submitted = self.db.submit(Box::new(move |db| {
             let res = (|| -> DbResult<crate::worker::OpenedGrid> {
                 let columns = db.columns(&table)?;
@@ -4042,7 +4043,6 @@ impl App {
                     tag,
                     PendingOp::Open {
                         name: name.to_owned(),
-                        seq,
                     },
                 );
             }
@@ -5361,6 +5361,19 @@ impl App {
                 other => self.err(format!("set shimmer on|off (got {other:?})")),
             };
         }
+        if let Some(rest) = line.strip_prefix("set boot ") {
+            return match rest.trim().to_ascii_lowercase().as_str() {
+                "menu" => {
+                    store::pref_set(self.db.link(), "boot", "menu");
+                    self.say("boot: menu — apps open on startup (remembered)");
+                }
+                "browser" => {
+                    store::pref_set(self.db.link(), "boot", "browser");
+                    self.say("boot: browser (remembered)");
+                }
+                other => self.err(format!("set boot menu|browser (got {other:?})")),
+            };
+        }
         if line == "help" {
             return self.open_help();
         }
@@ -5505,6 +5518,7 @@ impl App {
                     self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
                     self.reload_tables();
                     self.refresh_health();
+                    self.refresh_grid_after_sql(&line);
                     self.say(match n {
                         -1 => "ok (batch)".to_owned(),
                         n => format!("ok, {n} row(s) affected"),
@@ -5512,6 +5526,38 @@ impl App {
                 }
                 Err(e) => self.err(e),
             }
+        }
+    }
+
+    /// A write at the dot prompt may change the table currently on screen
+    /// (ch02's bulk INSERT left the orders BROWSE stale). After any
+    /// non-SELECT statement, refresh the live grid: a plain window refill
+    /// for DML (keeping the cursor), a full reopen for DDL (columns may
+    /// have changed).
+    fn refresh_grid_after_sql(&mut self, sql: &str) {
+        let name = match &self.grid {
+            Some(Grid {
+                source: GridSource::Table { name, .. },
+                ..
+            }) => name.clone(),
+            _ => return, // queries are materialized; nothing to refetch
+        };
+        // reload_tables already closed a dropped/renamed-away grid.
+        if !self
+            .tables
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(&name))
+        {
+            return;
+        }
+        let lower = sql.to_ascii_lowercase();
+        if ["create", "alter", "drop", "vacuum"]
+            .iter()
+            .any(|k| lower.contains(k))
+        {
+            self.open_table(&name);
+        } else {
+            self.refresh_grid_keep_position();
         }
     }
 
@@ -5534,6 +5580,7 @@ impl App {
             Ok(msg) => {
                 self.reload_tables();
                 self.refresh_health();
+                self.refresh_grid_after_sql("insert"); // DML: refill
                 self.say(msg);
             }
             Err(e) => self.err(e),
@@ -6661,6 +6708,29 @@ mod tests {
         a.apply(Command::DeleteRow); // re-arm on new row
         a.apply(Command::DeleteRow); // fire
         assert_eq!(a.grid.as_ref().unwrap().total, 500);
+    }
+
+    /// A DML statement at the dot prompt must refresh the open BROWSE
+    /// (ch02's bulk INSERT left the orders grid stale).
+    #[test]
+    fn prompt_write_refreshes_the_live_grid() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().total, 0);
+        for c in "insert into t(b) values ('x'), ('y')".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert_eq!(
+            a.grid.as_ref().unwrap().total,
+            2,
+            "grid refetched after prompt DML"
+        );
     }
 
     /// The optional `csv` keyword must be a standalone token: a table
@@ -7818,6 +7888,29 @@ mod tests {
                 .is_empty(),
             "second D drops"
         );
+    }
+
+    /// `set boot menu` persists (main reads it to start at the app menu).
+    #[test]
+    fn set_boot_persists() {
+        let file = std::env::temp_dir().join(format!("phosphor-boot-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap().to_owned();
+        {
+            let (db, _) = EmbeddedDb::open(&path).unwrap();
+            let mut a = App::new(Box::new(db), None);
+            for c in "set boot menu".chars() {
+                a.apply(Command::PromptChar(c));
+            }
+            a.apply(Command::PromptRun);
+            a.sync();
+        }
+        let (db2, _) = EmbeddedDb::open(&path).unwrap();
+        assert_eq!(
+            crate::store::pref_get(&db2, "boot").as_deref(),
+            Some("menu")
+        );
+        let _ = std::fs::remove_file(&file);
     }
 
     /// Manual widths (`+`/`-`) and freeze (`f`) persist per table.

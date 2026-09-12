@@ -474,7 +474,6 @@ impl EmbeddedDb {
         params: &[&dyn rusqlite::ToSql],
         cap: usize,
     ) -> DbResult<(Vec<Vec<PValue>>, bool)> {
-        let ncols = stmt.column_count();
         let mut rows_out = Vec::new();
         let mut truncated = false;
         let mut rows = stmt.query(params).map_err(|e| e.to_string())?;
@@ -483,6 +482,10 @@ impl EmbeddedDb {
                 truncated = true;
                 break;
             }
+            // Live count from the statement this row came from, not a
+            // pre-step snapshot: a cached statement re-prepares on a
+            // schema change (ALTER TABLE) and its width shifts under us.
+            let ncols = row.as_ref().column_count();
             let mut out = Vec::with_capacity(ncols);
             for i in 0..ncols {
                 out.push(PValue::from_ref(row.get_ref(i).map_err(|e| e.to_string())?));
@@ -1282,6 +1285,28 @@ mod tests {
         // Past-the-end window falls back to count (total still right).
         let (_, total) = db.open_window("t", 99, 10).unwrap();
         assert_eq!(total, 3);
+    }
+
+    /// A cached window statement must re-read its width after a schema
+    /// change: `column_count()` snapshotted before the first step went
+    /// stale once `ALTER TABLE ... DROP COLUMN` shrank the result set,
+    /// yielding a bogus `InvalidColumnIndex` for the trailing columns.
+    #[test]
+    fn open_window_survives_a_column_drop() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT, note TEXT);
+             INSERT INTO t(a,b,note) VALUES ('x', 'y', 'z');",
+        )
+        .unwrap();
+        // First open prepares and caches `SELECT rowid, *, count(*) …`.
+        let (page, _) = db.open_window("t", 0, 10).unwrap();
+        assert_eq!(page.rows[0].len(), 4);
+        db.execute("ALTER TABLE t DROP COLUMN note").unwrap();
+        // Second open reuses the cached statement: the row is narrower.
+        let (page, total) = db.open_window("t", 0, 10).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(page.rows[0].len(), 3);
     }
 
     #[test]

@@ -1178,14 +1178,12 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let left = format!(" {} [{}]", app.db.name(), app.db.backend());
     // Borrowed mid/message (were format!+clone per frame): the spans
     // borrow from `app`, which outlives the frame render.
+    // The source name is deliberately omitted: the pane title above
+    // already says BROWSE <table> / QUERY / DETAIL, and the status line
+    // needs its width for the message and the row position.
     let mid: Cow<'_, str> = match &app.grid {
         Some(g) if g.total > 0 => Cow::Owned(format!(
-            "{} · row {}/{} · {}",
-            match &g.source {
-                GridSource::Table { name, .. } => name.as_str(),
-                GridSource::Query { .. } => "query",
-                GridSource::Detail { .. } => "detail",
-            },
+            "row {}/{} · {}",
             g.cur_row + 1,
             g.total,
             g.columns.get(g.cur_col).map(String::as_str).unwrap_or("")
@@ -1204,17 +1202,37 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         None => ("", th.dim()),
     };
 
+    // The position/latency/health cluster is pinned to the right edge so a
+    // long status message (startup hints, import errors) can never shove it
+    // off-screen; the message gets truncated instead.
+    let right = format!("{}  {ms} {dot} ", mid.as_ref());
+    let right_w = (right.chars().count() as u16).min(area.width);
+    let split = area.width.saturating_sub(right_w);
+    let left_area = Rect {
+        width: split,
+        ..area
+    };
+    let right_area = Rect {
+        x: area.x + split,
+        width: right_w,
+        ..area
+    };
     let line = Line::from(vec![
         Span::styled(left, th.dim()),
         Span::styled("  ", th.dim()),
         Span::styled(msg, msg_style),
-        Span::styled("  ", th.dim()),
-        Span::styled(mid, th.dim()),
-        Span::styled(format!("  {ms} "), th.dim()),
-        Span::styled(dot, dot_style),
-        Span::styled(" ", th.dim()),
     ]);
-    f.render_widget(Paragraph::new(line).alignment(Alignment::Left), area);
+    f.render_widget(Paragraph::new(line), left_area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(mid.into_owned(), th.dim()),
+            Span::styled(format!("  {ms} "), th.dim()),
+            Span::styled(dot, dot_style),
+            Span::styled(" ", th.dim()),
+        ]))
+        .alignment(Alignment::Right),
+        right_area,
+    );
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

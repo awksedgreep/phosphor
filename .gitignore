@@ -6,3 +6,6 @@
 docs/demo/*.cast
 docs/demo/ui/*.cast
 __pycache__/
+# Demo byproducts: report/label writers drop these in the process cwd.
+/report_*.txt
+/labels_*.txt

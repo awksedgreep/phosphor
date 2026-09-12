@@ -52,14 +52,16 @@
   tables. The evolution demo (CRM ch03) now drives the TABLE EDITOR for
   add/drop column and the confirmed drop, and a new `tableeditor` reel
   covers it (19 asserted reels).
+- **Live grid after prompt writes**: an INSERT/UPDATE/DELETE at the dot
+  prompt refetches the browsed grid in place (cursor kept), and DDL
+  reopens the table in view (its columns may have changed) — the pane no
+  longer shows rows the write just invalidated. `import` and
+  script-driven SQL refresh the same way.
+- **Boot destination**: `set boot menu|browser` recalls where a session on
+  a database-with-apps should land. When an app is present and no
+  preference is set, the status line points at `A` so the menu isn't a
+  secret.
 
-### Known issues
-- A database carrying the timeless extension cannot have columns
-  dropped/renamed or changed by the TABLE EDITOR: SQLite validates every
-  view on `ALTER`, and the extension's `timeless_dbhealth_series` view is
-  invalid (it references a missing `main.timeless_series`). ADD COLUMN
-  works; the CRM evolution demo drops columns on a clean database, which
-  works fine.
 - **Read-only kiosk + app version** (#21): `--app --readonly` refuses
   every write centrally; `_phosphor_apps.version` migrates in place and
   shows in the menu title when above 1.
@@ -97,6 +99,22 @@
   only the database.
 
 ### Fixed
+- **timeless #56**: the TABLE EDITOR now drops/renames columns on a
+  database that carries the timeless extension (column DROP is back in
+  the `tableeditor` reel). Upstream `dbhealth` registered its metric
+  modules but not the `timeless_series` TVF that its own
+  `timeless_<table>_series` view selects from; SQLite validates every
+  view on `ALTER`, so every schema edit failed with
+  `no such table: main.timeless_series`. Fixed in timeless-libsql
+  `df76dc4`; the extension must be loaded (`PHOSPHOR_EXT`) because the
+  view needs the TVF to resolve.
+- A cached window statement (`open_window`) snapshotted its column count
+  before the first step, so an `ALTER TABLE ... DROP COLUMN` followed by
+  a refill read past the narrowed row and failed with
+  `Invalid column index`. The width is now read live per row.
+- A long status message (startup hint, import error) no longer shoves the
+  row position, latency, and health dot off the status line, and an async
+  table reopen no longer wipes an `applied N change(s)` message.
 - **#11**: Enter on an untouched NEW form no longer INSERTs an all-NULL
   placeholder row; it just advances. F10/Ctrl-S still inserts a
   defaults-only row when asked.
@@ -132,6 +150,10 @@
 
 ### Chore
 - `cargo fmt` across the workspace (was ~2.8k lines of drift) and CI now runs `cargo fmt --check`.
+- Demo recordings (`crm.py`, `scenarios.py`) run with `cwd` in a scratch
+  directory, so the CRM/scenario runs no longer deposit `report_*.txt`
+  in the repo root (the stray tracked files are removed; `.gitignore`
+  covers new ones). Main and UI demo GIFs refreshed.
 
 ## 0.1.0 — 2026-08-04
 

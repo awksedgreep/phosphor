@@ -108,12 +108,41 @@ fn main() -> std::io::Result<()> {
         };
     let mut app = App::new(link, warning);
     app.readonly = readonly;
+    let apps = crate::appsgen::list_apps(app.db.link());
     if app_mode {
         // The database IS the application (DESIGN.md phase 5).
-        app.app_home = app_name
-            .clone()
-            .or_else(|| crate::appsgen::list_apps(app.db.link()).into_iter().next());
+        app.app_home = app_name.clone().or_else(|| apps.first().cloned());
         app.apply(app::Command::OpenAppMenu(app.app_home.clone()));
+    } else {
+        // Discoverability: `set boot menu` starts at the app menu (Esc
+        // still reaches the browser); otherwise a status hint points at
+        // whatever apps the database carries. Never trap the user in an
+        // app they did not ask for.
+        match crate::store::pref_get(app.db.link(), "boot").as_deref() {
+            Some("menu") if !apps.is_empty() => {
+                app.apply(app::Command::OpenAppMenu(apps.first().cloned()));
+            }
+            Some("browser") => {}
+            _ if apps.len() == 1 => {
+                app.status = Some((
+                    format!(
+                        "app {:?} ready — A opens it (set boot menu to boot here)",
+                        apps[0]
+                    ),
+                    false,
+                ));
+            }
+            _ if !apps.is_empty() => {
+                app.status = Some((
+                    format!(
+                        "{} apps ready — A opens one (set boot menu to boot here)",
+                        apps.len()
+                    ),
+                    false,
+                ));
+            }
+            _ => {}
+        }
     }
 
     fn finish(_terminal: ratatui::DefaultTerminal, r: std::io::Result<()>) -> std::io::Result<()> {

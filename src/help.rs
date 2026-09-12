@@ -152,6 +152,7 @@ Beyond SQL, the prompt knows a few short commands:
   advise            index / vacuum advisor (missing FK indexes)
   set theme <name>  green, amber, paper, or blue (remembered)
   set shimmer on|off  CRT scanlines (remembered)
+  set boot menu|browser  start at the app menu, or the browser
 
 Comforts: Up/Down walk your history, Tab completes table names and
 commands, Ctrl-A/Ctrl-E jump to the ends of the line, Ctrl-U clears
@@ -444,7 +445,7 @@ Designers
 Dot prompt
   Enter run · ↑↓ history · Tab complete
   Ctrl-A/E line ends · Ctrl-U clear · Ctrl-W delete word
-  import/export CSV · run <saved query> · set theme/shimmer
+  import/export CSV · run <saved query> · set theme/shimmer/boot
 
 Form painter
   Tab field · arrows cursor · Space place · t text · b box
