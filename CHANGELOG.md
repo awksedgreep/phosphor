@@ -63,7 +63,12 @@
   `edit <table> <event>` opens a full-screen editor — line numbers,
   inverse caret, Enter newline, Tab indent, Backspace that joins lines,
   F6 save, Esc close. The `scripts` pager now names the exact `edit`
-  command per binding. Still open: a richer host API.
+  command per binding.
+- **Scripting hook, slice 5** (#12): the editor also edits **menu-item
+  scripts**. In the Applications Generator, `E` opens the selected
+  `script` item full-screen; saving returns to the designer, and the
+  item list previews multi-line targets with `⏎`. `scripts` lists
+  menu-item scripts too. Still open: a richer host API.
 
 ### Fixed
 - `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).

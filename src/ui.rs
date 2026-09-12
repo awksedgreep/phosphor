@@ -460,6 +460,17 @@ fn draw_form(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// One-line preview of a possibly-multiline menu target (`⏎` when the
+/// full source is longer — press E to edit it).
+fn ref_preview(s: &str) -> String {
+    let first = s.lines().next().unwrap_or("");
+    if s.lines().count() > 1 {
+        format!("{first} ⏎")
+    } else {
+        first.to_owned()
+    }
+}
+
 fn draw_apps(f: &mut Frame, app: &App) {
     let th = app.theme;
     let Overlay::Apps(st) = &app.overlay else {
@@ -480,7 +491,7 @@ fn draw_apps(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " n new · x delete · Enter label · e ref · c kind · [ ] order · F2 run ",
+            " n new · x del · Enter label · e target · E script · c kind · F2 run ",
             th.dim(),
         ));
     let inner = block.inner(area);
@@ -489,7 +500,7 @@ fn draw_apps(f: &mut Frame, app: &App) {
     let mut lines = vec![Line::from(vec![
         Span::styled(pad("LABEL", 24), th.dim()),
         Span::styled(pad("KIND", 8), th.dim()),
-        Span::styled("TARGET (table · saved query/report · SQL)", th.dim()),
+        Span::styled("TARGET (table · query/report · SQL · Lua)", th.dim()),
     ])];
     for (i, item) in st.items.iter().enumerate() {
         let selected = i == st.cursor;
@@ -501,11 +512,11 @@ fn draw_apps(f: &mut Frame, app: &App) {
             ),
             (true, Some(buf)) => (
                 editing_span(buf, 24, th),
-                Span::styled(item.action_ref.clone(), style),
+                Span::styled(ref_preview(&item.action_ref), style),
             ),
             _ => (
                 Span::styled(pad(&item.label, 24), style),
-                Span::styled(item.action_ref.clone(), style),
+                Span::styled(ref_preview(&item.action_ref), style),
             ),
         };
         lines.push(Line::from(vec![
@@ -1459,10 +1470,7 @@ fn draw_script_editor(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .border_style(th.bright())
         .style(th.base())
-        .title(Span::styled(
-            format!(" SCRIPT · {} · {}{dirty} ", st.table, st.event),
-            th.bright(),
-        ))
+        .title(Span::styled(format!("{}{dirty} ", st.title()), th.bright()))
         .title_bottom(Line::styled(
             " type · Enter newline · Tab indent · F6 save · Esc close ",
             th.dim(),

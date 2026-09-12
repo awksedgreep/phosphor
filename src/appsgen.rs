@@ -150,6 +150,15 @@ pub fn update_item(db: &dyn DbLink, item: &AppItem) -> DbResult<()> {
     .map(|_| ())
 }
 
+/// Replace one item's target (used by the multi-line script editor).
+pub fn set_item_ref(db: &dyn DbLink, item_id: i64, action_ref: &str) -> DbResult<()> {
+    db.execute(&format!(
+        "UPDATE _phosphor_items SET action_ref = {} WHERE id = {item_id}",
+        store::q(action_ref)
+    ))
+    .map(|_| ())
+}
+
 pub fn delete_item(db: &dyn DbLink, item_id: i64) -> DbResult<()> {
     db.execute(&format!("DELETE FROM _phosphor_items WHERE id = {item_id}"))
         .map(|_| ())

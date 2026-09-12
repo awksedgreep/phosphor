@@ -251,8 +251,9 @@ Each menu item has a label, a kind, and a target:
   script    a one-line Lua script: query(sql), execute(sql), say(v)
 
 In the designer: n adds an item, Enter edits the label, e edits the
-target, c cycles the kind, [ and ] reorder, x deletes. Everything
-saves as you go. F2 opens the live menu to try it.
+target, c cycles the kind, [ and ] reorder, x deletes. For a
+`script` item, E opens the full Lua editor (see Scripting). All
+changes save as you go. F2 opens the live menu to try it.
 
 The menu itself is pure 1988: arrow keys and Enter, or press the
 bright first letter of an item to run it instantly.
@@ -295,7 +296,9 @@ the field you were on, and is_new says whether it is a new row.
 List bindings with  scripts [table]; no lua clears one, and
   edit <table> <event>
 opens a multi-line editor (type, Enter for a new line, Tab to
-indent, F6 saves, Esc closes without saving).
+indent, F6 saves, Esc closes without saving). In the
+Applications Generator, E opens the same editor on the selected
+script menu item.
 
 Sandbox: a 32 MB heap cap and an instruction budget stop runaway
 scripts. A script reaches the database, never the filesystem or
@@ -396,6 +399,7 @@ Designers
   table: type names · F3 type · F4 pk · F5 not-null · F6 unique
          F7 default · F8 add · F9 delete · [ ] move · F2 apply
   report: Enter edit title/source/group · Space cycle · F2 preview
+  apps: n new · Enter label · e target · E script · c kind · F2 run
 
 Dot prompt
   Enter run · ↑↓ history · Tab complete

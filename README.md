@@ -130,7 +130,8 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   Need logic the declarative layer can't express? Bind a sandboxed **Lua
   lifecycle script** — `script customers OnValidate ...`, or edit it
   full-screen with `edit customers OnValidate` — and it runs on save with
-  a read/write record. Menu items can carry a `script` action too.
+  a read/write record. Menu items can carry a `script` action too —
+  press `E` in the Applications Generator to edit it full-screen.
 
 ## The CRM user story — empty file to running app in 5 minutes
 

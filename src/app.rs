@@ -52,10 +52,24 @@ pub enum Overlay {
     ScriptEditor(ScriptState),
 }
 
-/// A full-screen text buffer for one lifecycle script.
+/// What the script editor is bound to: a form lifecycle event, or the
+/// one-line action of an application menu item.
+#[derive(Clone)]
+pub enum ScriptTarget {
+    Form {
+        table: String,
+        event: String,
+    },
+    MenuItem {
+        app: String,
+        item_id: i64,
+        label: String,
+    },
+}
+
+/// A full-screen text buffer for one script.
 pub struct ScriptState {
-    pub table: String,
-    pub event: String,
+    pub target: ScriptTarget,
     pub lines: Vec<String>,
     /// Line index and char index (not bytes) of the caret.
     pub row: usize,
@@ -64,14 +78,13 @@ pub struct ScriptState {
 }
 
 impl ScriptState {
-    pub fn new(table: String, event: String, source: &str) -> Self {
+    pub fn new(target: ScriptTarget, source: &str) -> Self {
         let mut lines: Vec<String> = source.split('\n').map(str::to_owned).collect();
         if lines.is_empty() {
             lines.push(String::new());
         }
         ScriptState {
-            table,
-            event,
+            target,
             lines,
             row: 0,
             col: 0,
@@ -81,6 +94,16 @@ impl ScriptState {
 
     pub fn text(&self) -> String {
         self.lines.join("\n")
+    }
+
+    /// The box title: what this script is bound to.
+    pub fn title(&self) -> String {
+        match &self.target {
+            ScriptTarget::Form { table, event } => format!(" SCRIPT · {table} · {event}"),
+            ScriptTarget::MenuItem { app, label, .. } => {
+                format!(" SCRIPT · {app} · {label}")
+            }
+        }
     }
 
     fn line_len(&self) -> usize {
@@ -350,6 +373,8 @@ pub enum Command {
         table: String,
         event: String,
     },
+    /// Open the multi-line Lua editor for the selected menu item's script.
+    OpenSelectedScript,
     ScriptChar(char),
     ScriptTab,
     ScriptNewline,
@@ -505,6 +530,8 @@ pub struct App {
     pub show_internals: bool,
     /// An overlay was launched from the app menu: Esc returns HOME.
     menu_launched: bool,
+    /// The app whose designer launched the script editor; Esc returns.
+    script_return_app: Option<String>,
     /// Select-all semantics for prefilled single-line editors: the
     /// first typed char REPLACES the prefill; Backspace edits it.
     editor_fresh: bool,
@@ -584,6 +611,7 @@ impl App {
             last_find: None,
             show_internals: false,
             menu_launched: false,
+            script_return_app: None,
             editor_fresh: false,
             last_edit_page: None,
             page_streak: 0,
@@ -1335,6 +1363,7 @@ impl App {
                 (None, Char('c')) => Command::DesignerCycle,
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, Char('e') | Tab) => Command::DesignerEditAlt,
+                (None, Char('E')) => Command::OpenSelectedScript,
                 (None, Char('[')) => Command::DesignerSwap(-1),
                 (None, Char(']')) => Command::DesignerSwap(1),
                 (None, F(2)) => Command::DesignerRun,
@@ -1912,6 +1941,7 @@ impl App {
                 }
             }
             Command::OpenFormScript { table, event } => self.open_form_script(table, event),
+            Command::OpenSelectedScript => self.open_selected_item_script(),
             Command::ScriptChar(c) => self.script_char(c),
             Command::ScriptTab => {
                 self.script_char(' ');
@@ -2027,6 +2057,7 @@ impl App {
                 let home = self.app_home.clone();
                 self.open_app_menu(home);
             }
+            Overlay::ScriptEditor(_) => self.close_script_editor(),
             Overlay::Edit(_)
             | Overlay::Help(_)
             | Overlay::Health(_)
@@ -2036,8 +2067,7 @@ impl App {
             | Overlay::Form(_)
             | Overlay::Apps(_)
             | Overlay::Create(_)
-            | Overlay::AppMenu(_)
-            | Overlay::ScriptEditor(_) => self.overlay = Overlay::None,
+            | Overlay::AppMenu(_) => self.overlay = Overlay::None,
             Overlay::None => match self.focus {
                 Focus::Prompt => {
                     self.focus = if self.grid.is_some() {
@@ -5271,6 +5301,37 @@ impl App {
             }
             lines.push(String::new());
         }
+        // Menu-item scripts live on `_phosphor_items`, not the lifecycle
+        // table; show them too when unfiltered.
+        if table.is_empty() {
+            if let Ok(q) = self.db.query(
+                "SELECT a.name, i.label, i.action_ref \
+                 FROM _phosphor_items i JOIN _phosphor_apps a ON a.id = i.app_id \
+                 WHERE i.action_kind = 'script' ORDER BY a.name, i.seq, i.id",
+            ) {
+                let items: Vec<(String, String, String)> = q
+                    .rows
+                    .iter()
+                    .filter_map(|r| match (r.first(), r.get(1), r.get(2)) {
+                        (Some(PValue::Text(a)), Some(PValue::Text(l)), Some(PValue::Text(s))) => {
+                            Some((a.clone(), l.clone(), s.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !items.is_empty() {
+                    lines.push("MENU-ITEM SCRIPTS (A, then E on the item)".to_owned());
+                    lines.push(String::new());
+                    for (app, label, src) in items {
+                        lines.push(format!("{app} · {label}"));
+                        for l in src.lines() {
+                            lines.push(format!("  {l}"));
+                        }
+                        lines.push(String::new());
+                    }
+                }
+            }
+        }
         self.overlay = Overlay::Pager(PagerState {
             title: if table.is_empty() {
                 " SCRIPTS ".into()
@@ -5293,7 +5354,50 @@ impl App {
             return self.err("events: OnValidate, OnSave, OnChange");
         };
         let src = crate::script::get_script(self.db.link(), &table, ev).unwrap_or_default();
-        self.overlay = Overlay::ScriptEditor(ScriptState::new(table, ev.to_owned(), &src));
+        self.script_return_app = None;
+        self.overlay = Overlay::ScriptEditor(ScriptState::new(
+            ScriptTarget::Form {
+                table,
+                event: ev.to_owned(),
+            },
+            &src,
+        ));
+    }
+
+    /// `E` in the Applications Generator: edit the selected item's Lua
+    /// source full-screen. Only meaningful for `script` items.
+    fn open_selected_item_script(&mut self) {
+        if self.readonly {
+            return self.err("read-only mode: cannot edit scripts");
+        }
+        let (app, item) = match &self.overlay {
+            Overlay::Apps(st) => (st.app.clone(), st.items.get(st.cursor).cloned()),
+            _ => return,
+        };
+        let Some(item) = item else {
+            return self.say("no menu item selected");
+        };
+        if item.kind != ActionKind::Script {
+            return self.say("E edits a `script` item's Lua (c cycles the kind)");
+        }
+        self.script_return_app = Some(app.clone());
+        self.overlay = Overlay::ScriptEditor(ScriptState::new(
+            ScriptTarget::MenuItem {
+                app,
+                item_id: item.id,
+                label: item.label.clone(),
+            },
+            &item.action_ref,
+        ));
+    }
+
+    /// Leave the editor; when it was opened from the Applications
+    /// Generator, go back there instead of the bare browser.
+    fn close_script_editor(&mut self) {
+        match self.script_return_app.take() {
+            Some(app) => self.open_apps(Some(app)),
+            None => self.overlay = Overlay::None,
+        }
     }
 
     fn script_char(&mut self, c: char) {
@@ -5360,16 +5464,29 @@ impl App {
         let Overlay::ScriptEditor(st) = &self.overlay else {
             return;
         };
-        let (table, event, text) = (st.table.clone(), st.event.clone(), st.text());
-        let result = if text.trim().is_empty() {
-            crate::script::clear_script(self.db.link(), &table, &event)
-        } else {
-            crate::script::set_script(self.db.link(), &table, &event, &text)
+        let text = st.text();
+        let (result, note): (crate::db::DbResult<()>, String) = match &st.target {
+            ScriptTarget::Form { table, event } => {
+                let r = if text.trim().is_empty() {
+                    crate::script::clear_script(self.db.link(), table, event)
+                } else {
+                    crate::script::set_script(self.db.link(), table, event, &text)
+                };
+                (r, format!("saved {table} {event}"))
+            }
+            ScriptTarget::MenuItem {
+                app,
+                item_id,
+                label,
+            } => (
+                crate::appsgen::set_item_ref(self.db.link(), *item_id, &text),
+                format!("saved {app} · {label}"),
+            ),
         };
         match result {
             Ok(()) => {
-                self.say(format!("saved {table} {event}"));
-                self.overlay = Overlay::None;
+                self.say(note);
+                self.close_script_editor();
             }
             Err(e) => self.err(e),
         }
@@ -5703,6 +5820,52 @@ mod tests {
         assert!(matches!(a.overlay, Overlay::None));
         let src = crate::script::get_script(a.db.link(), "t", "OnValidate").unwrap();
         assert_eq!(src, "say(\"hi\")\nreturn 1");
+    }
+
+    /// #12: the editor edits a menu item's script (multi-line), returns
+    /// to the Applications Generator, and the item runs the new source.
+    #[test]
+    fn menu_item_script_editor_round_trips() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE log(x TEXT)").unwrap();
+        let mut a = App::new(Box::new(db), None);
+        appsgen::ensure_app(a.db.link(), "demo").unwrap();
+        appsgen::add_item(a.db.link(), "demo", "Do it").unwrap();
+        let mut items = appsgen::items(a.db.link(), "demo");
+        items[0].kind = ActionKind::Script;
+        items[0].action_ref = String::new();
+        appsgen::update_item(a.db.link(), &items[0]).unwrap();
+
+        a.apply(Command::OpenApps(Some("demo".into())));
+        a.apply(Command::OpenSelectedScript);
+        assert!(
+            matches!(&a.overlay, Overlay::ScriptEditor(st)
+                if matches!(st.target, ScriptTarget::MenuItem { .. })),
+            "editor targets the menu item"
+        );
+        for c in "execute(\"insert into log values ('a')\")".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::ScriptNewline);
+        for c in "ui.refresh()".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::ScriptSave);
+        assert!(matches!(a.overlay, Overlay::Apps(_)), "returns to designer");
+        let items = appsgen::items(a.db.link(), "demo");
+        assert!(
+            items[0].action_ref.contains('\n'),
+            "{:?}",
+            items[0].action_ref
+        );
+
+        // Run it: designer → live menu → the item.
+        a.apply(Command::DesignerRun);
+        assert!(matches!(a.overlay, Overlay::AppMenu(_)));
+        a.apply(Command::DesignerRun);
+        a.sync();
+        let q = a.db.query("SELECT count(*) FROM log").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Int(1), "multi-line script ran");
     }
 
     /// Backspace at column 0 joins with the previous line.
