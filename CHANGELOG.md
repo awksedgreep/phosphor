@@ -92,6 +92,11 @@
 - `import csv <table>` / `export csv <source>` mistook a table whose name
   starts with `csv` for the optional `csv` keyword (`csvtest` → `test`;
   caught by the new `data` UI reel).
+- BROWSE column widths were computed while a table was still empty and
+  then frozen at the header minimum (4), so a table created and filled in
+  one session showed `Gra…`/`Lon…` (caught on film: CRM `01-customers`).
+  Widths now grow to fit as the window fills, and never shrink mid-session
+  (`Grid::grow_widths`).
 - The `builders` demo no longer shows the incoherent painter beat (the
   dedicated, asserted `forms` reel owns the painter); new asserted reels
   cover scripting, CSV + advisor, QBE joins/group, PICTURE/F7 pickers,

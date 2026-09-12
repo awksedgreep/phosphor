@@ -262,22 +262,43 @@ impl Grid {
         self.cache.get(idx as usize)
     }
 
+    /// Widths for the current cache, 4..24 (render_len, not render: no
+    /// String per sampled cell). Used on open/select, where a fresh fit
+    /// is right.
     fn compute_widths(&mut self) {
-        self.widths = self
-            .columns
+        self.widths = self.fitted_widths();
+    }
+
+    fn fitted_widths(&self) -> Vec<u16> {
+        self.columns
             .iter()
             .enumerate()
             .map(|(c, name)| {
                 let mut w = name.chars().count();
                 for row in self.cache.iter().take(WIDTH_SAMPLE) {
                     if let Some(v) = row.get(c) {
-                        // render_len, not render: no String per cell.
                         w = w.max(v.render_len());
                     }
                 }
                 w.clamp(4, 24) as u16
             })
-            .collect();
+            .collect()
+    }
+
+    /// Re-fit but only GROW. A window install after data arrived must not
+    /// leave columns stuck at their header-minimum width — a table
+    /// created empty and then filled kept 4-wide columns (found on film:
+    /// the CRM `01-customers` GIF showed `Gra…`/`Lon…`). Growing only, so
+    /// paging into wider rows never snaps existing columns narrower.
+    fn grow_widths(&mut self) {
+        let fresh = self.fitted_widths();
+        if self.widths.len() != fresh.len() {
+            self.widths = fresh;
+            return;
+        }
+        for (w, f) in self.widths.iter_mut().zip(fresh) {
+            *w = (*w).max(f);
+        }
     }
 }
 
@@ -797,6 +818,7 @@ impl App {
                         g.rowids = page.rowids;
                         g.cache_start = want_start;
                         g.cur_col = col.min(g.columns.len().saturating_sub(1));
+                        g.grow_widths();
                     }
                     self.last_ms = Some(took.as_secs_f64() * 1000.0);
                     self.grid_jump(row);
@@ -822,9 +844,7 @@ impl App {
                         g.cache = page.rows;
                         g.rowids = page.rowids;
                         g.cache_start = want_start;
-                        if g.widths.is_empty() {
-                            g.compute_widths();
-                        }
+                        g.grow_widths();
                     }
                     self.last_ms = Some(took.as_secs_f64() * 1000.0);
                     self.try_pending_edit();
@@ -4129,9 +4149,7 @@ impl App {
                     g.cache = page.rows;
                     g.rowids = page.rowids;
                     g.cache_start = want_start;
-                    if g.widths.is_empty() {
-                        g.compute_widths();
-                    }
+                    g.grow_widths();
                 }
                 // Void in-flight windows: their data predates the insert.
                 self.pending_page = None;
@@ -4706,6 +4724,10 @@ impl App {
                     g.rowids = page.rowids;
                     g.cache_start = want_start;
                     g.cur_col = col.min(g.columns.len().saturating_sub(1));
+                    // A fill (or a new insert) can widen columns: grow to
+                    // fit, never shrink (issue: empty tables kept 4-wide
+                    // columns after data arrived).
+                    g.grow_widths();
                 }
                 self.last_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
             }
@@ -6485,6 +6507,33 @@ mod tests {
         let q = a.db.query("SELECT count(*) FROM csvtest").unwrap();
         assert_eq!(q.rows[0][0], PValue::Int(1));
         let _ = std::fs::remove_file(&csv);
+    }
+
+    /// A table opened empty kept header-minimum (4-wide) columns after
+    /// rows arrived — the CRM `01-customers` GIF showed `Gra…`/`Lon…`.
+    /// Widths must grow to fit as the window fills.
+    #[test]
+    fn column_widths_grow_when_an_empty_table_fills() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE c(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected); // opens empty c
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().widths[1], 4, "header-min first");
+        a.apply(Command::OpenInsert);
+        a.apply(Command::EditMove(1)); // name
+        a.apply(Command::EditBegin);
+        for ch in "Alexandria".chars() {
+            a.apply(Command::EditChar(ch));
+        }
+        a.apply(Command::EditCommitField); // insert + refetch
+        a.sync();
+        assert!(
+            a.grid.as_ref().unwrap().widths[1] >= "Alexandria".chars().count() as u16,
+            "width must grow to fit: {:?}",
+            a.grid.as_ref().unwrap().widths
+        );
     }
 
     /// #11: Enter on an untouched NEW form advances but does not INSERT

@@ -352,7 +352,8 @@ def ch08_report(s):
     s.k("R", 1.0)                                          # report designer
     s.keys(["j", "j"], gap=0.4)                            # → group by
     s.keys([" "] * 6, gap=0.4)                             # cycle → region
-    s.k(F6, 0.9)                                           # save (instant: named after the table)
+    s.k(F6, 0.9)                                           # save-as prompt (prefilled)
+    s.k(ENTER, 0.7)                                        # accept the table name
     s.k(F2, 1.6)                                           # preview the bands
     s.keys(["j", "j", "j"], gap=0.4)                       # scroll the bands
     s.k("w", 1.0)                                          # write the file
@@ -381,6 +382,8 @@ def ch10_app_builder(s):
     """The Applications Generator: three menu items wired to the
     browse, the saved report, and the saved query."""
     s.pause(0.8).k("A", 1.2)
+    s.k("r", 0.7)                                          # name the app (was "app")
+    s.type("CRM", cps=32, wait=0.4).k(ENTER, 0.6)
     s.k("n", 0.7).k(ENTER, 0.5)                            # new item → label
     s.type("Customers", cps=32, wait=0.4).k(ENTER, 0.6)
     s.k("e", 0.6)                                          # action_ref
@@ -445,10 +448,10 @@ CHAPTERS = [
      ["debtors", "found at row", "theme: amber"],
      ["error"]),
     ("10", "wiring the application menu", [], 2.0, ch10_app_builder,
-     ["APP", "Customers", "Orders by region", "Debtors"],
+     ["CRM", "Customers", "Orders by region", "Debtors"],
      ["error: no such"]),
     ("11", "--app: the database IS the application", ["--app"], 2.5, ch11_app_boots,
-     ["APP", "orders report", "TOTAL", "QUERY"],
+     ["CRM", "orders report", "TOTAL", "QUERY"],
      ["error: no such"]),
 ]
 
