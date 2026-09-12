@@ -114,10 +114,11 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   from then on.
 - **The Applications Generator** — press `A`, craft a menu of actions
   (browse a table, run a saved query or report, execute SQL, or run a
-  one-line **Lua script** over a sandboxed `query`/`execute`/`say` plus
-  a queued `ui.*` surface: `refresh`, `browse`, `query`, `report`,
-  `form`, `prompt`, `quit`), and the result is an *application* stored
-  in `_phosphor_*` tables inside the database itself. Then:
+  **Lua script** over a sandboxed API — `query`/`query_one`/`scalar`/
+  `execute`/`exists`, `json`, string helpers, and a queued `ui.*`
+  surface (`refresh`, `browse`, `query`, `report`, `form`, `prompt`,
+  `quit`)), and the result is an *application* stored in `_phosphor_*`
+  tables inside the database itself. Then:
 
   ```sh
   phosphor --app crm.db               # your team's CRM, hotkeys and all

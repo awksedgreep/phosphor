@@ -286,9 +286,19 @@ A `script` menu action and form lifecycle events run small Lua
 scripts in a sandbox that can touch only the database.
 
 Data globals:
-  query(sql)    rows as tables keyed by column name
-  execute(sql)  affected rows (-1 for a batch)
-  say(v)        add a line to the result
+  query(sql)      rows as tables keyed by column name
+  query_one(sql)  the first row, or nil
+  scalar(sql)     first column of the first row
+  execute(sql)    affected rows (-1 for a batch)
+  exists(sql)     true when any row comes back
+  columns(table)  the table's column names
+  quote(s)        a SQL string literal; ident(s) an identifier
+
+Output and helpers:
+  say(v) / print(...)  add a line to the result
+  trim(s) split(s, sep) join(list, sep) now()
+  assert(cond, msg)    stop with msg when cond is false
+  json.encode(v) / json.decode(s)
 
 UI effects are QUEUED, then run through the normal command bus —
 so read-only mode and every check still apply:

@@ -195,9 +195,11 @@ Three layers, one philosophy — the artifact proves itself:
    `prompt`, `quit`) that the app dispatches as the same `Command`s a
    keystroke would. Slice 4 added the multi-line editor (`edit <table>
    <event>`); slice 5 extended it to menu-item scripts (`E` in the
-   Applications Generator). Still open: a richer host API. The original
-   note stands: the declarative layer covers the 90% case, so scripting
-   stays additive.
+   Applications Generator); slice 6 widened the host API (`query_one`,
+   `scalar`, `exists`, `columns`, `quote`, `ident`, `print`, `trim`,
+   `split`, `join`, `now`, `assert`, `json`). The original note stands:
+   the declarative layer covers the 90% case, so scripting stays
+   additive.
 3. Printing path — **decided 2026-09-12**: always write the text file,
    then `p` pipes it to `$PHOSPHOR_PRINT` (default `lp`, fallback `lpr`).
    Direct-to-`lp` only as a convenience; the file is the artifact.

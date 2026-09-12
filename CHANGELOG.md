@@ -68,7 +68,12 @@
   scripts**. In the Applications Generator, `E` opens the selected
   `script` item full-screen; saving returns to the designer, and the
   item list previews multi-line targets with `⏎`. `scripts` lists
-  menu-item scripts too. Still open: a richer host API.
+  menu-item scripts too.
+- **Scripting hook, slice 6** (#12): a richer host API. Alongside
+  `query`/`execute`/`say`, scripts get `query_one`, `scalar`, `exists`,
+  `columns`, `quote`, `ident`, `print`, `trim`, `split`, `join`, `now`,
+  `assert`, and `json.encode`/`json.decode` — the sandbox still reaches
+  only the database.
 
 ### Fixed
 - `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).

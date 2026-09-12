@@ -2,11 +2,19 @@
 //! environment that talks to the database only through [`DbLink`] and
 //! exchanges the one [`PValue`] type — never a second conversion layer.
 //!
-//! Data globals:
+//! Host API (shared by menu actions and form events):
 //!
-//!   query(sql)    -> a sequence of row tables keyed by column name
-//!   execute(sql)  -> affected-row count (-1 for a batch)
-//!   say(value)    -> append a line to the run's report
+//!   query(sql)      rows as a sequence of column-keyed tables
+//!   query_one(sql)  the first row (or nil)
+//!   scalar(sql)     the first column of the first row (or nil)
+//!   execute(sql)    affected-row count (-1 for a batch)
+//!   exists(sql)     true when the query returns any row
+//!   columns(table)  the table's column names (sequence)
+//!   quote(s)        a single-quoted SQL literal
+//!   ident(s)        a double-quoted SQL identifier
+//!   say(v) / print(...)  append a line to the run's report
+//!   trim(s) split(s, sep) join(list, sep) now() assert(cond, msg)
+//!   json.encode(v) / json.decode(s)
 //!
 //! UI effects (rule 5) are queued, not performed, in a `ui` table:
 //! `ui.refresh()`, `ui.browse(t)`, `ui.query(name)`, `ui.report(name)`,
@@ -18,7 +26,7 @@ use std::cell::RefCell;
 
 use mlua::{Lua, Value};
 
-use crate::db::{DbLink, DbResult, PValue};
+use crate::db::{DbLink, DbResult, PValue, QueryResult};
 use crate::store;
 
 /// A queued UI request from a script. Mapped 1:1 onto the command bus
@@ -37,7 +45,7 @@ pub enum Effect {
 /// Everything a run produced.
 #[derive(Debug, Default)]
 pub struct Outcome {
-    /// `say(...)` lines, in order.
+    /// `say(...)`/`print(...)` lines, in order.
     pub messages: Vec<String>,
     /// Set by `error("...")`; a non-None value blocks a blocking event.
     pub error: Option<String>,
@@ -149,12 +157,115 @@ fn from_lua(v: &Value) -> PValue {
     }
 }
 
-/// Register the sandboxed `ui` table inside a `lua.scope` block. A
-/// macro (not a function) so the scope's inferred lifetimes flow through.
+/// One row as a table keyed by column name.
+fn row_to_lua(lua: &Lua, columns: &[String], row: &[PValue]) -> mlua::Result<Value> {
+    let t = lua.create_table()?;
+    for (i, cell) in row.iter().enumerate() {
+        if let Some(name) = columns.get(i) {
+            t.set(name.as_str(), to_lua(lua, cell)?)?;
+        }
+    }
+    Ok(Value::Table(t))
+}
+
+/// A query result as a sequence of row tables.
+fn rows_to_lua(lua: &Lua, q: &QueryResult) -> mlua::Result<Value> {
+    let t = lua.create_table()?;
+    for (ri, row) in q.rows.iter().enumerate() {
+        t.set(ri + 1, row_to_lua(lua, &q.columns, row)?)?;
+    }
+    Ok(Value::Table(t))
+}
+
+fn json_to_lua(lua: &Lua, j: &serde_json::Value) -> mlua::Result<Value> {
+    use serde_json::Value as J;
+    Ok(match j {
+        J::Null => Value::Nil,
+        J::Bool(b) => Value::Boolean(*b),
+        J::Number(n) => match n.as_i64() {
+            Some(i) => Value::Integer(i),
+            None => Value::Number(n.as_f64().unwrap_or(0.0)),
+        },
+        J::String(s) => Value::String(lua.create_string(s)?),
+        J::Array(a) => {
+            let t = lua.create_table()?;
+            for (i, x) in a.iter().enumerate() {
+                t.set(i + 1, json_to_lua(lua, x)?)?;
+            }
+            Value::Table(t)
+        }
+        J::Object(o) => {
+            let t = lua.create_table()?;
+            for (k, v) in o {
+                t.set(k.as_str(), json_to_lua(lua, v)?)?;
+            }
+            Value::Table(t)
+        }
+    })
+}
+
+fn lua_to_json(v: &Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::Nil => J::Null,
+        Value::Boolean(b) => J::Bool(*b),
+        Value::Integer(i) => J::Number((*i).into()),
+        Value::Number(n) => serde_json::Number::from_f64(*n)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        Value::String(s) => J::String(s.to_string_lossy().to_string()),
+        Value::Table(t) => table_to_json(t),
+        _ => J::Null,
+    }
+}
+
+fn table_to_json(t: &mlua::Table) -> serde_json::Value {
+    use serde_json::Value as J;
+    // A sequence table becomes an array; anything else an object.
+    let len = t.raw_len();
+    if len > 0 {
+        let mut arr = Vec::with_capacity(len);
+        let mut seq = true;
+        for i in 1..=len {
+            match t.raw_get::<Value>(i) {
+                Ok(Value::Nil) | Err(_) => {
+                    seq = false;
+                    break;
+                }
+                Ok(v) => arr.push(lua_to_json(&v)),
+            }
+        }
+        if seq {
+            return J::Array(arr);
+        }
+    }
+    let mut map = serde_json::Map::new();
+    for pair in t.clone().pairs::<Value, Value>().flatten() {
+        map.insert(lua_to_string(&pair.0), lua_to_json(&pair.1));
+    }
+    J::Object(map)
+}
+
+fn sql_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// A fresh sandbox with the resource caps applied.
+fn engine() -> Lua {
+    let lua = Lua::new();
+    // 32 MB of Lua heap is plenty for a menu action.
+    let _ = lua.set_memory_limit(32 * 1024 * 1024);
+    lua.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(200_000),
+        |_lua, _debug| Err(mlua::Error::RuntimeError("script exceeded budget".into())),
+    );
+    lua
+}
+
+/// Register the queued `ui` table inside a `lua.scope` block. A macro
+/// (not a function) so the scope's inferred lifetimes flow through.
 macro_rules! install_ui {
     ($scope:expr, $lua:expr, $effects:expr) => {{
-        // Bind the reference OUTSIDE the `move` closures so each captures
-        // a Copy of `&RefCell`, not the RefCell itself.
         let effects: &RefCell<Vec<Effect>> = $effects;
         let ui = $lua.create_table()?;
         ui.set(
@@ -210,16 +321,164 @@ macro_rules! install_ui {
     }};
 }
 
-/// A fresh sandbox with the resource caps applied.
-fn engine() -> Lua {
-    let lua = Lua::new();
-    // 32 MB of Lua heap is plenty for a menu action.
-    let _ = lua.set_memory_limit(32 * 1024 * 1024);
-    lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(200_000),
-        |_lua, _debug| Err(mlua::Error::RuntimeError("script exceeded budget".into())),
-    );
-    lua
+/// Register the shared data/helper globals. `$messages` receives output;
+/// `$effects` receives `ui.*`.
+macro_rules! install_host {
+    ($scope:expr, $lua:expr, $db:expr, $messages:expr, $effects:expr) => {{
+        // Bind references outside the `move` closures (see install_ui).
+        let messages: &RefCell<Vec<String>> = $messages;
+        let db: &dyn DbLink = $db;
+
+        $lua.globals().set(
+            "query",
+            $scope.create_function(|lua, sql: String| {
+                let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
+                rows_to_lua(lua, &q)
+            })?,
+        )?;
+        $lua.globals().set(
+            "query_one",
+            $scope.create_function(|lua, sql: String| {
+                let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
+                match q.rows.first() {
+                    Some(row) => row_to_lua(lua, &q.columns, row),
+                    None => Ok(Value::Nil),
+                }
+            })?,
+        )?;
+        $lua.globals().set(
+            "scalar",
+            $scope.create_function(|lua, sql: String| {
+                let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
+                match q.rows.first().and_then(|r| r.first()) {
+                    Some(v) => to_lua(lua, v),
+                    None => Ok(Value::Nil),
+                }
+            })?,
+        )?;
+        $lua.globals().set(
+            "execute",
+            $scope.create_function(|_, sql: String| {
+                let (n, _) = db.execute(&sql).map_err(mlua::Error::RuntimeError)?;
+                Ok(n)
+            })?,
+        )?;
+        $lua.globals().set(
+            "exists",
+            $scope.create_function(|_, sql: String| {
+                let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
+                Ok(!q.rows.is_empty())
+            })?,
+        )?;
+        $lua.globals().set(
+            "columns",
+            $scope.create_function(|lua, table: String| {
+                let q = db
+                    .query(&format!(
+                        "SELECT name FROM pragma_table_info({})",
+                        store::q(&table)
+                    ))
+                    .map_err(mlua::Error::RuntimeError)?;
+                let t = lua.create_table()?;
+                for (i, r) in q.rows.iter().enumerate() {
+                    if let Some(PValue::Text(n)) = r.first() {
+                        t.set(i + 1, n.as_str())?;
+                    }
+                }
+                Ok(t)
+            })?,
+        )?;
+        let say = $scope.create_function(|_, v: Value| {
+            messages.borrow_mut().push(lua_to_string(&v));
+            Ok(())
+        })?;
+        $lua.globals().set("say", say.clone())?;
+        $lua.globals().set(
+            "print",
+            $scope.create_function(|_, args: mlua::Variadic<Value>| {
+                let line = args.iter().map(lua_to_string).collect::<Vec<_>>().join(" ");
+                messages.borrow_mut().push(line);
+                Ok(())
+            })?,
+        )?;
+
+        $lua.globals().set(
+            "quote",
+            $scope.create_function(|_, s: String| Ok(store::q(&s)))?,
+        )?;
+        $lua.globals().set(
+            "ident",
+            $scope.create_function(|_, s: String| Ok(sql_ident(&s)))?,
+        )?;
+        $lua.globals().set(
+            "trim",
+            $scope.create_function(|_, s: String| Ok(s.trim().to_owned()))?,
+        )?;
+        $lua.globals().set(
+            "split",
+            $scope.create_function(|lua, (s, sep): (String, String)| {
+                let t = lua.create_table()?;
+                let parts: Vec<&str> = if sep.is_empty() {
+                    s.split_whitespace().collect()
+                } else {
+                    s.split(sep.as_str()).collect()
+                };
+                for (i, p) in parts.iter().enumerate() {
+                    t.set(i + 1, *p)?;
+                }
+                Ok(t)
+            })?,
+        )?;
+        $lua.globals().set(
+            "join",
+            $scope.create_function(|_, (list, sep): (mlua::Table, String)| {
+                let mut out: Vec<String> = Vec::new();
+                for v in list.sequence_values::<Value>() {
+                    out.push(lua_to_string(&v?));
+                }
+                Ok(out.join(&sep))
+            })?,
+        )?;
+        $lua.globals().set(
+            "now",
+            $scope.create_function(|_, ()| {
+                Ok(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0))
+            })?,
+        )?;
+        $lua.globals().set(
+            "assert",
+            $scope.create_function(|_, (cond, msg): (Value, Option<String>)| {
+                let truthy = !matches!(cond, Value::Nil | Value::Boolean(false));
+                if truthy {
+                    Ok(())
+                } else {
+                    Err(mlua::Error::RuntimeError(
+                        msg.unwrap_or_else(|| "assertion failed".to_owned()),
+                    ))
+                }
+            })?,
+        )?;
+
+        let json = $lua.create_table()?;
+        json.set(
+            "encode",
+            $scope.create_function(|_, v: Value| Ok(lua_to_json(&v).to_string()))?,
+        )?;
+        json.set(
+            "decode",
+            $scope.create_function(|lua, s: String| {
+                let j: serde_json::Value = serde_json::from_str(&s)
+                    .map_err(|e| mlua::Error::RuntimeError(format!("json: {e}")))?;
+                json_to_lua(lua, &j)
+            })?,
+        )?;
+        $lua.globals().set("json", json)?;
+
+        install_ui!($scope, $lua, $effects);
+    }};
 }
 
 // ── the runners ──────────────────────────────────────────────────────
@@ -232,35 +491,7 @@ pub fn run(db: &dyn DbLink, source: &str) -> Result<Outcome, String> {
     let effects: RefCell<Vec<Effect>> = RefCell::new(Vec::new());
 
     let result: mlua::Result<()> = lua.scope(|scope| {
-        // Data globals.
-        let query = scope.create_function(|lua, sql: String| {
-            let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
-            let table = lua.create_table()?;
-            for (ri, row) in q.rows.iter().enumerate() {
-                let rt = lua.create_table()?;
-                for (ci, cell) in row.iter().enumerate() {
-                    if let Some(name) = q.columns.get(ci) {
-                        rt.set(name.as_str(), to_lua(lua, cell)?)?;
-                    }
-                }
-                table.set(ri + 1, rt)?;
-            }
-            Ok(table)
-        })?;
-        let execute = scope.create_function(|_, sql: String| {
-            let (n, _) = db.execute(&sql).map_err(mlua::Error::RuntimeError)?;
-            Ok(n)
-        })?;
-        let say = scope.create_function(|_, msg: Value| {
-            messages.borrow_mut().push(lua_to_string(&msg));
-            Ok(())
-        })?;
-        let globals = lua.globals();
-        globals.set("query", query)?;
-        globals.set("execute", execute)?;
-        globals.set("say", say)?;
-        install_ui!(scope, lua, &effects);
-
+        install_host!(scope, lua, db, &messages, &effects);
         // A trailing expression is reported too, so `return #rows` works.
         let ret: Value = lua.load(source).eval()?;
         if !matches!(ret, Value::Nil) {
@@ -296,28 +527,7 @@ pub fn run_form_event(
     let failure: RefCell<Option<String>> = RefCell::new(None);
 
     let result: mlua::Result<()> = lua.scope(|scope| {
-        let query = scope.create_function(|lua, sql: String| {
-            let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
-            let table = lua.create_table()?;
-            for (ri, row) in q.rows.iter().enumerate() {
-                let rt = lua.create_table()?;
-                for (ci, cell) in row.iter().enumerate() {
-                    if let Some(name) = q.columns.get(ci) {
-                        rt.set(name.as_str(), to_lua(lua, cell)?)?;
-                    }
-                }
-                table.set(ri + 1, rt)?;
-            }
-            Ok(table)
-        })?;
-        let execute = scope.create_function(|_, sql: String| {
-            let (n, _) = db.execute(&sql).map_err(mlua::Error::RuntimeError)?;
-            Ok(n)
-        })?;
-        let say = scope.create_function(|_, msg: Value| {
-            messages.borrow_mut().push(lua_to_string(&msg));
-            Ok(())
-        })?;
+        install_host!(scope, lua, db, &messages, &effects);
         let error = scope.create_function(|_, msg: Value| {
             *failure.borrow_mut() = Some(lua_to_string(&msg));
             Ok(())
@@ -338,15 +548,11 @@ pub fn run_form_event(
         })?;
 
         let globals = lua.globals();
-        globals.set("query", query)?;
-        globals.set("execute", execute)?;
-        globals.set("say", say)?;
         globals.set("error", error)?;
         globals.set("get", get)?;
         globals.set("set", set)?;
         globals.set("field", field.map(str::to_owned))?;
         globals.set("is_new", inserting)?;
-        install_ui!(scope, lua, &effects);
         globals.set("record", record.clone())?;
 
         lua.load(source).exec()?;
@@ -479,6 +685,65 @@ mod tests {
     }
 
     #[test]
+    fn host_helpers() {
+        let db = db();
+        db.execute("INSERT INTO t(name) VALUES ('ada'), ('grace')")
+            .unwrap();
+        let out = run(
+            &db,
+            r#"
+            say(scalar("SELECT count(*) FROM t"))
+            say(query_one("SELECT name FROM t ORDER BY name").name)
+            say(exists("SELECT 1 FROM t WHERE name = 'ada'") and "yes" or "no")
+            say(trim("  hi  "))
+            say(join(split("a,b,c", ","), "-"))
+            say(quote("O'Brien"))
+            say(ident("odd name"))
+            assert(scalar("SELECT count(*) FROM t") == 2, "count wrong")
+            say(columns("t")[2])
+            "#,
+        )
+        .unwrap();
+        let msg = out.messages.join("\n");
+        assert!(msg.contains("\n2\n") || msg.starts_with('2'), "{msg}");
+        assert!(msg.contains("ada"), "{msg}");
+        assert!(msg.contains("yes"), "{msg}");
+        assert!(msg.contains("hi"), "{msg}");
+        assert!(msg.contains("a-b-c"), "{msg}");
+        assert!(msg.contains("'O''Brien'"), "{msg}");
+        assert!(msg.contains("\"odd name\""), "{msg}");
+        assert!(msg.contains("name"), "{msg}");
+    }
+
+    #[test]
+    fn json_round_trip() {
+        let db = db();
+        let out = run(
+            &db,
+            r#"
+            local v = json.decode('{"a":[1,2,3],"ok":true}')
+            say(v.a[2])
+            say(v.ok and "true" or "false")
+            say(json.encode({1, 2, 3}))
+            say(json.encode({name = "ada", n = 3}))
+            "#,
+        )
+        .unwrap();
+        let msg = out.messages.join("\n");
+        assert!(msg.contains("2"), "{msg}");
+        assert!(msg.contains("true"), "{msg}");
+        assert!(msg.contains("[1,2,3]"), "{msg}");
+        assert!(msg.contains("\"name\":\"ada\""), "{msg}");
+    }
+
+    #[test]
+    fn assert_blocks_on_false() {
+        let db = db();
+        let err = run(&db, r#"assert(1 == 2, "nope")"#).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
     fn form_event_can_block_and_set() {
         let db = db();
         let mut values = vec![
@@ -490,7 +755,7 @@ mod tests {
             if record.name == nil or record.name == "" then
                 error("name is required")
             else
-                set("name", string.gsub(record.name, "^%s*(.-)%s*$", "%1"))
+                set("name", trim(record.name))
                 say("trimmed to " .. record.name)
             end
         "#;
