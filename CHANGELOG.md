@@ -42,6 +42,11 @@
   from dbhealth's bloat check.
 - **Split orientation** (#18): `H` stacks the master above the detail
   pane (default stays side-by-side); the choice is remembered.
+- **Column resize & freeze** (the last `DESIGN.md` BROWSE goals): `+`/`-`
+  resize the current column — manual widths override auto-fit and persist
+  per table — and `f` freezes the columns up to the cursor so they stay
+  put while scrolling right (also persisted). Stored in `_phosphor_prefs`
+  as `width:<table>` / `freeze:<table>`; a new `columns` UI reel shows it.
 - **Read-only kiosk + app version** (#21): `--app --readonly` refuses
   every write centrally; `_phosphor_apps.version` migrates in place and
   shows in the menu title when above 1.

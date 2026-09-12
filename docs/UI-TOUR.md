@@ -13,6 +13,7 @@ python3 tools/demo/uitest.py --render   # assert everything, then render
 | reel | covers |
 |---|---|
 | ![nav](demo/ui/nav.gif) | first-letter seek, the internals toggle, browse motion (g/G, Home/End), read-only views |
+| ![columns](demo/ui/columns.gif) | column widths (`+`/`-`) and frozen columns (`f`) |
 | ![crud](demo/ui/crud.gif) | the painted card, editing a field, required-field refusal, insert, find, double-x delete |
 | ![prompt](demo/ui/prompt.gif) | SQL in the grid, error handling, Tab completion, all four themes |
 | ![qbe](demo/ui/qbe.gif) | Query By Example: filters, live (wrapping) SQL, run, save, replay by name |

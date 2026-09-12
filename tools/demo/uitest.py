@@ -488,6 +488,17 @@ def reels():
     r.key(ESC, 0.4).key(ESC, 0.5)
     out.append(r)
 
+    # ── C · column widths (+/-) and frozen columns (f) ───────────────
+    r = Reel("columns", "resize columns (+/-) and freeze them (f)")
+    r.key("o", 0.5).key(ENTER, 0.6).expect("BROWSE orders")
+    r.key("=", 0.5).expect("cells")                   # widen id
+    r.key("l", 0.3).key("=", 0.4).expect("cells")     # widen customer
+    r.key("f", 0.5).expect("frozen")                  # freeze through cursor
+    r.key("l", 0.3).key("l", 0.3)                     # scroll right; frozen stays
+    r.key("f", 0.5).expect("unfrozen")
+    r.key(ESC, 0.4)
+    out.append(r)
+
     # ── I · app mode: the database IS the application ────────────────
     r = Reel("appmode", "--app: menu · report · single-Esc home",
              argv=[BIN, "--app", DB])

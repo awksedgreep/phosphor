@@ -73,6 +73,9 @@ In the grid:
 
   · Arrow keys move cell by cell; PgUp/PgDn move a screenful;
     g jumps to the first row and G to the last.
+  · Columns fit their data. + and - resize the current column
+    (remembered per table), and f freezes the columns up to the
+    cursor so they stay put while you scroll right.
   · Enter opens the current row in EDIT — a record form. The form
     is LIVE: land on a field and just start typing (the old value
     is replaced). Enter commits — which also SAVES the record and
@@ -411,6 +414,7 @@ BROWSE grid
   ↑↓←→ / hjkl move · PgUp PgDn page · g G first/last row
   Home End first/last column · Enter edit row · a add row
   x (twice) delete row · n find next · F5 refresh
+  + / - column width · f freeze at cursor
   v split view · H stack split · Q qbe · R report · L labels
   F form · A applications · E table editor
 

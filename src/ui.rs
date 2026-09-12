@@ -999,10 +999,18 @@ fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
 
-    // Visible column window.
+    // Visible column window: frozen leading columns always render, then
+    // the scrolling window from max(col_off, frozen) (issue: 1988 BROWSE
+    // "freeze").
+    let frozen = g.frozen.min(g.columns.len());
+    let start = g.col_off.max(frozen);
     let mut cols: Vec<usize> = Vec::new();
     let mut used: u16 = 0;
-    for c in g.col_off..g.columns.len() {
+    for c in 0..frozen {
+        used = used.saturating_add(g.widths[c] + 1);
+        cols.push(c);
+    }
+    for c in start..g.columns.len() {
         let w = g.widths[c] + 1;
         if used + w > inner.width && !cols.is_empty() {
             break;

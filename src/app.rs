@@ -254,6 +254,12 @@ pub struct Grid {
     pub row_off: i64,
     pub col_off: usize,
     pub widths: Vec<u16>,
+    /// User-set widths by column name (`+`/`-`). Auto-fit never overrides
+    /// these, and they persist per table in `_phosphor_prefs`.
+    pub manual: HashMap<String, u16>,
+    /// 1988 "freeze": this many leading columns stay put while the rest
+    /// scroll right (`f` toggles; persisted per table).
+    pub frozen: usize,
 }
 
 impl Grid {
@@ -274,6 +280,10 @@ impl Grid {
             .iter()
             .enumerate()
             .map(|(c, name)| {
+                // A user-set width wins outright.
+                if let Some(&w) = self.manual.get(name) {
+                    return w;
+                }
                 let mut w = name.chars().count();
                 for row in self.cache.iter().take(WIDTH_SAMPLE) {
                     if let Some(v) = row.get(c) {
@@ -341,6 +351,10 @@ pub enum Command {
     },
     GridPage(i64),
     GridEdge(bool),
+    /// Widen/narrow the focused column by N cells (`+`/`-`).
+    ColWidth(i64),
+    /// Toggle frozen leading columns (`f`) at the cursor.
+    ToggleFreeze,
     GridTop,
     GridBottom,
     OpenEdit,
@@ -747,7 +761,18 @@ impl App {
                         row_off: 0,
                         col_off: 0,
                         widths: Vec::new(),
+                        manual: HashMap::new(),
+                        frozen: 0,
                     };
+                    // User-set widths and freezes come back ("my screen
+                    // comes back tomorrow").
+                    let table = match &grid.source {
+                        GridSource::Table { name, .. } => name.clone(),
+                        _ => String::new(),
+                    };
+                    if !table.is_empty() {
+                        apply_width_prefs(&mut grid, &table, self.db.link());
+                    }
                     grid.compute_widths();
                     self.grid = Some(grid);
                     self.focus = Focus::Grid;
@@ -778,6 +803,8 @@ impl App {
                         row_off: 0,
                         col_off: 0,
                         widths: Vec::new(),
+                        manual: HashMap::new(),
+                        frozen: 0,
                     };
                     grid.compute_widths();
                     self.grid = Some(grid);
@@ -967,6 +994,7 @@ impl App {
                         } => (parent.clone(), child.clone(), child_col.clone()),
                         _ => return,
                     };
+                    let child_for_prefs = child.clone();
                     state.grid.source = GridSource::Detail {
                         parent,
                         child,
@@ -981,6 +1009,7 @@ impl App {
                     g.rowids = None;
                     g.cur_row = g.cur_row.clamp(0, g.total.saturating_sub(1).max(0));
                     g.row_off = g.row_off.min(g.cur_row);
+                    apply_width_prefs(g, &child_for_prefs, self.db.link());
                     g.compute_widths();
                     self.last_ms = Some(took.as_secs_f64() * 1000.0);
                 }
@@ -1509,6 +1538,9 @@ impl App {
                 Char('a') | Insert => Command::OpenInsert,
                 Char('x') | Delete => Command::DeleteRow,
                 Char('n') => Command::FindNext,
+                Char('f') => Command::ToggleFreeze,
+                Char('+') | Char('=') => Command::ColWidth(2),
+                Char('-') => Command::ColWidth(-2),
                 F(5) => Command::Refresh,
                 Char('Q') => Command::OpenQbe(None),
                 Char('R') => Command::OpenReport(None),
@@ -1544,6 +1576,8 @@ impl App {
                 Enter => Command::OpenEdit,
                 Tab => Command::Focus(Focus::Grid),
                 Char('.') => Command::Focus(Focus::Prompt),
+                Char('+') | Char('=') => Command::ColWidth(2),
+                Char('-') => Command::ColWidth(-2),
                 _ => return None,
             }),
         }
@@ -1785,6 +1819,8 @@ impl App {
                     self.grid_jump(total.saturating_sub(1));
                 }
             }
+            Command::ColWidth(d) => self.adjust_col_width(d),
+            Command::ToggleFreeze => self.toggle_freeze(),
             Command::OpenEdit => self.open_edit(),
             Command::EditMove(d) => {
                 self.fold_editing_buffer();
@@ -3683,6 +3719,8 @@ impl App {
             row_off: 0,
             col_off: 0,
             widths: Vec::new(),
+            manual: HashMap::new(),
+            frozen: 0,
         };
         self.detail = Some(DetailState {
             grid,
@@ -3989,13 +4027,20 @@ impl App {
         if g.cur_row >= g.row_off + visible {
             g.row_off = g.cur_row - visible + 1;
         }
-        // Horizontal: slide col_off until the cursor column fits.
+        // Horizontal: slide col_off until the cursor column fits. Frozen
+        // leading columns never scroll away, so col_off never drops below
+        // `frozen` and their width counts against the viewport budget.
         if g.cur_col < g.col_off {
-            g.col_off = g.cur_col;
+            g.col_off = g.cur_col.max(g.frozen);
         }
+        if g.col_off < g.frozen {
+            g.col_off = g.frozen;
+        }
+        let frozen = g.frozen.min(g.columns.len());
+        let frozen_w: u16 = g.widths[..frozen].iter().map(|w| w + 1).sum();
         while g.col_off < g.cur_col {
             let used: u16 = g.widths[g.col_off..=g.cur_col].iter().map(|w| w + 1).sum();
-            if used <= self.visible_cols_width {
+            if used + frozen_w <= self.visible_cols_width {
                 break;
             }
             g.col_off += 1;
@@ -4005,6 +4050,76 @@ impl App {
         // split pane (single choke point — commands, find, refill and
         // the insert flip all funnel through here).
         self.refresh_detail();
+    }
+
+    /// `+`/`-`: resize the focused column; `-` never goes below 3 cells.
+    /// Manual widths persist per table and stop auto-fit from overriding.
+    fn adjust_col_width(&mut self, d: i64) {
+        if d == 0 {
+            return;
+        }
+        if self.focus == Focus::Detail {
+            let child = {
+                let Some(st) = &mut self.detail else { return };
+                let Some((name, new)) = resize_one(&mut st.grid, d) else {
+                    return;
+                };
+                let child = match &st.grid.source {
+                    GridSource::Detail { child, .. } => child.clone(),
+                    _ => String::new(),
+                };
+                if !child.is_empty() {
+                    persist_widths(self.db.link(), &child, &st.grid);
+                }
+                (name, new)
+            };
+            self.say(format!("{}: {} cells", child.0, child.1));
+            return;
+        }
+        let Some(g) = &mut self.grid else { return };
+        let Some((name, new)) = resize_one(g, d) else {
+            return;
+        };
+        let table = match &g.source {
+            GridSource::Table { name, .. } => name.clone(),
+            _ => String::new(),
+        };
+        if !table.is_empty() {
+            persist_widths(self.db.link(), &table, g);
+        }
+        self.say(format!("{name}: {new} cells"));
+    }
+
+    /// `f`: freeze the columns up to and including the cursor, or clear.
+    fn toggle_freeze(&mut self) {
+        let Some(g) = &mut self.grid else { return };
+        let n = g.columns.len();
+        if n == 0 {
+            return;
+        }
+        g.frozen = if g.frozen == 0 {
+            (g.cur_col + 1).min(n)
+        } else {
+            0
+        };
+        if g.col_off < g.frozen {
+            g.col_off = g.frozen;
+        }
+        let (frozen, table) = (
+            g.frozen,
+            match &g.source {
+                GridSource::Table { name, .. } => name.clone(),
+                _ => String::new(),
+            },
+        );
+        if !table.is_empty() {
+            persist_widths(self.db.link(), &table, g);
+        }
+        self.say(if frozen == 0 {
+            "columns unfrozen".to_owned()
+        } else {
+            format!("{frozen} column(s) frozen")
+        });
     }
 
     /// Virtualization: keep [row_off-OVERSCAN, row_off+visible+OVERSCAN)
@@ -5659,6 +5774,48 @@ impl App {
 /// An EDIT form's final values for a lifecycle script:
 /// (table, inserting, current field, column/value pairs).
 type EditValues = (String, bool, Option<String>, Vec<(String, PValue)>);
+
+/// Apply persisted column widths/freeze for `table` to a fresh Grid.
+/// Read-only path: a database without prefs keeps auto widths.
+fn apply_width_prefs(grid: &mut Grid, table: &str, db: &dyn DbLink) {
+    if let Some(s) = store::pref_get(db, &format!("width:{table}")) {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, u16>>(&s) {
+            for (name, w) in map {
+                if grid.columns.iter().any(|c| c == &name) {
+                    grid.manual.insert(name, w.clamp(3, 80));
+                }
+            }
+        }
+    }
+    if let Some(n) =
+        store::pref_get(db, &format!("freeze:{table}")).and_then(|s| s.parse::<usize>().ok())
+    {
+        grid.frozen = n.min(grid.columns.len());
+        if grid.col_off < grid.frozen {
+            grid.col_off = grid.frozen;
+        }
+    }
+}
+
+/// Persist a grid's manual widths and freeze for `table`.
+fn persist_widths(db: &dyn DbLink, table: &str, grid: &Grid) {
+    let json = serde_json::to_string(&grid.manual).unwrap_or_else(|_| "{}".to_owned());
+    store::pref_set(db, &format!("width:{table}"), &json);
+    store::pref_set(db, &format!("freeze:{table}"), &grid.frozen.to_string());
+}
+
+/// Resize the focused column by `d` cells; returns (name, new width).
+fn resize_one(g: &mut Grid, d: i64) -> Option<(String, u16)> {
+    let c = g.cur_col;
+    let name = g.columns.get(c)?.clone();
+    let cur = g.widths.get(c).copied().unwrap_or(8) as i64;
+    let new = (cur + d).clamp(3, 80) as u16;
+    if let Some(w) = g.widths.get_mut(c) {
+        *w = new;
+    }
+    g.manual.insert(name.clone(), new);
+    Some((name, new))
+}
 
 /// A fresh `calcN` column name for a newly added computed form field
 /// (must not collide with another spec field, or it would be read as a
@@ -7587,6 +7744,46 @@ mod tests {
             panic!("designer closed")
         };
         assert_eq!(st.spec.fields.len(), base);
+    }
+
+    /// Manual widths (`+`/`-`) and freeze (`f`) persist per table.
+    #[test]
+    fn column_resize_and_freeze_persist() {
+        let file = std::env::temp_dir().join(format!("phosphor-widths-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let path = file.to_str().unwrap().to_owned();
+        let saved_width;
+        {
+            let (db, _) = EmbeddedDb::open(&path).unwrap();
+            db.execute("CREATE TABLE w(id INTEGER PRIMARY KEY, a TEXT, b TEXT, c TEXT)")
+                .unwrap();
+            db.execute("INSERT INTO w(a,b,c) VALUES ('aaaaaaaaaa','bbbbbbbbbb','cccccccccc')")
+                .unwrap();
+            let mut a = App::new(Box::new(db), None);
+            a.apply(Command::OpenSelected);
+            a.sync();
+            a.apply(Command::GridMove { dr: 0, dc: 2 }); // column b
+            let before = a.grid.as_ref().unwrap().widths[2];
+            a.apply(Command::ColWidth(6));
+            a.apply(Command::ColWidth(6));
+            saved_width = a.grid.as_ref().unwrap().widths[2];
+            assert!(saved_width > before, "widen grows the column");
+            assert_eq!(a.grid.as_ref().unwrap().manual.get("b"), Some(&saved_width));
+            a.apply(Command::ToggleFreeze);
+            assert_eq!(a.grid.as_ref().unwrap().frozen, 3, "freeze through cursor");
+            assert!(a.grid.as_ref().unwrap().col_off >= 3);
+            // Moving left cannot scroll the frozen columns away.
+            a.apply(Command::GridMove { dr: 0, dc: -2 });
+            assert!(a.grid.as_ref().unwrap().col_off >= 3);
+        }
+        let (db2, _) = EmbeddedDb::open(&path).unwrap();
+        let mut b = App::new(Box::new(db2), None);
+        b.apply(Command::OpenSelected);
+        b.sync();
+        let g = b.grid.as_ref().unwrap();
+        assert_eq!(g.widths[2], saved_width, "manual width remembered");
+        assert_eq!(g.frozen, 3, "freeze remembered");
+        let _ = std::fs::remove_file(&file);
     }
 
     /// #18: `H` flips the split orientation and it is remembered.
