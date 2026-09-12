@@ -184,6 +184,10 @@ pub struct ColumnInfo {
     pub decl_type: String,
     pub notnull: bool,
     pub pk: bool,
+    /// Raw SQL text of the DEFAULT expression (e.g. `0`, `'abc'`),
+    /// as stored by pragma table_info — None when the column has no
+    /// default. Used by the TABLE EDITOR to round-trip constraints.
+    pub dflt_value: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,6 +240,41 @@ pub trait DbLink: Send {
     /// returns the new rowid.
     fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64>;
     fn delete_row(&self, table: &str, rowid: i64) -> DbResult<()>;
+    /// FK targets declared BY `table`: (from_col, to_table, to_col).
+    /// to_col is None when the FK references the parent's pk (bare
+    /// `REFERENCES parent`). Powers the TABLE EDITOR round-trip.
+    fn outgoing_fks(&self, table: &str) -> Vec<(String, String, Option<String>)> {
+        let q = self
+            .query(&format!(
+                "SELECT \"from\", \"table\", \"to\" FROM pragma_foreign_key_list({})",
+                sql_str(table)
+            ))
+            .unwrap_or_else(|_| QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                truncated: false,
+                elapsed: Duration::ZERO,
+            });
+        q.rows
+            .iter()
+            .filter_map(|r| match (r.first(), r.get(1), r.get(2)) {
+                (
+                    Some(PValue::Text(from)),
+                    Some(PValue::Text(to_table)),
+                    to_col,
+                ) => Some((
+                    from.clone(),
+                    to_table.clone(),
+                    match to_col {
+                        Some(PValue::Text(c)) => Some(c.clone()),
+                        _ => None,
+                    },
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Worst dbhealth_report status if the view exists and is readable
     /// ("ok" | "warn" | "attention" | "no data"), else None.
     fn health(&self) -> Option<String>;
@@ -584,6 +623,7 @@ impl DbLink for EmbeddedDb {
                     decl_type: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     notnull: r.get::<_, i64>(3)? != 0,
                     pk: r.get::<_, i64>(5)? != 0,
+                    dflt_value: r.get(4)?,
                 })
             })
             .map_err(|e| e.to_string())?;

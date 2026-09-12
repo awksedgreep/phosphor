@@ -181,41 +181,51 @@ fn draw_create(f: &mut Frame, app: &App) {
     let [rows_area, sql_area] =
         Layout::vertical([Constraint::Length(rows_h), Constraint::Fill(1)]).areas(inner);
     f.render_widget(Paragraph::new(lines), rows_area);
-    // The SQL that F2 will run: CREATE for a new table, the ALTER
-    // diff for an existing one (or the reason it can't be applied).
-    let empty_cols: Vec<crate::db::ColumnInfo> = Vec::new();
-    let sql_lines: Vec<Line> = match (&st.original, st.draft.diff_statements(
-        st.original.as_ref().map(|(_, c)| c).unwrap_or(&empty_cols),
-    )) {
-        (Some((orig_table, _)), Ok(stmts)) => {
-            let renamed = !st.draft.table.eq_ignore_ascii_case(orig_table);
-            let mut v = vec![Line::styled("CHANGES:", th.dim())];
-            if renamed {
-                v.push(Line::styled(
-                    format!(
-                        "ALTER TABLE {} RENAME TO {};",
-                        crate::creator::quote_ident(orig_table),
-                        crate::creator::quote_ident(&st.draft.table)
-                    ),
-                    th.bright(),
-                ));
+    // The SQL that F2 will run: CREATE for a new table, the compiled
+    // script (ALTERs or the rebuild) for an existing one — or the
+    // reason it can't be applied.
+    let empty_schema = crate::creator::EditorSchema {
+        table: String::new(),
+        columns: Vec::new(),
+        fks: Vec::new(),
+    };
+    let default_schema = &empty_schema;
+    let schema = st.original.as_ref().unwrap_or(default_schema);
+    let sql_lines: Vec<Line> = if st.original.is_some() {
+        // TABLE EDITOR: preview the compiled script (ALTERs or the
+        // rebuild) — or the reason it can't be applied.
+        match st.draft.apply_script(schema, &[]) {
+            Ok(stmts) => {
+                let renamed = !st.draft.table.eq_ignore_ascii_case(&schema.table);
+                let mut v = vec![Line::styled("CHANGES:", th.dim())];
+                if renamed {
+                    v.push(Line::styled(
+                        format!(
+                            "ALTER TABLE {} RENAME TO {};",
+                            crate::creator::quote_ident(&schema.table),
+                            crate::creator::quote_ident(&st.draft.table)
+                        ),
+                        th.bright(),
+                    ));
+                }
+                if stmts.is_empty() && !renamed {
+                    v.push(Line::styled("(no changes)", th.dim()));
+                }
+                for s in &stmts {
+                    v.push(Line::styled(format!("{s};"), th.bright()));
+                }
+                v
             }
-            if stmts.is_empty() && !renamed {
-                v.push(Line::styled("(no changes)", th.dim()));
-            }
-            for s in &stmts {
-                v.push(Line::styled(format!("{s};"), th.bright()));
-            }
-            v
+            Err(e) => vec![
+                Line::styled("CHANGES:", th.dim()),
+                Line::styled(e, th.error()),
+            ],
         }
-        (Some(_), Err(e)) => vec![
-            Line::styled("CHANGES:", th.dim()),
-            Line::styled(e, th.error()),
-        ],
-        _ => vec![
+    } else {
+        vec![
             Line::styled("SQL:", th.dim()),
             Line::styled(st.draft.sql(), th.bright()),
-        ],
+        ]
     };
     f.render_widget(
         Paragraph::new(sql_lines).wrap(ratatui::widgets::Wrap { trim: false }),

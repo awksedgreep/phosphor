@@ -2034,7 +2034,12 @@ impl App {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
-        self.overlay = Overlay::Create(CreateState::edit_existing(&name, cols));
+        let fks = self.db.outgoing_fks(&name);
+        self.overlay = Overlay::Create(CreateState::edit_existing(crate::creator::EditorSchema {
+            table: name,
+            columns: cols,
+            fks,
+        }));
     }
 
     fn create_toggle(&mut self, f: impl FnOnce(&mut crate::creator::FieldDef)) {
@@ -2491,32 +2496,38 @@ impl App {
             }
             Overlay::Create(st) => {
                 let draft = st.draft.clone();
-                let original = st.original.clone();
-                match original {
-                    // TABLE EDITOR: apply the diff as ALTER statements.
-                    Some((orig_table, orig_cols)) => {
+                let schema = st.original.clone();
+                match schema {
+                    // TABLE EDITOR: apply the compiled script (ALTERs,
+                    // or the rebuild — both transactional).
+                    Some(schema) => {
                         let table = draft.table.clone();
-                        let renamed = !table.eq_ignore_ascii_case(&orig_table);
-                        match draft.diff_statements(&orig_cols) {
-                            Ok(stmts) if stmts.is_empty() && !renamed => {
+                        // Capture index definitions BEFORE applying: a
+                        // rebuild drops them with the old table.
+                        let idx_sql: Vec<String> = self
+                            .db
+                            .query(&format!(
+                                "SELECT sql FROM sqlite_master WHERE type = 'index' \
+                                 AND tbl_name = {} AND sql IS NOT NULL",
+                                crate::store::q(&schema.table)
+                            ))
+                            .map(|q| {
+                                q.rows
+                                    .iter()
+                                    .filter_map(|r| match r.first() {
+                                        Some(PValue::Text(t)) => Some(t.clone()),
+                                        _ => None,
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        match draft.apply_script(&schema, &idx_sql) {
+                            Ok(lines) if lines.is_empty() => {
                                 self.say("no structural changes to apply");
                             }
-                            Ok(stmts) => {
-                                // Atomic: one failed ALTER must not
-                                // leave the table half-migrated.
-                                let mut sql = String::from("BEGIN;\n");
-                                if renamed {
-                                    sql.push_str(&format!(
-                                        "ALTER TABLE {} RENAME TO {};\n",
-                                        crate::creator::quote_ident(&orig_table),
-                                        crate::creator::quote_ident(&table)
-                                    ));
-                                }
-                                for stmt in &stmts {
-                                    sql.push_str(stmt);
-                                    sql.push_str(";\n");
-                                }
-                                sql.push_str("COMMIT;");
+                            Ok(lines) => {
+                                let count = lines.len();
+                                let sql = lines.join(";\n");
                                 match self.db.execute(&sql) {
                                     Ok((_, elapsed)) => {
                                         self.last_ms =
@@ -2527,13 +2538,17 @@ impl App {
                                         self.open_table(&table);
                                         self.say(format!(
                                             "applied {} change(s) to {table:?}",
-                                            stmts.len() + usize::from(renamed)
+                                            count
                                         ));
                                     }
                                     Err(e) => {
                                         // The batch aborted before COMMIT:
-                                        // roll back so nothing partial stays.
-                                        let _ = self.db.execute("ROLLBACK");
+                                        // roll back so nothing partial
+                                        // stays, and restore FK enforcement
+                                        // (the rebuild toggles it OFF).
+                                        let _ = self
+                                            .db
+                                            .execute("ROLLBACK; PRAGMA foreign_keys = ON");
                                         self.err(e);
                                     }
                                 }
@@ -5273,21 +5288,25 @@ mod tests {
     /// The editor declines a type change on an existing column with a
     /// clear message instead of a raw SQLite error.
     #[test]
-    fn table_editor_declines_type_change() {
+    fn table_editor_rebuilds_type_change() {
         let (db, _) = EmbeddedDb::open(":memory:").unwrap();
         db.execute("CREATE TABLE things(id INTEGER PRIMARY KEY, size TEXT);")
             .unwrap();
+        db.execute("INSERT INTO things(size) VALUES ('big')").unwrap();
         let mut a = App::new(Box::new(db), None);
         a.apply(Command::OpenSelected);
         a.sync();
         a.apply(Command::OpenTableEditor);
         a.apply(Command::DesignerCycle); // TEXT -> REAL: a type change
         a.apply(Command::DesignerRun);
-        assert!(matches!(a.overlay, Overlay::Create(_)), "stays open");
-        assert!(a
-            .status
-            .as_ref()
-            .is_some_and(|(m, _)| m.contains("rebuild")));
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::None), "applied and closed");
+        // The rebuild re-declared the column and preserved the row.
+        let cols = a.db.columns("things").unwrap();
+        assert_eq!(cols[1].decl_type.to_ascii_uppercase(), "REAL");
+        let q = a.db.query("SELECT size FROM things").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Text("big".into()));
+        assert!(a.status.as_ref().is_some_and(|(m, _)| m.contains("applied")));
     }
 
     #[test]

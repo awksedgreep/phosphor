@@ -239,6 +239,10 @@ impl DbLink for RemoteDb {
                 },
                 notnull: matches!(&r[3], PValue::Int(n) if *n != 0),
                 pk: matches!(&r[5], PValue::Int(n) if *n != 0),
+                dflt_value: match &r[4] {
+                    PValue::Text(t) => Some(t.clone()),
+                    _ => None,
+                },
             })
             .collect())
     }
