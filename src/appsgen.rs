@@ -159,6 +159,41 @@ pub fn set_item_ref(db: &dyn DbLink, item_id: i64, action_ref: &str) -> DbResult
     .map(|_| ())
 }
 
+/// Rename an app (items link by id, so links survive). Errors if the
+/// target name is already taken by a *different* app. A never-saved
+/// default app (`old` has no row) is simply created under `new`.
+pub fn rename_app(db: &dyn DbLink, old: &str, new: &str) -> DbResult<()> {
+    if old == new {
+        return Ok(());
+    }
+    store::ensure(db)?;
+    let taken = db
+        .query(&format!(
+            "SELECT id FROM _phosphor_apps WHERE name = {}",
+            store::q(new)
+        ))
+        .map(|q| !q.rows.is_empty())
+        .unwrap_or(false);
+    if taken {
+        return Err(format!("an app named {new:?} already exists"));
+    }
+    let exists = app_id(db, old).is_some();
+    if exists {
+        db.execute(&format!(
+            "UPDATE _phosphor_apps SET name = {} WHERE name = {}",
+            store::q(new),
+            store::q(old)
+        ))
+        .map(|_| ())
+    } else {
+        db.execute(&format!(
+            "INSERT INTO _phosphor_apps(name) VALUES ({})",
+            store::q(new)
+        ))
+        .map(|_| ())
+    }
+}
+
 pub fn delete_item(db: &dyn DbLink, item_id: i64) -> DbResult<()> {
     db.execute(&format!("DELETE FROM _phosphor_items WHERE id = {item_id}"))
         .map(|_| ())
@@ -184,6 +219,8 @@ pub struct AppDesignState {
     pub editing: Option<String>,
     /// true → editing action_ref, false → editing label.
     pub editing_ref: bool,
+    /// true → the buffer edits the app's name (`r`).
+    pub renaming_app: bool,
 }
 
 /// Runtime state: the menu end users drive.

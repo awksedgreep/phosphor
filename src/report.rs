@@ -436,6 +436,11 @@ pub struct ReportState {
     pub editing: Option<String>,
     /// Columns of the current source (group_by cycles through these).
     pub columns: Vec<String>,
+    /// True while the F6 "save as" prompt owns the buffer.
+    pub naming: bool,
+    /// The name this report was loaded under (None when it is unsaved),
+    /// so a rename can retire the old catalog row.
+    pub original_name: Option<String>,
 }
 
 #[cfg(test)]

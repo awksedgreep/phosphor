@@ -375,6 +375,8 @@ pub enum Command {
     },
     /// Open the multi-line Lua editor for the selected menu item's script.
     OpenSelectedScript,
+    /// Applications Generator: rename the current app (`r`).
+    RenameApp,
     ScriptChar(char),
     ScriptTab,
     ScriptNewline,
@@ -1034,6 +1036,28 @@ impl App {
         self.fks_cache.clear();
         self.pane_cache.clear();
         self.health_cache = None;
+        // A dropped/renamed browsed table would leave a zombie grid
+        // (stale title + cached rows, quiet "no such table" refills):
+        // close it and send the user back to the sidebar (issue #10).
+        let gone = match &self.grid {
+            Some(Grid {
+                source: GridSource::Table { name, .. },
+                ..
+            }) => !self
+                .tables
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case(name)),
+            _ => false,
+        };
+        if gone {
+            self.grid = None;
+            self.pending_page = None;
+            self.close_detail();
+            if matches!(self.focus, Focus::Grid | Focus::Detail) {
+                self.focus = Focus::Sidebar;
+            }
+            self.say("the browsed table is gone — back to the table list");
+        }
     }
 
     /// Health-dot TTL: re-query at most every 30 s between writes.
@@ -1363,6 +1387,7 @@ impl App {
                 (None, Char('c')) => Command::DesignerCycle,
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, Char('e') | Tab) => Command::DesignerEditAlt,
+                (None, Char('r')) => Command::RenameApp,
                 (None, Char('E')) => Command::OpenSelectedScript,
                 (None, Char('[')) => Command::DesignerSwap(-1),
                 (None, Char(']')) => Command::DesignerSwap(1),
@@ -1809,13 +1834,20 @@ impl App {
                 self.fold_editing_buffer();
                 // A field was committed: the OnChange moment (rule 4).
                 let _ = self.run_edit_script("OnChange", false, false);
+                // An untouched NEW form must not INSERT on Enter: the
+                // first Enter just advances (issue #11). F10/Ctrl-S still
+                // inserts a defaults-only row if the user really wants it.
+                let can_autosave = match &self.overlay {
+                    Overlay::Edit(ed) => ed.dirty() || !ed.inserting,
+                    _ => true,
+                };
                 if let Overlay::Edit(ed) = &mut self.overlay {
                     let n = ed.fields.len();
                     if n > 0 {
                         ed.cursor = (ed.cursor + 1) % n;
                     }
                 }
-                if self.edit_required_ok() {
+                if self.edit_required_ok() && can_autosave {
                     // Already validated quietly; skip the loud re-check
                     // inside commit_edit to avoid a second PValue::parse
                     // per required field.
@@ -1942,6 +1974,7 @@ impl App {
             }
             Command::OpenFormScript { table, event } => self.open_form_script(table, event),
             Command::OpenSelectedScript => self.open_selected_item_script(),
+            Command::RenameApp => self.rename_app_begin(),
             Command::ScriptChar(c) => self.script_char(c),
             Command::ScriptTab => {
                 self.script_char(' ');
@@ -2029,9 +2062,15 @@ impl App {
                 st.editing = None;
                 st.naming = false;
             }
-            Overlay::Report(st) if st.editing.is_some() => st.editing = None,
+            Overlay::Report(st) if st.editing.is_some() => {
+                st.editing = None;
+                st.naming = false;
+            }
             Overlay::Form(st) if st.editing.is_some() => st.editing = None,
-            Overlay::Apps(st) if st.editing.is_some() => st.editing = None,
+            Overlay::Apps(st) if st.editing.is_some() => {
+                st.editing = None;
+                st.renaming_app = false;
+            }
             Overlay::Create(st) if st.editing.is_some() => {
                 st.editing = None;
                 st.slot = crate::creator::EditSlot::Name;
@@ -2477,14 +2516,21 @@ impl App {
             return self.err("report: no table selected (report <table-or-saved-name>)");
         };
         // A saved report by this name wins; otherwise start from the table.
-        let spec =
-            ReportSpec::load(self.db.link(), &name).unwrap_or_else(|| ReportSpec::for_table(&name));
+        let (spec, original_name) = match ReportSpec::load(self.db.link(), &name) {
+            Some(s) => {
+                let n = s.name.clone();
+                (s, Some(n))
+            }
+            None => (ReportSpec::for_table(&name), None),
+        };
         let columns = self.source_columns(&spec);
         self.overlay = Overlay::Report(ReportState {
             spec,
             cursor: 0,
             editing: None,
             columns,
+            naming: false,
+            original_name,
         });
     }
 
@@ -2660,6 +2706,7 @@ impl App {
             Overlay::Apps(st) => {
                 if let Some(item) = st.items.get(st.cursor) {
                     st.editing_ref = false;
+                    st.renaming_app = false;
                     st.editing = Some(item.label.clone());
                 }
             }
@@ -2685,6 +2732,7 @@ impl App {
             Overlay::Apps(st) => {
                 if let Some(item) = st.items.get(st.cursor) {
                     st.editing_ref = true;
+                    st.renaming_app = false;
                     st.editing = Some(item.action_ref.clone());
                 }
             }
@@ -2834,6 +2882,8 @@ impl App {
 
     fn designer_commit(&mut self) {
         let mut save_as: Option<String> = None;
+        let mut save_report = false;
+        let mut app_rename: Option<String> = None;
         match &mut self.overlay {
             Overlay::Qbe(st) => {
                 if let Some(buf) = st.editing.take() {
@@ -2848,7 +2898,16 @@ impl App {
                 }
             }
             Overlay::Report(st) => {
-                if let Some(buf) = st.editing.take() {
+                if st.naming {
+                    st.naming = false;
+                    if let Some(buf) = st.editing.take() {
+                        let n = buf.trim().to_owned();
+                        if !n.is_empty() {
+                            st.spec.name = n;
+                        }
+                    }
+                    save_report = true;
+                } else if let Some(buf) = st.editing.take() {
                     match st.cursor {
                         0 => st.spec.title = buf,
                         1 => {
@@ -2887,7 +2946,13 @@ impl App {
             }
             Overlay::Apps(st) => {
                 if let Some(buf) = st.editing.take() {
-                    if let Some(item) = st.items.get_mut(st.cursor) {
+                    if st.renaming_app {
+                        st.renaming_app = false;
+                        let new = buf.trim().to_owned();
+                        if !new.is_empty() && new != st.app {
+                            app_rename = Some(new);
+                        }
+                    } else if let Some(item) = st.items.get_mut(st.cursor) {
                         if st.editing_ref {
                             item.action_ref = buf;
                         } else {
@@ -2937,6 +3002,50 @@ impl App {
             match st.spec.save(self.db.link(), name) {
                 Ok(()) => self.say(format!("saved query {name:?} (run {name})")),
                 Err(e) => self.err(e),
+            }
+        }
+        if save_report {
+            let payload = match &self.overlay {
+                Overlay::Report(st) => Some((st.spec.clone(), st.original_name.clone())),
+                _ => None,
+            };
+            if let Some((spec, old)) = payload {
+                match spec.save(self.db.link()) {
+                    Ok(()) => {
+                        // A rename retires the old catalog row.
+                        if let Some(old) = old.filter(|o| o != &spec.name) {
+                            let _ = self.db.execute(&format!(
+                                "DELETE FROM _phosphor_reports WHERE name = {}",
+                                crate::store::q(&old)
+                            ));
+                        }
+                        if let Overlay::Report(st) = &mut self.overlay {
+                            st.original_name = Some(spec.name.clone());
+                        }
+                        self.say(format!(
+                            "saved report {:?} (report {})",
+                            spec.name, spec.name
+                        ));
+                    }
+                    Err(e) => self.err(e),
+                }
+            }
+        }
+        if let Some(new) = app_rename {
+            let old = match &self.overlay {
+                Overlay::Apps(st) => Some(st.app.clone()),
+                _ => None,
+            };
+            if let Some(old) = old {
+                match appsgen::rename_app(self.db.link(), &old, &new) {
+                    Ok(()) => {
+                        if let Overlay::Apps(st) = &mut self.overlay {
+                            st.app = new.clone();
+                        }
+                        self.say(format!("app renamed to {new:?}"));
+                    }
+                    Err(e) => self.err(e),
+                }
             }
         }
     }
@@ -3165,14 +3274,11 @@ impl App {
                 st.editing = Some(String::new());
             }
             Overlay::Report(st) => {
-                let spec = st.spec.clone();
-                match spec.save(self.db.link()) {
-                    Ok(()) => self.say(format!(
-                        "saved report {:?} (report {})",
-                        spec.name, spec.name
-                    )),
-                    Err(e) => self.err(e),
-                }
+                // F6 prompts for a name (prefilled), so reports can be
+                // renamed and several can share a source (issue #8).
+                st.naming = true;
+                st.editing = Some(st.spec.name.clone());
+                self.editor_fresh = true; // first keystroke replaces it
             }
             Overlay::Form(st) => {
                 let spec = st.spec.clone();
@@ -3342,7 +3448,18 @@ impl App {
             cursor: 0,
             editing: None,
             editing_ref: false,
+            renaming_app: false,
         });
+    }
+
+    /// `r` in the Applications Generator: type the app's name.
+    fn rename_app_begin(&mut self) {
+        self.editor_fresh = true;
+        if let Overlay::Apps(st) = &mut self.overlay {
+            st.renaming_app = true;
+            st.editing_ref = false;
+            st.editing = Some(st.app.clone());
+        }
     }
 
     fn open_app_menu(&mut self, name: Option<String>) {
@@ -6025,6 +6142,35 @@ mod tests {
         assert_eq!(counts, vec![2, 1]);
     }
 
+    /// #8: report F6 prompts for a name; renaming retires the old row.
+    #[test]
+    fn report_save_as_names_and_renames() {
+        let mut a = app();
+        a.apply(Command::OpenReport(Some("t".into())));
+        a.apply(Command::DesignerSave); // opens the name prompt
+        for c in "monthly".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        let Overlay::Report(st) = &a.overlay else {
+            panic!("designer closed")
+        };
+        assert_eq!(st.spec.name, "monthly");
+        let names = crate::store::names(a.db.link(), "_phosphor_reports", "name");
+        assert!(names.contains(&"monthly".to_owned()), "{names:?}");
+        assert!(!names.contains(&"t".to_owned()), "{names:?}");
+
+        // Rename again: the old catalog row is retired.
+        a.apply(Command::DesignerSave);
+        for c in "quarterly".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        let names = crate::store::names(a.db.link(), "_phosphor_reports", "name");
+        assert!(names.contains(&"quarterly".to_owned()), "{names:?}");
+        assert!(!names.contains(&"monthly".to_owned()), "{names:?}");
+    }
+
     #[test]
     fn report_preview_through_the_bus() {
         let mut a = app();
@@ -6236,6 +6382,56 @@ mod tests {
         a.apply(Command::DeleteRow); // re-arm on new row
         a.apply(Command::DeleteRow); // fire
         assert_eq!(a.grid.as_ref().unwrap().total, 500);
+    }
+
+    /// #11: Enter on an untouched NEW form advances but does not INSERT
+    /// an all-NULL placeholder row.
+    #[test]
+    fn enter_on_untouched_new_form_does_not_insert() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().total, 500);
+        a.apply(Command::OpenInsert);
+        let n = match &a.overlay {
+            Overlay::Edit(ed) => ed.fields.len(),
+            _ => panic!("insert form did not open"),
+        };
+        for _ in 0..n {
+            a.apply(Command::EditCommitField); // Enter with nothing typed
+        }
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().total, 500, "no phantom row");
+        assert!(
+            matches!(&a.overlay, Overlay::Edit(ed) if ed.inserting),
+            "form stays in NEW"
+        );
+        // Typing a value then Enter does insert.
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        for c in "real".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().total, 501);
+    }
+
+    /// #10: dropping the browsed table closes the zombie grid instead of
+    /// leaving stale rows and quiet refill errors.
+    #[test]
+    fn dropping_the_browsed_table_closes_the_grid() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        assert!(a.grid.is_some());
+        for c in "drop table t".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(a.grid.is_none(), "zombie grid must close");
+        assert_eq!(a.focus, Focus::Sidebar);
     }
 
     #[test]
@@ -6889,6 +7085,37 @@ mod tests {
         a.apply(Command::ToggleInternals);
         let all: Vec<String> = a.visible_tables().iter().map(|t| t.name.clone()).collect();
         assert!(all.iter().any(|n| n == "_phosphor_apps"), "{all:?}");
+    }
+
+    /// #7: an app can be named/renamed with `r`; items survive the rename.
+    #[test]
+    fn app_can_be_named_and_renamed() {
+        let mut a = app();
+        a.apply(Command::OpenApps(None)); // default name "app"
+        a.apply(Command::RenameApp);
+        for c in "crm".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        let Overlay::Apps(st) = &a.overlay else {
+            panic!("designer closed")
+        };
+        assert_eq!(st.app, "crm");
+        assert_eq!(appsgen::list_apps(a.db.link()), ["crm"]);
+        a.apply(Command::DesignerAdd); // an item under crm
+        assert_eq!(appsgen::items(a.db.link(), "crm").len(), 1);
+
+        a.apply(Command::RenameApp);
+        for c in "sales".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        assert_eq!(appsgen::list_apps(a.db.link()), ["sales"]);
+        assert_eq!(
+            appsgen::items(a.db.link(), "sales").len(),
+            1,
+            "items follow"
+        );
     }
 
     #[test]

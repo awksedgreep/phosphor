@@ -192,8 +192,9 @@ wide enough for their own totals.
 
 F2 previews the report in a pager: arrows and PgUp/PgDn scroll,
 w writes the report to a text file, p sends it to a printer
-(lp, or $PHOSPHOR_PRINT), Esc returns. F6 saves the design;
-application menus can run it by name.
+(lp, or $PHOSPHOR_PRINT), Esc returns. F6 asks for a name and
+saves the design (rename by typing a new one); application menus
+can run it by name.
 
 Labels: press L on a table for mailing labels, three across, every
 visible column on its own line — Avery energy, zero configuration.
@@ -251,9 +252,10 @@ Each menu item has a label, a kind, and a target:
   script    a one-line Lua script: query(sql), execute(sql), say(v)
 
 In the designer: n adds an item, Enter edits the label, e edits the
-target, c cycles the kind, [ and ] reorder, x deletes. For a
-`script` item, E opens the full Lua editor (see Scripting). All
-changes save as you go. F2 opens the live menu to try it.
+target, c cycles the kind, [ and ] reorder, x deletes, and r
+renames the app itself. For a `script` item, E opens the full Lua
+editor (see Scripting). All changes save as you go. F2 opens the
+live menu to try it.
 
 The menu itself is pure 1988: arrow keys and Enter, or press the
 bright first letter of an item to run it instantly.
@@ -408,8 +410,8 @@ Designers
   qbe:  Space show · Enter filter · s sort · J join · g group
   table: type names · F3 type · F4 pk · F5 not-null · F6 unique
          F7 default · F8 add · F9 delete · [ ] move · F2 apply
-  report: Enter edit title/source/group · Space cycle · F2 preview
-  apps: n new · Enter label · e target · E script · c kind · F2 run
+  report: Enter edit · Space cycle group · F2 preview · F6 save-as
+  apps: n new · Enter label · e target · r name · E script · F2 run
 
 Dot prompt
   Enter run · ↑↓ history · Tab complete

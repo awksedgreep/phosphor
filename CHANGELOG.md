@@ -76,6 +76,16 @@
   only the database.
 
 ### Fixed
+- **#11**: Enter on an untouched NEW form no longer INSERTs an all-NULL
+  placeholder row; it just advances. F10/Ctrl-S still inserts a
+  defaults-only row when asked.
+- **#10**: dropping the browsed table closes the zombie grid (stale
+  title/rows, quiet "no such table" refills) and returns to the sidebar.
+- **#8**: the report designer's F6 now prompts for a name (prefilled)
+  instead of saving instantly under the table name; renaming retires the
+  old `_phosphor_reports` row, so a source can feed several reports.
+- **#7**: the Applications Generator can name/rename the app with `r`
+  (items link by id, so they survive); the menu title follows.
 - `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).
 - TABLE EDITOR `ALTER TABLE RENAME` + `DROP/ADD COLUMN` targeting the old name after a table rename (now targets the live name); column renames already handled.
 - `DbHandle::call` buffering `Duration::ZERO` for async responses arriving during a sync call (now preserves worker-measured latency).

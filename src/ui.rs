@@ -491,17 +491,25 @@ fn draw_apps(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " n new · x del · Enter label · e target · E script · c kind · F2 run ",
+            " n new · x del · Enter label · e target · E script · r name · c kind · F2 run ",
             th.dim(),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut lines = vec![Line::from(vec![
+    let mut lines = Vec::new();
+    if st.renaming_app {
+        lines.push(Line::from(vec![
+            Span::styled("app name: ", th.bright()),
+            editing_span(st.editing.as_deref().unwrap_or(""), 0, th),
+        ]));
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::from(vec![
         Span::styled(pad("LABEL", 24), th.dim()),
         Span::styled(pad("KIND", 8), th.dim()),
         Span::styled("TARGET (table · query/report · SQL · Lua)", th.dim()),
-    ])];
+    ]));
     for (i, item) in st.items.iter().enumerate() {
         let selected = i == st.cursor;
         let style = if selected { th.cursor() } else { th.base() };
@@ -696,7 +704,7 @@ fn draw_report(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " Enter edit · Space cycle group · F2 preview · F6 save · Esc ",
+            " Enter edit · Space cycle group · F2 preview · F6 save-as · Esc ",
             th.dim(),
         ));
     let inner = block.inner(area);
@@ -712,7 +720,7 @@ fn draw_report(f: &mut Frame, app: &App) {
     ];
     let mut lines = Vec::new();
     for (i, (label, value)) in fields.iter().enumerate() {
-        let selected = i == st.cursor;
+        let selected = i == st.cursor && !st.naming;
         let value_span = match (selected, &st.editing) {
             (true, Some(buf)) => editing_span(buf, 0, th),
             _ => Span::styled(
@@ -728,11 +736,19 @@ fn draw_report(f: &mut Frame, app: &App) {
             value_span,
         ]));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "numeric columns total automatically; grouping adds bands + subtotals",
-        th.dim(),
-    ));
+    if st.naming {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("save as : ", th.bright()),
+            editing_span(st.editing.as_deref().unwrap_or(""), 0, th),
+        ]));
+    } else {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "numeric columns total automatically; grouping adds bands + subtotals",
+            th.dim(),
+        ));
+    }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
