@@ -13,6 +13,9 @@ pub enum ActionKind {
     Query,
     Report,
     Sql,
+    /// A one-line Lua script (docs: `src/script.rs`): `query`, `execute`,
+    /// and `say` are the sandboxed surface.
+    Script,
 }
 
 impl ActionKind {
@@ -21,7 +24,8 @@ impl ActionKind {
             ActionKind::Browse => ActionKind::Query,
             ActionKind::Query => ActionKind::Report,
             ActionKind::Report => ActionKind::Sql,
-            ActionKind::Sql => ActionKind::Browse,
+            ActionKind::Sql => ActionKind::Script,
+            ActionKind::Script => ActionKind::Browse,
         }
     }
 
@@ -31,6 +35,7 @@ impl ActionKind {
             ActionKind::Query => "query",
             ActionKind::Report => "report",
             ActionKind::Sql => "sql",
+            ActionKind::Script => "script",
         }
     }
 
@@ -39,6 +44,7 @@ impl ActionKind {
             "query" => ActionKind::Query,
             "report" => ActionKind::Report,
             "sql" => ActionKind::Sql,
+            "script" => ActionKind::Script,
             _ => ActionKind::Browse,
         }
     }

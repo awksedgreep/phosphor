@@ -43,7 +43,7 @@ affiliation or compatibility is implied or intended.)
 | `PROTECT` (users/passwords) | Delegated to deployment: file permissions (embedded) or sqld auth (network) | phosphor is not an auth system |
 | Function keys, status bar | F1 help, F2 data, F10 menu, Esc backs out, status bar with db/latency/health dot | keyboard-first, mouse tolerated |
 | `SET` commands | A `set` command namespace at the dot prompt (`set theme amber`) | persisted per-user |
-| dBASE language (`DO WHILE`, `.prg`) | **Not revived in v1.** SQL + the menu/action layer covers the 90% case | a scripting hook (Lua?) is a later, separate decision |
+| dBASE language (`DO WHILE`, `.prg`) | **Not revived in v1.** SQL + the menu/action layer covers the 90% case | a Lua scripting hook landed after v1 (slice 1: `script` menu actions) |
 
 Deliberate omissions: the dBASE-style language interpreter (see above),
 `.dbf` file compatibility — **phosphor reads and writes SQLite/libSQL
@@ -185,11 +185,13 @@ Three layers, one philosophy — the artifact proves itself:
 
 1. Name: `phosphor` chosen for the founding commit (the glow of a P1
    CRT). GitHub renames redirect, so this is reversible cheaply.
-2. Scripting hook (Lua? Rhai? none?) — **tabled (author decision,
-   2026-07-27)**. Nothing in phases 1–5 depends on the answer: the
-   menu/action layer is declarative, and its `action_kind` enum is the
-   natural extension point if a scripting action is ever added. Revisit
-   only when a real user hits the declarative layer's ceiling.
+2. Scripting hook — **decided 2026-09-12: Lua** (vendored `mlua`/
+   Lua 5.4, no system dependency). Slice 1 ships the `script` menu
+   action (`query`/`execute`/`say` over `DbLink`, with a heap cap and
+   instruction budget). Still open: form-lifecycle events
+   (`OnValidate`/`OnSave`) and letting scripts emit `Command`s through
+   the bus. The original note stands: the declarative layer covers the
+   90% case, so scripting stays additive.
 3. Printing path for reports/labels (direct to `lp`? text file only?) —
    decide in phase 4 with real users' printers in mind.
 4. Whether the embedded backend bundles SQLite (static, with extension

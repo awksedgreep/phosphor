@@ -42,6 +42,11 @@
 - **Read-only kiosk + app version** (#21): `--app --readonly` refuses
   every write centrally; `_phosphor_apps.version` migrates in place and
   shows in the menu title when above 1.
+- **Scripting hook, slice 1** (#12): a new `script` menu action kind runs
+  a one-line Lua script (vendored `mlua`/Lua 5.4). The sandbox exposes
+  `query(sql)`, `execute(sql)`, and `say(v)` over the same `DbLink`, with
+  a 32 MB heap cap and an instruction budget that aborts runaway loops.
+  Form-lifecycle events and `Command` emission are the next slice.
 
 ### Fixed
 - `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).

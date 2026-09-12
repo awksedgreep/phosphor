@@ -2963,6 +2963,22 @@ impl App {
                     }
                 }
             }
+            ActionKind::Script => {
+                if self.readonly {
+                    self.err("read-only mode: scripts can write");
+                } else {
+                    match crate::script::run(self.db.link(), &item.action_ref) {
+                        Ok(out) => {
+                            self.reload_tables();
+                            self.refresh_health();
+                            // A transcript is multi-line; the status bar
+                            // is one line, so fold it.
+                            self.say(out.replace('\n', " · "));
+                        }
+                        Err(e) => self.err(format!("script: {e}")),
+                    }
+                }
+            }
         }
     }
 
@@ -5147,6 +5163,31 @@ mod tests {
         a.apply(Command::PromptRun);
         a.sync();
         assert_eq!(a.grid.as_ref().unwrap().total, 1);
+    }
+
+    /// #12: a menu item of kind `script` runs a sandboxed Lua action
+    /// that talks to the db through the same DbLink.
+    #[test]
+    fn script_action_runs_through_the_menu() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE log(x TEXT)").unwrap();
+        let mut a = App::new(Box::new(db), None);
+        appsgen::ensure_app(a.db.link(), "demo").unwrap();
+        appsgen::add_item(a.db.link(), "demo", "Log it").unwrap();
+        let mut items = appsgen::items(a.db.link(), "demo");
+        items[0].kind = ActionKind::Script;
+        items[0].action_ref = "say(execute(\"insert into log values ('hi')\"))".into();
+        appsgen::update_item(a.db.link(), &items[0]).unwrap();
+        a.apply(Command::OpenAppMenu(Some("demo".into())));
+        a.apply(Command::DesignerRun);
+        a.sync();
+        let q = a.db.query("SELECT count(*) FROM log").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Int(1), "script wrote the row");
+        assert!(
+            !a.status.as_ref().is_some_and(|(_, e)| *e),
+            "status: {:?}",
+            a.status
+        );
     }
 
     /// #16: QBE cycles an FK join (`J`) and GROUP BY (`g`) through the

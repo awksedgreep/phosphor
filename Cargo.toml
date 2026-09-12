@@ -17,6 +17,9 @@ ureq = { version = "2", features = ["json"] }
 serde_json = "1"
 base64 = "0.22"
 csv = "1.4"
+# Scripting hook (#12): Lua, vendored so one binary and no system dep.
+# DESIGN.md kept the language choice open; Lua is the dBASE-lineage pick.
+mlua = { version = "0.10", features = ["lua54", "vendored"] }
 
 # The faker seeder: cargo run --release --features seed --bin phosphor-seed
 fake = { version = "2", optional = true }

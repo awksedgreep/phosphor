@@ -17,6 +17,7 @@ mod help;
 mod qbe;
 mod remote;
 mod report;
+mod script;
 mod store;
 mod theme;
 mod ui;

@@ -244,6 +244,7 @@ Each menu item has a label, a kind, and a target:
   query     runs a query saved from QBE, by name
   report    runs a saved report (or a plain table report), by name
   sql       executes a statement — good for one-key housekeeping
+  script    a one-line Lua script: query(sql), execute(sql), say(v)
 
 In the designer: n adds an item, Enter edits the label, e edits the
 target, c cycles the kind, [ and ] reorder, x deletes. Everything
