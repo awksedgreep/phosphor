@@ -27,6 +27,11 @@ CREATE TABLE IF NOT EXISTS _phosphor_items (
 CREATE TABLE IF NOT EXISTS _phosphor_prefs (
   user TEXT NOT NULL, key TEXT NOT NULL, value TEXT,
   UNIQUE(user, key));
+-- Form/field lifecycle scripts (DESIGN.md rule 4): one Lua source per
+-- (table, event). Authored with `script <table> <event> <lua>`.
+CREATE TABLE IF NOT EXISTS _phosphor_scripts (
+  id INTEGER PRIMARY KEY, table_ref TEXT NOT NULL, event TEXT NOT NULL,
+  source TEXT NOT NULL, UNIQUE(table_ref, event));
 CREATE INDEX IF NOT EXISTS idx_phosphor_items_app ON _phosphor_items(app_id);
 ";
 

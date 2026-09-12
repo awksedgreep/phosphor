@@ -186,12 +186,14 @@ Three layers, one philosophy — the artifact proves itself:
 1. Name: `phosphor` chosen for the founding commit (the glow of a P1
    CRT). GitHub renames redirect, so this is reversible cheaply.
 2. Scripting hook — **decided 2026-09-12: Lua** (vendored `mlua`/
-   Lua 5.4, no system dependency). Slice 1 ships the `script` menu
-   action (`query`/`execute`/`say` over `DbLink`, with a heap cap and
-   instruction budget). Still open: form-lifecycle events
-   (`OnValidate`/`OnSave`) and letting scripts emit `Command`s through
-   the bus. The original note stands: the declarative layer covers the
-   90% case, so scripting stays additive.
+   Lua 5.4, no system dependency). Slice 1 shipped the `script` menu
+   action; slice 2 shipped the rule-4 lifecycle events — `OnValidate`
+   (can block and rewrite), `OnChange` (on field commit), and `OnSave`
+   (post-write), bound with `script <table> <event> <lua>` into
+   `_phosphor_scripts`. Still open: letting scripts emit `Command`s
+   through the bus (rule 1) and a dedicated script editor. The original
+   note stands: the declarative layer covers the 90% case, so scripting
+   stays additive.
 3. Printing path for reports/labels (direct to `lp`? text file only?) —
    decide in phase 4 with real users' printers in mind.
 4. Whether the embedded backend bundles SQLite (static, with extension

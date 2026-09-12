@@ -118,6 +118,9 @@ Beyond SQL, the prompt knows a few short commands:
   run <name>        run a query saved from QBE
   import <table> <path>   CSV into a table (header row required)
   export <table|SELECT> <path>  CSV out (table or query)
+  script <table> <event> <lua>  bind a form lifecycle script
+                    (OnValidate, OnSave, OnChange); no lua clears it
+  scripts [table]   list bound lifecycle scripts
   quit / exit       leave phosphor (q and Ctrl-Q work anywhere
                     outside the prompt)
   health            the DBHEALTH console

@@ -46,7 +46,13 @@
   a one-line Lua script (vendored `mlua`/Lua 5.4). The sandbox exposes
   `query(sql)`, `execute(sql)`, and `say(v)` over the same `DbLink`, with
   a 32 MB heap cap and an instruction budget that aborts runaway loops.
-  Form-lifecycle events and `Command` emission are the next slice.
+- **Scripting hook, slice 2** (#12): form lifecycle scripts. `script
+  <table> <event> <lua>` binds Lua to `OnValidate` / `OnSave` / `OnChange`
+  in `_phosphor_scripts`, and `scripts [table]` lists them. During EDIT
+  the script sees a read/write `record` table, `field`, `is_new`, plus
+  `get`/`set`/`error`; `OnValidate` can block a save and rewrite fields,
+  `OnChange` runs when a field is committed, `OnSave` runs after the
+  write. Still open: scripts emitting `Command`s through the bus.
 
 ### Fixed
 - `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).

@@ -1688,6 +1688,8 @@ impl App {
                 // empty, the save quietly waits for them — no error toast
                 // until an explicit save/leave is attempted.
                 self.fold_editing_buffer();
+                // A field was committed: the OnChange moment (rule 4).
+                let _ = self.run_edit_script("OnChange", false, false);
                 if let Overlay::Edit(ed) = &mut self.overlay {
                     let n = ed.fields.len();
                     if n > 0 {
@@ -4490,6 +4492,8 @@ impl App {
             "import",
             "export",
             "advise",
+            "script",
+            "scripts",
             "set theme",
         ];
         let matches: Vec<&str> = self
@@ -4588,6 +4592,11 @@ impl App {
                 }
             }
         }
+        // Form lifecycle (rule 4): OnValidate may block or set fields.
+        // The Enter path is quiet; F10/paging surface the reason.
+        if !self.run_validate_script(skip_required_check) {
+            return false;
+        }
         let payload = match &self.overlay {
             Overlay::Edit(ed) if !ed.dirty() && !ed.inserting => None,
             Overlay::Edit(ed) => {
@@ -4659,7 +4668,16 @@ impl App {
                         }
                     }
                 }
-                self.say(msg);
+                // OnSave runs after the row is committed (side effects,
+                // messages); its field edits are ignored — the record is
+                // already written.
+                match self.run_save_script() {
+                    Ok(notes) if !notes.is_empty() => {
+                        self.say(format!("{msg} · {}", notes.join(" · ")))
+                    }
+                    Ok(_) => self.say(msg),
+                    Err(e) => self.err(format!("{msg} · OnSave: {e}")),
+                }
                 true
             }
             Err(e) => {
@@ -4667,6 +4685,105 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Final field values of the open EDIT as `(column, value)`.
+    fn edit_values(&self) -> Option<EditValues> {
+        let Overlay::Edit(ed) = &self.overlay else {
+            return None;
+        };
+        let values = ed
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, (c, _))| {
+                let v = match &ed.inputs[i] {
+                    Some(t) => PValue::parse(t, &c.decl_type),
+                    None => ed.fields[i].1.clone(),
+                };
+                (c.name.clone(), v)
+            })
+            .collect();
+        let field = ed.fields.get(ed.cursor).map(|(c, _)| c.name.clone());
+        Some((ed.table.clone(), ed.inserting, field, values))
+    }
+
+    /// Run `OnValidate` (if bound). Returns false to block the save.
+    fn run_validate_script(&mut self, quiet: bool) -> bool {
+        self.run_edit_script("OnValidate", quiet, true)
+    }
+
+    /// Run a form/field lifecycle script and fold any fields it set back
+    /// in as ordinary edits. `blocking` scripts return false on `error`.
+    fn run_edit_script(&mut self, event: &str, quiet: bool, blocking: bool) -> bool {
+        let Some((table, inserting, field, mut values)) = self.edit_values() else {
+            return true;
+        };
+        let Some(src) = crate::script::get_script(self.db.link(), &table, event) else {
+            return true;
+        };
+        let outcome = match crate::script::run_form_event(
+            self.db.link(),
+            &src,
+            &mut values,
+            field.as_deref(),
+            inserting,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                if !quiet {
+                    self.err(format!("{event}: {e}"));
+                }
+                return !blocking;
+            }
+        };
+        if !quiet {
+            for m in &outcome.messages {
+                self.say(m.clone());
+            }
+            if let Some(e) = &outcome.error {
+                self.err(e.clone());
+            }
+        }
+        if blocking && outcome.error.is_some() {
+            return false;
+        }
+        // Fold script-set values back in as if the user had typed them.
+        if let Overlay::Edit(ed) = &mut self.overlay {
+            for (name, v) in &values {
+                if let Some(i) = ed.fields.iter().position(|(c, _)| &c.name == name) {
+                    let current = match &ed.inputs[i] {
+                        Some(t) => PValue::parse(t, &ed.fields[i].0.decl_type),
+                        None => ed.fields[i].1.clone(),
+                    };
+                    if &current != v {
+                        ed.inputs[i] = Some(pvalue_to_input(v));
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Run `OnSave` (if bound) after a successful write; returns notes.
+    fn run_save_script(&mut self) -> Result<Vec<String>, String> {
+        let Some((table, inserting, field, mut values)) = self.edit_values() else {
+            return Ok(Vec::new());
+        };
+        let Some(src) = crate::script::get_script(self.db.link(), &table, "OnSave") else {
+            return Ok(Vec::new());
+        };
+        let outcome = crate::script::run_form_event(
+            self.db.link(),
+            &src,
+            &mut values,
+            field.as_deref(),
+            inserting,
+        )?;
+        if let Some(e) = outcome.error {
+            return Err(e);
+        }
+        Ok(outcome.messages)
     }
 
     fn prompt_history(&mut self, d: i64) {
@@ -4747,6 +4864,13 @@ impl App {
         }
         if line == "health" {
             return self.open_health();
+        }
+        if let Some(rest) = line.strip_prefix("script ") {
+            return self.set_form_script(rest);
+        }
+        if line == "scripts" || line.starts_with("scripts ") {
+            let t = line["scripts".len()..].trim();
+            return self.list_scripts(t);
         }
         if line == "advise" || line == "advisor" {
             return match crate::advisor::advise(self.db.link()) {
@@ -4929,6 +5053,89 @@ impl App {
             Ok(msg) => self.say(msg),
             Err(e) => self.err(e),
         }
+    }
+
+    /// `script <table> <event> <lua>` — bind a form lifecycle script.
+    /// An empty lua body clears the binding.
+    fn set_form_script(&mut self, rest: &str) {
+        if self.readonly {
+            return self.err("read-only mode: cannot bind scripts");
+        }
+        let mut parts = rest.splitn(3, char::is_whitespace);
+        let table = parts.next().unwrap_or("").trim();
+        let event = parts.next().unwrap_or("").trim();
+        let source = parts.next().unwrap_or("").trim();
+        if table.is_empty() || event.is_empty() {
+            return self
+                .err("usage: script <table> <OnValidate|OnSave|OnChange> <lua>  (no lua clears)");
+        }
+        let Some(ev) = crate::script::normalize_event(event) else {
+            return self.err("events: OnValidate, OnSave, OnChange");
+        };
+        if source.is_empty() {
+            return match crate::script::clear_script(self.db.link(), table, ev) {
+                Ok(()) => self.say(format!("cleared {table} {ev}")),
+                Err(e) => self.err(e),
+            };
+        }
+        match crate::script::set_script(self.db.link(), table, ev, source) {
+            Ok(()) => self.say(format!(
+                "saved {table} {ev} ({} chars) — see: scripts {table}",
+                source.chars().count()
+            )),
+            Err(e) => self.err(e),
+        }
+    }
+
+    /// `scripts [table]` — list bound lifecycle scripts in a pager.
+    fn list_scripts(&mut self, table: &str) {
+        let all = crate::script::all_scripts(self.db.link());
+        let mut lines = vec![
+            "LIFECYCLE SCRIPTS".to_owned(),
+            "bind:  script <table> <event> <lua>".to_owned(),
+            format!("events: {}", crate::script::EVENTS.join(" · ")),
+            String::new(),
+        ];
+        let filtered: Vec<_> = all
+            .into_iter()
+            .filter(|(t, _, _)| table.is_empty() || t.eq_ignore_ascii_case(table))
+            .collect();
+        if filtered.is_empty() {
+            lines.push(if table.is_empty() {
+                "no scripts bound in this database".to_owned()
+            } else {
+                format!("no scripts bound for {table}")
+            });
+        }
+        for (t, ev, src) in filtered {
+            lines.push(format!("{t}  {ev}"));
+            lines.push(format!("  {src}"));
+            lines.push(String::new());
+        }
+        self.overlay = Overlay::Pager(PagerState {
+            title: if table.is_empty() {
+                " SCRIPTS ".into()
+            } else {
+                format!(" SCRIPTS · {table} ")
+            },
+            lines,
+            offset: 0,
+            file_stem: "scripts".into(),
+        });
+    }
+}
+
+/// An EDIT form's final values for a lifecycle script:
+/// (table, inserting, current field, column/value pairs).
+type EditValues = (String, bool, Option<String>, Vec<(String, PValue)>);
+
+/// The editable text for a value a script set: raw text is preserved
+/// (unlike `render`, which folds newlines), everything else renders.
+fn pvalue_to_input(v: &PValue) -> String {
+    match v {
+        PValue::Text(t) => t.clone(),
+        PValue::Null => String::new(),
+        other => other.render(),
     }
 }
 
@@ -5163,6 +5370,101 @@ mod tests {
         a.apply(Command::PromptRun);
         a.sync();
         assert_eq!(a.grid.as_ref().unwrap().total, 1);
+    }
+
+    /// #12: an OnValidate lifecycle script can block a save and rewrite
+    /// fields before the write.
+    #[test]
+    fn form_validation_script_blocks_and_sets() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO people(name) VALUES ('ada');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        let bind = r#"script people OnValidate if record.name == "" or record.name == nil then error("need a name") else set("name", string.upper(record.name)) end"#;
+        for c in bind.chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(
+            !a.status.as_ref().is_some_and(|(_, e)| *e),
+            "bind: {:?}",
+            a.status
+        );
+
+        a.apply(Command::SidebarSeek('p')); // people
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // name
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        a.apply(Command::EditCommitField); // Enter: quiet block, no toast
+        assert!(
+            !a.status.as_ref().is_some_and(|(_, e)| *e),
+            "quiet path must not toast: {:?}",
+            a.status
+        );
+        a.apply(Command::EditSave); // explicit save: loud reason
+        assert!(
+            a.status
+                .as_ref()
+                .is_some_and(|(m, e)| *e && m.contains("need a name")),
+            "status: {:?}",
+            a.status
+        );
+
+        // Type a value: the script uppercases it on the way through.
+        a.apply(Command::EditMove(1)); // back to name
+        a.apply(Command::EditBegin);
+        for c in "grace".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditSave);
+        a.sync();
+        let q = a.db.query("SELECT name FROM people").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Text("GRACE".into()));
+    }
+
+    /// #12: OnChange fires when a field is committed (Enter/Tab).
+    #[test]
+    fn form_change_script_fires_on_commit() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO people(name) VALUES ('ada');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        let bind = r#"script people OnChange if field == "name" then set("name", string.upper(record.name)) end"#;
+        for c in bind.chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        a.sync();
+
+        a.apply(Command::SidebarSeek('p'));
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // name
+        a.apply(Command::EditBegin);
+        for c in "bob".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField); // OnChange runs, then Enter saves
+        a.sync();
+        let q = a.db.query("SELECT name FROM people").unwrap();
+        assert_eq!(
+            q.rows[0][0],
+            PValue::Text("BOB".into()),
+            "OnChange rewrote the field before save"
+        );
     }
 
     /// #12: a menu item of kind `script` runs a sandboxed Lua action
