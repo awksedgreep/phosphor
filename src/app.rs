@@ -11,7 +11,10 @@ use std::collections::{BTreeMap, HashMap};
 use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
 use crate::creator::CreateState;
 use crate::db::{ColumnInfo, DbLink, DbResult, PValue, TableInfo};
-use crate::forms::{apply_mask, mask_ok, BoxItem, FormSpec, FormState, PaintState, TextItem};
+use crate::forms::{
+    apply_mask, mask_ok, BoxItem, FormField, FormSpec, FormState, PaintState, TextItem,
+    DEFAULT_FIELD_WIDTH,
+};
 use crate::help::{self, HelpState};
 use crate::qbe::{QbeSpec, QbeState};
 use crate::report::{self, PagerState, ReportSpec, ReportState};
@@ -1341,6 +1344,8 @@ impl App {
                 (None, Char('r')) => Command::DesignerCycle,
                 (None, Char('m')) => Command::DesignerEditMask,
                 (None, Char('c')) => Command::DesignerEditComputed,
+                (None, Char('n')) => Command::DesignerAdd,
+                (None, Char('x')) => Command::DesignerDelete,
                 (None, Char('[')) => Command::DesignerSwap(-1),
                 (None, Char(']')) => Command::DesignerSwap(1),
                 (None, Enter) => Command::DesignerEditBegin,
@@ -3317,6 +3322,27 @@ impl App {
             st.cursor = i + 1;
             return;
         }
+        // Form designer: add a computed (virtual) field and start typing
+        // its SQL expression right away.
+        if let Overlay::Form(st) = &mut self.overlay {
+            let name = fresh_computed_name(&st.spec);
+            st.spec.fields.push(FormField {
+                column: name.clone(),
+                label: name,
+                include: true,
+                required: false,
+                pos: None,
+                width: DEFAULT_FIELD_WIDTH,
+                mask: String::new(),
+                computed: String::new(),
+            });
+            st.cursor = st.spec.fields.len() - 1;
+            st.editing_mask = false;
+            st.editing_computed = true;
+            st.editing = Some(String::new());
+            self.editor_fresh = true;
+            return;
+        }
         if let Overlay::Apps(st) = &self.overlay {
             let app = st.app.clone();
             match appsgen::add_item(self.db.link(), &app, "New item") {
@@ -3340,6 +3366,16 @@ impl App {
                     st.draft.fields.remove(i);
                     st.cursor = st.cursor.min(st.draft.fields.len());
                 }
+            }
+            return;
+        }
+        // Form designer: x removes the selected field from the form
+        // (the column itself is untouched; keep at least one).
+        if let Overlay::Form(st) = &mut self.overlay {
+            if st.spec.fields.len() > 1 {
+                let i = st.cursor.min(st.spec.fields.len() - 1);
+                st.spec.fields.remove(i);
+                st.cursor = st.cursor.min(st.spec.fields.len() - 1);
             }
             return;
         }
@@ -5602,6 +5638,24 @@ impl App {
 /// (table, inserting, current field, column/value pairs).
 type EditValues = (String, bool, Option<String>, Vec<(String, PValue)>);
 
+/// A fresh `calcN` column name for a newly added computed form field
+/// (must not collide with another spec field, or it would be read as a
+/// real column and the expression ignored).
+fn fresh_computed_name(spec: &FormSpec) -> String {
+    let mut n = spec.fields.len() + 1;
+    loop {
+        let name = format!("calc{n}");
+        if !spec
+            .fields
+            .iter()
+            .any(|f| f.column.eq_ignore_ascii_case(&name))
+        {
+            return name;
+        }
+        n += 1;
+    }
+}
+
 /// Drop an optional standalone `csv` token: `import csv t path` and
 /// `import t path` both work, but a table actually named `csvtest` is
 /// not mistaken for the keyword (found on film — the demo caught it).
@@ -7427,6 +7481,63 @@ mod tests {
         a.apply(Command::EditSave);
         let err = a.db.query("SELECT total FROM orders").unwrap_err();
         assert!(err.contains("no such column"), "{err}");
+    }
+
+    /// The form designer can create a computed field from scratch
+    /// (`n`), and `x` removes it.
+    #[test]
+    fn form_designer_adds_and_removes_computed_fields() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE orders(id INTEGER PRIMARY KEY, qty INTEGER, price REAL);
+             INSERT INTO orders(qty, price) VALUES (3, 4.0);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenForm(Some("orders".into())));
+        let base = match &a.overlay {
+            Overlay::Form(st) => st.spec.fields.len(),
+            _ => panic!("form designer did not open"),
+        };
+        a.apply(Command::DesignerAdd); // n → computed field, editing expr
+        for c in "qty * price".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        a.apply(Command::DesignerSave);
+
+        let spec = crate::forms::FormSpec::load(a.db.link(), "orders").unwrap();
+        assert_eq!(spec.fields.len(), base + 1);
+        let calc = spec.fields.last().unwrap().clone();
+        assert_eq!(calc.computed, "qty * price");
+
+        // EDIT evaluates the computed column.
+        a.apply(Command::Back);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("edit closed")
+        };
+        let i = ed
+            .fields
+            .iter()
+            .position(|(c, _)| c.name == calc.column)
+            .unwrap();
+        assert_eq!(ed.computed[i].as_deref(), Some("qty * price"));
+        assert_eq!(ed.fields[i].1, PValue::Real(12.0));
+
+        // x removes it again.
+        a.apply(Command::Back);
+        a.apply(Command::OpenForm(Some("orders".into())));
+        if let Overlay::Form(st) = &mut a.overlay {
+            st.cursor = st.spec.fields.len() - 1;
+        }
+        a.apply(Command::DesignerDelete);
+        let Overlay::Form(st) = &a.overlay else {
+            panic!("designer closed")
+        };
+        assert_eq!(st.spec.fields.len(), base);
     }
 
     /// #18: `H` flips the split orientation and it is remembered.

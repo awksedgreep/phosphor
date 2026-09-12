@@ -416,7 +416,7 @@ fn draw_form(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " Space show · Enter label · m mask · c computed · r req · [ ] order · F2 PAINT · F6 save ",
+            " Space show · n add · x del · Enter label · m mask · c computed · [ ] order · F2 PAINT · F6 save ",
             th.dim(),
         ));
     let inner = block.inner(area);

@@ -51,6 +51,10 @@ class Screen:
         self.cols, self.rows = cols, rows
         self.grid = [[" "] * cols for _ in range(rows)]
         self.r = self.c = 0
+        # A pty read can split an escape sequence; hold the incomplete
+        # tail until the next feed so it is parsed as one token (a split
+        # `\x1b[38;2;…m` used to leak raw parameter bytes onto the grid).
+        self.pending = ""
 
     def put(self, ch):
         if ch == "\r":
@@ -65,6 +69,8 @@ class Screen:
             self.c += 1
 
     def feed(self, data):
+        data = self.pending + data
+        self.pending = ""
         pos = 0
         for m in self.TOKEN.finditer(data):
             for ch in data[pos:m.start()]:
@@ -91,7 +97,13 @@ class Screen:
                 self.c += int(p or 1)
             elif c == "D":
                 self.c = max(0, self.c - int(p or 1))
-        for ch in data[pos:]:
+        tail = data[pos:]
+        # Hold an incomplete escape sequence for the next read.
+        esc = tail.rfind("\x1b")
+        if esc != -1:
+            self.pending = tail[esc:]
+            tail = tail[:esc]
+        for ch in tail:
             self.put(ch)
 
     def text(self):
@@ -256,9 +268,11 @@ def reels():
     r.key(ENTER, 0.3).type(" by region").key(ENTER, 0.4)  # extend title
     r.keys([DOWN] * 2, gap=0.25)
     r.keys([SPACE] * 6, gap=0.3)                      # group: region
+    r.key(F6, 0.6).type("orders-by-region").key(ENTER, 0.7)  # save as (renameable)
+    r.expect("saved report")
     r.key(F2, 1.0).expect("region = east").expect("subtotal").expect("TOTAL (8 rows)")
     r.keys(["j"] * 3, gap=0.25)
-    r.key("w", 0.6).expect("wrote report_orders.txt")
+    r.key("w", 0.6).expect("wrote report_orders-by-region.txt")
     r.key(ESC, 0.5)
     r.key("c").key("L", 0.8).expect("LABELS · customers").expect("Zurich")
     r.key(ESC, 0.4)
@@ -271,6 +285,9 @@ def reels():
     r.key(DOWN).key("r", 0.4)                         # require customer
     r.key(ENTER, 0.3)
     r.type("Who").key(ENTER, 0.4)                     # typing replaces prefill
+    r.key("n", 0.5)                                   # add a computed field
+    r.type("qty * amount").key(ENTER, 0.4)            # its SQL expression
+    r.key(ENTER, 0.3).type("Total").key(ENTER, 0.4).expect("Total")  # relabel
     r.key(F6, 0.6).expect("saved form")
     r.key(F2, 0.8).expect("FORM PAINTER · orders")
     r.key(TAB, 0.4)                                   # select next field
@@ -282,7 +299,7 @@ def reels():
     r.key(F6, 0.6).expect("saved painted form")
     r.key(ESC, 0.4).key(ESC, 0.5)
     r.key(ENTER, 0.6)                                 # browse orders
-    r.key(ENTER, 1.0).expect("ORDER ENTRY").expect("Who:")
+    r.key(ENTER, 1.0).expect("ORDER ENTRY").expect("Who:").expect("Total")
     r.key(ESC, 0.4).key(ESC, 0.4)
     out.append(r)
 
@@ -300,6 +317,8 @@ def reels():
     r.key("A", 0.6)
     r.keys(["j"], gap=0.3)                            # Zap sits at idx 1
     r.key("x", 0.6).expect_absent("Zap orders")       # gone
+    r.key("r", 0.5).type("crm-app").key(ENTER, 0.6)   # rename the app
+    r.expect("APPLICATIONS GENERATOR · crm-app")
     r.key(ESC, 0.4)
     out.append(r)
 
@@ -385,6 +404,12 @@ def reels():
     r.key(PGDN, 0.8).expect("invoices (1)").expect("router")
     r.key(F4, 0.9).expect("router").expect_absent("modem")  # filtered browse
     r.key(ESC, 0.5)
+    # Split BROWSE, and the H orientation toggle (issue #18).
+    r.key(ENTER, 0.6).expect("BROWSE accounts")
+    r.key("v", 0.9).expect("invoices · account_id")
+    r.key("H", 0.7).expect("stacked")
+    r.key("v", 0.7)                                   # single link: closes
+    r.key(ESC, 0.4)
     out.append(r)
 
     # ── S · scripting: lifecycle events + menu action + the editor ───

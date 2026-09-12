@@ -24,7 +24,10 @@
   field — dBASE value lookup, no manual id typing.
 - **Computed form fields** (#15, third slice): form designer `c` sets a
   SQL expression (`qty * price`) rendered read-only (`ƒ`); it is
-  calculated per record in one query and never written back.
+  calculated per record in one query and never written back. `n` adds a
+  new computed field (its expression editor opens immediately) and `x`
+  removes the selected field — computed fields are authorable from the
+  UI now, not just hand-written JSON.
 - **Persistent appearance** (#22): `set theme` and `set shimmer on|off`
   are remembered in `_phosphor_prefs` across sessions; shimmer dims every
   other screen row (off by default).
@@ -93,6 +96,11 @@
   dedicated, asserted `forms` reel owns the painter); new asserted reels
   cover scripting, CSV + advisor, QBE joins/group, PICTURE/F7 pickers,
   and the read-only kiosk.
+- Existing reels now also exercise report save-as (rename), app rename
+  (`r`), computed-field authoring (`n`), and split `H`.
+- The UI-test terminal emulator carries an escape sequence split across
+  pty reads instead of leaking its raw parameter bytes onto the grid
+  (which made a correct advisor line unfindable).
 - `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).
 - TABLE EDITOR `ALTER TABLE RENAME` + `DROP/ADD COLUMN` targeting the old name after a table rename (now targets the live name); column renames already handled.
 - `DbHandle::call` buffering `Duration::ZERO` for async responses arriving during a sync call (now preserves worker-measured latency).

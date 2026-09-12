@@ -216,6 +216,8 @@ column with four properties:
   COMPUTED  c — a SQL expression shown read-only on the form
             (qty * price). Calculated per record, never saved; EDIT
             skips over it when you Tab.
+  ADD/DEL   n adds a computed field (type its expression right
+            away); x removes the selected field from the form.
   order     [ and ] move the field up and down.
 
 F6 saves; from then on EDIT and NEW use your form for that table.
@@ -405,8 +407,8 @@ EDIT / NEW record
   F10 / Ctrl-S save and close · Esc cancel value, then close
 
 Designers
-  form: Space show · r required · m mask · c computed · Enter label
-        [ ] order · F2 painter · F6 save
+  form: Space show · n add · x del · r required · m mask · c computed
+        Enter label · [ ] order · F2 painter · F6 save
   qbe:  Space show · Enter filter · s sort · J join · g group
   table: type names · F3 type · F4 pk · F5 not-null · F6 unique
          F7 default · F8 add · F9 delete · [ ] move · F2 apply
