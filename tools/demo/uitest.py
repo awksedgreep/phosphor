@@ -499,6 +499,26 @@ def reels():
     r.key(ESC, 0.4)
     out.append(r)
 
+    # ── E2 · the TABLE EDITOR: add a column, drop a table (confirm) ──
+    # Column DROPs are exercised by CRM ch03 on a clean db; here the
+    # seeded db carries the timeless extension whose (invalid) views make
+    # SQLite refuse DROP/RENAME COLUMN, so this reel adds a column and
+    # demonstrates the two-press table drop.
+    r = Reel("tableeditor", "TABLE EDITOR (E): add a column · drop a table")
+    r.key("o", 0.5).key(ENTER, 0.6).expect("BROWSE orders")
+    r.key("E", 0.8).expect("TABLE EDITOR · orders")
+    r.key(F8, 0.4).type("note").key(ENTER, 0.4)       # add a column
+    r.key(F2, 1.0).expect("applied 1 change")
+    # A throwaway table, dropped with the two-press confirm.
+    r.key(".", 0.3).type("CREATE TABLE scratch(x TEXT)").key(ENTER, 0.6)
+    r.key(ESC, 0.4).key(ESC, 0.4)                     # prompt -> grid -> sidebar
+    r.key("s", 0.5).key(ENTER, 0.6).expect("BROWSE scratch")
+    r.key("E", 0.8).expect("TABLE EDITOR · scratch")
+    r.key("D", 0.5).expect("DROP TABLE")
+    r.key("D", 0.8).expect("dropped table")
+    r.key(ESC, 0.4)
+    out.append(r)
+
     # ── I · app mode: the database IS the application ────────────────
     r = Reel("appmode", "--app: menu · report · single-Esc home",
              argv=[BIN, "--app", DB])

@@ -47,6 +47,19 @@
   per table — and `f` freezes the columns up to the cursor so they stay
   put while scrolling right (also persisted). Stored in `_phosphor_prefs`
   as `width:<table>` / `freeze:<table>`; a new `columns` UI reel shows it.
+- **Drop table from the UI**: `D` in the TABLE EDITOR drops the whole
+  table on the second press — the row-delete contract, extended to
+  tables. The evolution demo (CRM ch03) now drives the TABLE EDITOR for
+  add/drop column and the confirmed drop, and a new `tableeditor` reel
+  covers it (19 asserted reels).
+
+### Known issues
+- A database carrying the timeless extension cannot have columns
+  dropped/renamed or changed by the TABLE EDITOR: SQLite validates every
+  view on `ALTER`, and the extension's `timeless_dbhealth_series` view is
+  invalid (it references a missing `main.timeless_series`). ADD COLUMN
+  works; the CRM evolution demo drops columns on a clean database, which
+  works fine.
 - **Read-only kiosk + app version** (#21): `--app --readonly` refuses
   every write centrally; `_phosphor_apps.version` migrates in place and
   shows in the menu title when above 1.

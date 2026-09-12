@@ -453,6 +453,8 @@ pub enum Command {
     CreateUnique,
     /// First-letter seek in the sidebar (dBASE-style, cycling).
     SidebarSeek(char),
+    /// TABLE EDITOR: drop the whole table (`D`, twice to confirm).
+    DropTable,
     /// Show/hide internal tables (shadow, _phosphor, dbhealth views).
     ToggleInternals,
     /// Toggle the split-view detail pane (SET RELATION on one screen).
@@ -562,6 +564,8 @@ pub struct App {
     pub visible_cols_width: u16,
     /// Armed delete: (table, rowid) — second 'x' on the same row fires.
     pending_delete: Option<(String, i64)>,
+    /// Armed table drop: the TABLE EDITOR table watching for a second 'D'.
+    drop_table_armed: Option<String>,
     /// Last automatic health sample (the console is LIVE while open).
     last_auto_sample: std::time::Instant,
     /// The last `find <text>` needle; 'n' repeats it.
@@ -648,6 +652,7 @@ impl App {
             visible_rows: 20,
             visible_cols_width: 80,
             pending_delete: None,
+            drop_table_armed: None,
             last_find: None,
             show_internals: false,
             menu_launched: false,
@@ -1349,6 +1354,7 @@ impl App {
                 (None, F(10)) => Command::CreateRefs,
                 (None, F(8) | Insert) => Command::DesignerAdd,
                 (None, F(9) | Delete) => Command::DesignerDelete,
+                (None, Char('D')) => Command::DropTable,
                 (None, Char('[')) => Command::DesignerSwap(-1),
                 (None, Char(']')) => Command::DesignerSwap(1),
                 (None, Enter) => Command::DesignerEditBegin,
@@ -1600,6 +1606,7 @@ impl App {
                 | Command::DesignerDelete
                 | Command::DesignerSwap(_)
                 | Command::DesignerCommit
+                | Command::DropTable
         )
     }
 
@@ -1614,6 +1621,7 @@ impl App {
             return;
         }
         let is_delete = matches!(cmd, Command::DeleteRow);
+        let is_drop = matches!(cmd, Command::DropTable);
         match cmd {
             Command::Quit => self.quit = true,
             Command::EditType(c) => {
@@ -2084,6 +2092,7 @@ impl App {
             Command::CreateNull => self.create_toggle(|f| f.notnull = !f.notnull),
             Command::CreateUnique => self.create_toggle(|f| f.unique = !f.unique),
             Command::SidebarSeek(c) => self.sidebar_seek(c),
+            Command::DropTable => self.drop_table(),
             Command::ToggleInternals => {
                 self.show_internals = !self.show_internals;
                 self.sidebar_idx = 0;
@@ -2104,9 +2113,13 @@ impl App {
             Command::PaintDelete => self.paint_delete(),
         }
         // Any command other than a second DeleteRow disarms the pending
-        // delete (moving the cursor, refreshing, anything).
+        // delete (moving the cursor, refreshing, anything). Same for the
+        // TABLE EDITOR's two-press drop.
         if !is_delete {
             self.pending_delete = None;
+        }
+        if !is_drop {
+            self.drop_table_armed = None;
         }
     }
 
@@ -2550,6 +2563,37 @@ impl App {
             columns: cols,
             fks,
         }));
+    }
+
+    /// `D` in the TABLE EDITOR: drop the whole table. Two presses on the
+    /// same table — the row-delete contract, extended to tables.
+    fn drop_table(&mut self) {
+        if self.readonly {
+            return self.err("read-only mode: cannot drop tables");
+        }
+        let table = match &self.overlay {
+            Overlay::Create(st) => st.original.as_ref().map(|s| s.table.clone()),
+            _ => None,
+        };
+        let Some(table) = table else {
+            return self.say("open the TABLE EDITOR (E) to drop a table");
+        };
+        if self.drop_table_armed.as_deref() != Some(table.as_str()) {
+            self.drop_table_armed = Some(table.clone());
+            return self.err(format!("press D again to DROP TABLE {table:?}"));
+        }
+        self.drop_table_armed = None;
+        match self
+            .db
+            .execute(&format!("DROP TABLE {}", Self::quote_ident(&table)))
+        {
+            Ok(_) => {
+                self.overlay = Overlay::None;
+                self.reload_tables();
+                self.say(format!("dropped table {table:?}"));
+            }
+            Err(e) => self.err(e),
+        }
     }
 
     fn create_toggle(&mut self, f: impl FnOnce(&mut crate::creator::FieldDef)) {
@@ -7744,6 +7788,36 @@ mod tests {
             panic!("designer closed")
         };
         assert_eq!(st.spec.fields.len(), base);
+    }
+
+    /// `D` in the TABLE EDITOR drops the table only on the second press.
+    #[test]
+    fn table_editor_drops_with_double_d() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE doomed(x TEXT)").unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::SidebarSeek('d'));
+        a.apply(Command::OpenTableEditor);
+        assert!(matches!(a.overlay, Overlay::Create(_)));
+        a.apply(Command::DropTable);
+        assert!(
+            !a.db
+                .query("SELECT name FROM sqlite_master WHERE name = 'doomed'")
+                .unwrap()
+                .rows
+                .is_empty(),
+            "first D only arms"
+        );
+        assert!(a.status.as_ref().is_some_and(|(m, _)| m.contains("again")));
+        a.apply(Command::DropTable);
+        assert!(matches!(a.overlay, Overlay::None));
+        assert!(
+            a.db.query("SELECT name FROM sqlite_master WHERE name = 'doomed'")
+                .unwrap()
+                .rows
+                .is_empty(),
+            "second D drops"
+        );
     }
 
     /// Manual widths (`+`/`-`) and freeze (`f`) persist per table.

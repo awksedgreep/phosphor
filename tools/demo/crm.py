@@ -183,39 +183,42 @@ def ch02_orders(s):
 
 
 def ch03_evolution(s):
-    """Designs change: ALTER adds columns, a wrong idea gets dropped."""
-    s.pause(0.8).k(".", 0.6)
-    s.type("alter table customers add column balance real default 0",
-           cps=48, wait=0.7).k(ENTER, 0.9)
-    s.type("alter table customers add column email text",
-           cps=48, wait=0.7).k(ENTER, 0.9)
-    s.type("alter table customers drop column email",
-           cps=48, wait=0.7).k(ENTER, 0.9)
-    s.k(ESC, 0.5)
-    # A wrong idea, built properly so it can be dropped properly.
+    """Designs change in the UI: the TABLE EDITOR adds and drops
+    columns with no SQL, and a wrong idea is dropped with a confirm."""
+    s.pause(0.8).k("c", 0.6)                               # sidebar: customers
+    s.k("E", 1.1)                                          # TABLE EDITOR · customers
+    s.k(F8, 0.6)                                           # add a column
+    s.type("balance", wait=0.45).k(ENTER, 0.45)
+    s.keys([F3], gap=0.35)                                 # TEXT -> REAL
+    s.k(F7, 0.4)
+    s.type("0", wait=0.4).k(ENTER, 0.5)                    # default 0
+    s.k(F8, 0.6)
+    s.type("email", wait=0.45).k(ENTER, 0.45)              # a second column
+    s.k(F2, 1.5)                                           # apply ALTERs -> BROWSE
+    s.k("E", 1.1)                                          # reopen: cursor on email
+    s.k(F9, 0.5)                                           # drop the column
+    s.k(F2, 1.5)                                           # apply the drop
+    s.k(ESC, 0.5)                                          # grid -> sidebar
+    # A wrong idea, built then dropped with the two-press confirm.
     s.k("C", 1.0)
     s.k(UP, 0.4)
     s.type("leads", wait=0.5).k(ENTER, 0.5)
     s.k(TAB, 0.4).k(F8, 0.6)
     s.type("source", wait=0.4).k(ENTER, 0.45)
-    s.k(F2, 1.4)
-    s.k(ESC, 0.6)                                          # browse leads -> sidebar
-    s.k(".", 0.6)
-    s.type("drop table leads", cps=40, wait=0.6).k(ENTER, 0.9)
-    s.k(ESC, 0.5)                                          # prompt -> grid
-    s.k(ESC, 0.5)                                          # grid -> sidebar
-    s.k("r", 0.9)                                          # refresh (leads gone)
+    s.k(F2, 1.4)                                           # BROWSE leads
+    s.k("E", 1.1)                                          # TABLE EDITOR · leads
+    s.k("D", 0.7)                                          # arm the drop
+    s.k("D", 1.0)                                          # confirm -> dropped
     s.k(".", 0.6)
     s.type("select * from leads", cps=40, wait=0.5).k(ENTER, 1.1)
-    s.k(ESC, 0.5)                                          # prompt -> zombie grid
-    s.k(ESC, 0.5)                                          # grid -> sidebar
+    s.k(ESC, 0.5)                                          # prompt -> sidebar
     # Give Ada and Grace real balances through the EDIT form.
-    goto_table(s, "customers")                    # browse customers
-    s.k(ENTER, 0.9)                                       # EDIT Ada
-    s.keys([DOWN, DOWN, DOWN], gap=0.35)                  # -> balance
+    s.k("c", 0.6).k(ENTER, 1.0)                            # BROWSE customers
+    s.k(ENTER, 0.9)                                        # EDIT Ada
+    s.keys([DOWN, DOWN, DOWN], gap=0.35)                   # -> balance
     s.type("120.5", wait=0.55).k(ENTER, 0.7)
     s.k(ESC, 0.7)
-    s.keys([DOWN], gap=0.5)                               # Grace (grid)
+    s.keys([DOWN], gap=0.5)                                # Grace
     s.k(ENTER, 0.9)
     s.keys([DOWN, DOWN, DOWN], gap=0.35)
     s.type("80", wait=0.55).k(ENTER, 0.7)
@@ -425,7 +428,8 @@ CHAPTERS = [
       "compiler", "4 row(s) affected"],
      ["error: no such"]),
     ("03", "designs change: alter, drop, rethink", [], 2.0, ch03_evolution,
-     ["balance", "drop table", "no such table: leads", "saved 1 field(s)"],
+     ["balance", "applied", "DROP TABLE", "no such table: leads",
+      "saved 1 field(s)"],
      ["error: no such table: customers"]),
     ("04", "contacts, interactions — and the split cycle", [], 2.0, ch04_contacts,
      ["BROWSE contacts", "BROWSE interactions", "contacts · customer_id",

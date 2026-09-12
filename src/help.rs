@@ -69,6 +69,13 @@ AFTER the cursor — forgot street_name? stand on street_num and
 press F8 — F9 (or Del) deletes, [ and ] move a field up and
 down; F2 builds the table and opens the empty BROWSE.
 
+Press E (in the sidebar or a BROWSE) for the TABLE EDITOR: the
+same structure screen, preloaded with the table's live columns.
+Add, rename, or drop columns, change types and constraints, even
+rename the table; F2 applies it as ALTERs (or a rebuild when
+SQLite can't ALTER in place), showing the exact changes first.
+D twice drops the whole table — the same confirm as row delete.
+
 In the grid:
 
   · Arrow keys move cell by cell; PgUp/PgDn move a screenful;
@@ -430,6 +437,7 @@ Designers
   qbe:  Space show · Enter filter · s sort · J join · g group
   table: type names · F3 type · F4 pk · F5 not-null · F6 unique
          F7 default · F8 add · F9 delete · [ ] move · F2 apply
+  editor: same keys; D D drops the table (E opens it)
   report: Enter edit · Space cycle group · F2 preview · F6 save-as
   apps: n new · Enter label · e target · r name · E script · F2 run
 
