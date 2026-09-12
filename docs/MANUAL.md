@@ -263,6 +263,41 @@ reports live in _phosphor tables inside the file, copying the file
 deploys the app, and libSQL replication deploys it everywhere.
 ```
 
+## Scripting (Lua)
+
+```text
+A `script` menu action and form lifecycle events run small Lua
+scripts in a sandbox that can touch only the database.
+
+Data globals:
+  query(sql)    rows as tables keyed by column name
+  execute(sql)  affected rows (-1 for a batch)
+  say(v)        add a line to the result
+
+UI effects are QUEUED, then run through the normal command bus —
+so read-only mode and every check still apply:
+  ui.refresh()       redraw from the database
+  ui.browse(table)   open a table in BROWSE
+  ui.query(name)     run a query saved from QBE
+  ui.report(name)    render a saved report
+  ui.form(table)     open the form designer
+  ui.prompt()        focus the dot prompt
+  ui.quit()          leave phosphor
+
+Bind form events with:
+  script <table> OnChange  <lua>   after a field commits
+  script <table> OnValidate <lua>  before a save: error(m) blocks,
+                                   set(c, v) rewrites a field
+  script <table> OnSave    <lua>   after a successful write
+Inside them, record is a read/write table of the fields, field is
+the field you were on, and is_new says whether it is a new row.
+List bindings with  scripts [table]; no lua clears one.
+
+Sandbox: a 32 MB heap cap and an instruction budget stop runaway
+scripts. A script reaches the database, never the filesystem or
+the network.
+```
+
 ## The DBHEALTH console
 
 ```text

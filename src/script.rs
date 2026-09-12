@@ -1,17 +1,18 @@
-//! The scripting hook (DESIGN.md rule 1/2/3): a small, sandboxed Lua
+//! The scripting hook (DESIGN.md rules 1/2/3/5): a small, sandboxed Lua
 //! environment that talks to the database only through [`DbLink`] and
 //! exchanges the one [`PValue`] type — never a second conversion layer.
 //!
-//! Slice 1 exposes three globals to a script:
+//! Data globals:
 //!
 //!   query(sql)    -> a sequence of row tables keyed by column name
 //!   execute(sql)  -> affected-row count (-1 for a batch)
 //!   say(value)    -> append a line to the run's report
 //!
-//! The script itself is stored inline in an app menu item's `action_ref`
-//! (one line), so the Applications Generator needs no new table. Form
-//! lifecycle events (`OnValidate`/`OnSave`) and emitting `Command`s are
-//! the deliberate next slice; the bus already routes those moments.
+//! UI effects (rule 5) are queued, not performed, in a `ui` table:
+//! `ui.refresh()`, `ui.browse(t)`, `ui.query(name)`, `ui.report(name)`,
+//! `ui.form(t)`, `ui.prompt()`, `ui.quit()`. The app turns those into the
+//! same `Command`s a keystroke would (rule 1), so a script inherits every
+//! permission check — including `--readonly`.
 
 use std::cell::RefCell;
 
@@ -19,6 +20,32 @@ use mlua::{Lua, Value};
 
 use crate::db::{DbLink, DbResult, PValue};
 use crate::store;
+
+/// A queued UI request from a script. Mapped 1:1 onto the command bus
+/// by the App; never carried out by the sandbox itself.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    Refresh,
+    Prompt,
+    Browse(String),
+    Query(String),
+    Report(String),
+    Form(String),
+    Quit,
+}
+
+/// Everything a run produced.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    /// `say(...)` lines, in order.
+    pub messages: Vec<String>,
+    /// Set by `error("...")`; a non-None value blocks a blocking event.
+    pub error: Option<String>,
+    /// Queued `ui.*` effects, in call order.
+    pub effects: Vec<Effect>,
+}
+
+// ── script storage (`_phosphor_scripts`) ─────────────────────────────
 
 /// The lifecycle moments a form can subscribe to (DESIGN.md rule 4).
 pub const EVENTS: [&str; 3] = ["OnValidate", "OnSave", "OnChange"];
@@ -88,6 +115,8 @@ pub fn all_scripts(db: &dyn DbLink) -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
+// ── value marshalling ────────────────────────────────────────────────
+
 fn to_lua(lua: &Lua, v: &PValue) -> mlua::Result<Value> {
     Ok(match v {
         PValue::Null => Value::Nil,
@@ -109,10 +138,80 @@ fn lua_to_string(v: &Value) -> String {
     }
 }
 
-/// Run `source` against `db`. Returns the `say`/return-value transcript.
-/// A hard instruction budget and memory cap keep a bad script from
-/// hanging the terminal.
-pub fn run(db: &dyn DbLink, source: &str) -> Result<String, String> {
+fn from_lua(v: &Value) -> PValue {
+    match v {
+        Value::Nil => PValue::Null,
+        Value::Boolean(b) => PValue::Int(*b as i64),
+        Value::Integer(i) => PValue::Int(*i),
+        Value::Number(n) => PValue::Real(*n),
+        Value::String(s) => PValue::Text(s.to_string_lossy().to_string()),
+        other => PValue::Text(format!("{other:?}")),
+    }
+}
+
+/// Register the sandboxed `ui` table inside a `lua.scope` block. A
+/// macro (not a function) so the scope's inferred lifetimes flow through.
+macro_rules! install_ui {
+    ($scope:expr, $lua:expr, $effects:expr) => {{
+        // Bind the reference OUTSIDE the `move` closures so each captures
+        // a Copy of `&RefCell`, not the RefCell itself.
+        let effects: &RefCell<Vec<Effect>> = $effects;
+        let ui = $lua.create_table()?;
+        ui.set(
+            "refresh",
+            $scope.create_function(move |_, ()| {
+                effects.borrow_mut().push(Effect::Refresh);
+                Ok(())
+            })?,
+        )?;
+        ui.set(
+            "prompt",
+            $scope.create_function(move |_, ()| {
+                effects.borrow_mut().push(Effect::Prompt);
+                Ok(())
+            })?,
+        )?;
+        ui.set(
+            "quit",
+            $scope.create_function(move |_, ()| {
+                effects.borrow_mut().push(Effect::Quit);
+                Ok(())
+            })?,
+        )?;
+        ui.set(
+            "browse",
+            $scope.create_function(move |_, arg: String| {
+                effects.borrow_mut().push(Effect::Browse(arg));
+                Ok(())
+            })?,
+        )?;
+        ui.set(
+            "query",
+            $scope.create_function(move |_, arg: String| {
+                effects.borrow_mut().push(Effect::Query(arg));
+                Ok(())
+            })?,
+        )?;
+        ui.set(
+            "report",
+            $scope.create_function(move |_, arg: String| {
+                effects.borrow_mut().push(Effect::Report(arg));
+                Ok(())
+            })?,
+        )?;
+        ui.set(
+            "form",
+            $scope.create_function(move |_, arg: String| {
+                effects.borrow_mut().push(Effect::Form(arg));
+                Ok(())
+            })?,
+        )?;
+        $lua.globals().set("ui", ui)?;
+    }};
+}
+
+/// A fresh sandbox with the resource caps applied.
+fn engine() -> Lua {
     let lua = Lua::new();
     // 32 MB of Lua heap is plenty for a menu action.
     let _ = lua.set_memory_limit(32 * 1024 * 1024);
@@ -120,9 +219,20 @@ pub fn run(db: &dyn DbLink, source: &str) -> Result<String, String> {
         mlua::HookTriggers::new().every_nth_instruction(200_000),
         |_lua, _debug| Err(mlua::Error::RuntimeError("script exceeded budget".into())),
     );
+    lua
+}
 
-    let output: RefCell<Vec<String>> = RefCell::new(Vec::new());
-    let scope_result: mlua::Result<()> = lua.scope(|scope| {
+// ── the runners ──────────────────────────────────────────────────────
+
+/// Run `source` as a menu/standalone action. Returns the transcript and
+/// any queued effects.
+pub fn run(db: &dyn DbLink, source: &str) -> Result<Outcome, String> {
+    let lua = engine();
+    let messages: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let effects: RefCell<Vec<Effect>> = RefCell::new(Vec::new());
+
+    let result: mlua::Result<()> = lua.scope(|scope| {
+        // Data globals.
         let query = scope.create_function(|lua, sql: String| {
             let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
             let table = lua.create_table()?;
@@ -142,46 +252,29 @@ pub fn run(db: &dyn DbLink, source: &str) -> Result<String, String> {
             Ok(n)
         })?;
         let say = scope.create_function(|_, msg: Value| {
-            output.borrow_mut().push(lua_to_string(&msg));
+            messages.borrow_mut().push(lua_to_string(&msg));
             Ok(())
         })?;
         let globals = lua.globals();
         globals.set("query", query)?;
         globals.set("execute", execute)?;
         globals.set("say", say)?;
+        install_ui!(scope, lua, &effects);
+
         // A trailing expression is reported too, so `return #rows` works.
         let ret: Value = lua.load(source).eval()?;
         if !matches!(ret, Value::Nil) {
-            output.borrow_mut().push(lua_to_string(&ret));
+            messages.borrow_mut().push(lua_to_string(&ret));
         }
         Ok(())
     });
-    match scope_result {
-        Ok(()) => {
-            let mut lines = output.into_inner();
-            if lines.is_empty() {
-                lines.push("script: ok".to_owned());
-            }
-            Ok(lines.join("\n"))
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
 
-// ── form lifecycle scripts (rule 4) ──────────────────────────────────
-
-/// What a form/field event script produced.
-#[derive(Debug, Default)]
-pub struct FormOutcome {
-    /// `say(...)` lines, in order.
-    pub messages: Vec<String>,
-    /// Set by `error("...")`; a non-None value blocks the save.
-    pub error: Option<String>,
+    finish(result, messages, effects, None)
 }
 
 /// Run a lifecycle script against a record's final field values.
 ///
-/// Globals beyond the standard `query`/`execute`/`say`:
+/// Globals beyond the standard ones:
 ///   record    a table of column -> value (read AND write)
 ///   field     the field the user was on (or nil)
 ///   is_new    true while inserting a new record
@@ -196,15 +289,10 @@ pub fn run_form_event(
     values: &mut [(String, PValue)],
     field: Option<&str>,
     inserting: bool,
-) -> Result<FormOutcome, String> {
-    let lua = Lua::new();
-    let _ = lua.set_memory_limit(32 * 1024 * 1024);
-    lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(200_000),
-        |_lua, _debug| Err(mlua::Error::RuntimeError("script exceeded budget".into())),
-    );
-
+) -> Result<Outcome, String> {
+    let lua = engine();
     let messages: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let effects: RefCell<Vec<Effect>> = RefCell::new(Vec::new());
     let failure: RefCell<Option<String>> = RefCell::new(None);
 
     let result: mlua::Result<()> = lua.scope(|scope| {
@@ -246,11 +334,7 @@ pub fn run_form_event(
         })?;
         let set = scope.create_function({
             let record = record.clone();
-            move |lua, (name, v): (String, Value)| {
-                record.set(name, v)?;
-                let _ = lua;
-                Ok(())
-            }
+            move |_, (name, v): (String, Value)| record.set(name, v)
         })?;
 
         let globals = lua.globals();
@@ -262,6 +346,7 @@ pub fn run_form_event(
         globals.set("set", set)?;
         globals.set("field", field.map(str::to_owned))?;
         globals.set("is_new", inserting)?;
+        install_ui!(scope, lua, &effects);
         globals.set("record", record.clone())?;
 
         lua.load(source).exec()?;
@@ -274,23 +359,30 @@ pub fn run_form_event(
         Ok(())
     });
 
-    if let Err(e) = result {
-        return Err(e.to_string());
-    }
-    Ok(FormOutcome {
-        messages: messages.into_inner(),
-        error: failure.into_inner(),
-    })
+    let failure = failure.into_inner();
+    finish(result, messages, effects, failure)
 }
 
-fn from_lua(v: &Value) -> PValue {
-    match v {
-        Value::Nil => PValue::Null,
-        Value::Boolean(b) => PValue::Int(*b as i64),
-        Value::Integer(i) => PValue::Int(*i),
-        Value::Number(n) => PValue::Real(*n),
-        Value::String(s) => PValue::Text(s.to_string_lossy().to_string()),
-        other => PValue::Text(format!("{other:?}")),
+/// Assemble the outcome, defaulting an empty transcript to `script: ok`.
+fn finish(
+    result: mlua::Result<()>,
+    messages: RefCell<Vec<String>>,
+    effects: RefCell<Vec<Effect>>,
+    error: Option<String>,
+) -> Result<Outcome, String> {
+    let mut out = Outcome {
+        messages: messages.into_inner(),
+        error,
+        effects: effects.into_inner(),
+    };
+    match result {
+        Ok(()) => {
+            if out.messages.is_empty() {
+                out.messages.push("script: ok".to_owned());
+            }
+            Ok(out)
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -309,7 +401,7 @@ mod tests {
     #[test]
     fn execute_then_query() {
         let db = db();
-        let msg = run(
+        let out = run(
             &db,
             r#"
             local n = execute("INSERT INTO t(name) VALUES ('ada'), ('grace')")
@@ -319,6 +411,7 @@ mod tests {
             "#,
         )
         .unwrap();
+        let msg = out.messages.join("\n");
         assert!(msg.contains("inserted 2"), "{msg}");
         assert!(msg.contains("first ada"), "{msg}");
     }
@@ -327,7 +420,7 @@ mod tests {
     fn nil_and_numbers_round_trip() {
         let db = db();
         db.execute("INSERT INTO t(name) VALUES (NULL)").unwrap();
-        let msg = run(
+        let out = run(
             &db,
             r#"
             local r = query("SELECT name FROM t")
@@ -336,6 +429,7 @@ mod tests {
             "#,
         )
         .unwrap();
+        let msg = out.messages.join("\n");
         assert!(msg.contains("null"), "{msg}");
         assert!(msg.contains("42"), "{msg}");
     }
@@ -345,6 +439,43 @@ mod tests {
         let db = db();
         let err = run(&db, r#"execute("SELECT nope FROM t")"#).unwrap_err();
         assert!(err.contains("no such column"), "{err}");
+    }
+
+    #[test]
+    fn runaway_loop_is_stopped() {
+        let db = db();
+        let err = run(&db, "while true do end").unwrap_err();
+        assert!(err.contains("budget"), "{err}");
+    }
+
+    #[test]
+    fn ui_effects_queue_in_order() {
+        let db = db();
+        let out = run(
+            &db,
+            r#"
+            ui.refresh()
+            ui.browse("customers")
+            ui.query("debtors")
+            ui.report("orders")
+            ui.form("customers")
+            ui.prompt()
+            ui.quit()
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            out.effects,
+            vec![
+                Effect::Refresh,
+                Effect::Browse("customers".into()),
+                Effect::Query("debtors".into()),
+                Effect::Report("orders".into()),
+                Effect::Form("customers".into()),
+                Effect::Prompt,
+                Effect::Quit,
+            ]
+        );
     }
 
     #[test]
@@ -371,12 +502,5 @@ mod tests {
         let mut empty = vec![("name".to_owned(), PValue::Null)];
         let out = run_form_event(&db, src, &mut empty, Some("name"), true).unwrap();
         assert_eq!(out.error.as_deref(), Some("name is required"));
-    }
-
-    #[test]
-    fn runaway_loop_is_stopped() {
-        let db = db();
-        let err = run(&db, "while true do end").unwrap_err();
-        assert!(err.contains("budget"), "{err}");
     }
 }

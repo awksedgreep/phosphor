@@ -297,6 +297,11 @@ pub enum Command {
     PagerWrite,
     PagerPrint,
     OpenForm(Option<String>),
+    /// Script effects (rule 5): open a named table / run a saved query /
+    /// render a saved report, mapped from `ui.browse/query/report`.
+    OpenTable(String),
+    OpenSavedQuery(String),
+    OpenSavedReport(String),
     OpenApps(Option<String>),
     OpenAppMenu(Option<String>),
     OpenInsert,
@@ -1801,6 +1806,26 @@ impl App {
             Command::DesignerEditMask => self.designer_edit_mask(),
             Command::DesignerEditComputed => self.designer_edit_computed(),
             Command::OpenForm(t) => self.open_form(t),
+            Command::OpenTable(name) => self.open_table(&name),
+            Command::OpenSavedQuery(name) => match QbeSpec::saved_sql(self.db.link(), &name) {
+                Some(sql) => self.run_select(&sql),
+                None => self.err(format!("no saved query named {name:?}")),
+            },
+            Command::OpenSavedReport(name) => {
+                let spec = ReportSpec::load(self.db.link(), &name)
+                    .unwrap_or_else(|| ReportSpec::for_table(&name));
+                match report::render(self.db.link(), &spec) {
+                    Ok(lines) => {
+                        self.overlay = Overlay::Pager(PagerState {
+                            title: format!("REPORT · {}", spec.title),
+                            lines,
+                            offset: 0,
+                            file_stem: format!("report_{}", spec.name),
+                        })
+                    }
+                    Err(e) => self.err(e),
+                }
+            }
             Command::OpenApps(name) => self.open_apps(name),
             Command::OpenAppMenu(name) => self.open_app_menu(name),
             Command::OpenInsert => self.open_insert(),
@@ -2975,12 +3000,33 @@ impl App {
                             self.refresh_health();
                             // A transcript is multi-line; the status bar
                             // is one line, so fold it.
-                            self.say(out.replace('\n', " · "));
+                            let text = out.messages.join(" · ");
+                            self.say(text);
+                            self.apply_script_effects(&out.effects);
                         }
                         Err(e) => self.err(format!("script: {e}")),
                     }
                 }
             }
+        }
+    }
+
+    /// Turn queued `ui.*` effects into the same bus commands a keystroke
+    /// would produce (DESIGN.md rule 1), so readonly and every other
+    /// guard still applies.
+    fn apply_script_effects(&mut self, effects: &[crate::script::Effect]) {
+        use crate::script::Effect;
+        for e in effects {
+            let cmd = match e {
+                Effect::Refresh => Command::Refresh,
+                Effect::Prompt => Command::Focus(Focus::Prompt),
+                Effect::Browse(t) => Command::OpenTable(t.clone()),
+                Effect::Query(n) => Command::OpenSavedQuery(n.clone()),
+                Effect::Report(n) => Command::OpenSavedReport(n.clone()),
+                Effect::Form(t) => Command::OpenForm(Some(t.clone())),
+                Effect::Quit => Command::Quit,
+            };
+            self.apply(cmd);
         }
     }
 
@@ -5429,6 +5475,28 @@ mod tests {
         a.sync();
         let q = a.db.query("SELECT name FROM people").unwrap();
         assert_eq!(q.rows[0][0], PValue::Text("GRACE".into()));
+    }
+
+    /// #12: `ui.*` effects from a script are dispatched as bus commands.
+    #[test]
+    fn script_effects_drive_the_bus() {
+        let mut a = app();
+        appsgen::ensure_app(a.db.link(), "demo").unwrap();
+        appsgen::add_item(a.db.link(), "demo", "Open t").unwrap();
+        let mut items = appsgen::items(a.db.link(), "demo");
+        items[0].kind = ActionKind::Script;
+        items[0].action_ref = "ui.browse(\"t\")".into();
+        appsgen::update_item(a.db.link(), &items[0]).unwrap();
+        a.apply(Command::OpenAppMenu(Some("demo".into())));
+        a.apply(Command::DesignerRun);
+        a.sync();
+        assert!(
+            matches!(
+                &a.grid,
+                Some(Grid { source: GridSource::Table { name, .. }, .. }) if name == "t"
+            ),
+            "ui.browse opened table t"
+        );
     }
 
     /// #12: OnChange fires when a field is committed (Enter/Tab).

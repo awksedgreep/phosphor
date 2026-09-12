@@ -190,15 +190,17 @@ Three layers, one philosophy — the artifact proves itself:
    action; slice 2 shipped the rule-4 lifecycle events — `OnValidate`
    (can block and rewrite), `OnChange` (on field commit), and `OnSave`
    (post-write), bound with `script <table> <event> <lua>` into
-   `_phosphor_scripts`. Still open: letting scripts emit `Command`s
-   through the bus (rule 1) and a dedicated script editor. The original
-   note stands: the declarative layer covers the 90% case, so scripting
-   stays additive.
-3. Printing path for reports/labels (direct to `lp`? text file only?) —
-   decide in phase 4 with real users' printers in mind.
-4. Whether the embedded backend bundles SQLite (static, with extension
-   statically linked) or uses the system library + `.so` — bundling is
-   likelier (one binary, no "not authorized" macOS surprises).
+   `_phosphor_scripts`. Slice 3 shipped rule 5/rule 1: a sandboxed `ui`
+   table queues effects (`refresh`, `browse`, `query`, `report`, `form`,
+   `prompt`, `quit`) that the app dispatches as the same `Command`s a
+   keystroke would. Still open: a dedicated script editor and a richer
+   host API. The original note stands: the declarative layer covers the
+   90% case, so scripting stays additive.
+3. Printing path — **decided 2026-09-12**: always write the text file,
+   then `p` pipes it to `$PHOSPHOR_PRINT` (default `lp`, fallback `lpr`).
+   Direct-to-`lp` only as a convenience; the file is the artifact.
+4. Embedded backend — **decided**: bundled SQLite (Cargo `bundled`
+   feature), with the timeless extension opt-in via `PHOSPHOR_EXT`.
 
 ---
 

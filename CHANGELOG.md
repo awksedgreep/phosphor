@@ -52,7 +52,14 @@
   the script sees a read/write `record` table, `field`, `is_new`, plus
   `get`/`set`/`error`; `OnValidate` can block a save and rewrite fields,
   `OnChange` runs when a field is committed, `OnSave` runs after the
-  write. Still open: scripts emitting `Command`s through the bus.
+  write.
+- **Scripting hook, slice 3** (#12): effects as values (rule 5) — a
+  sandboxed `ui` table queues `ui.refresh()`, `ui.browse(t)`,
+  `ui.query(name)`, `ui.report(name)`, `ui.form(t)`, `ui.prompt()`, and
+  `ui.quit()`. Menu-script effects are dispatched through the same
+  command bus a keystroke uses (rule 1), so readonly and every guard
+  apply. New `script` F1 topic documents the whole surface. Still open:
+  a dedicated script editor and a richer host API.
 
 ### Fixed
 - `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).
