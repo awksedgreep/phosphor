@@ -76,20 +76,15 @@ def builders():
     steps += [(t + 0.5, "w")]                          # write file
     t += 1.2
     steps += [(t, ESC)]                                # close pager
-    steps += [(t + 0.6, "F")]                          # form designer (orders)
-    t += 1.8
-    steps += [(t, F2)]                                 # THE PAINTER
-    t += 2.0
-    s2, t = taps(t, ["l", "l", "l", "j", "j"])        # walk canvas
+    # The painter moved to the dedicated UI-tour reel (docs/demo/ui/forms.gif),
+    # which asserts each step; this reel stays QBE + reports + labels.
+    s2, t = taps(t + 0.3, ["c"])                      # seek customers
     steps += s2
-    steps += [(t + 0.3, " ")]                          # place field
-    steps += [(t + 0.8, "t")]                          # title text
-    typed, t = typing(t + 1.0, "ORDERS")
-    steps += typed
-    steps += [(t + 0.2, ENTER)]
-    t += 1.6
-    steps += [(t, ESC), (t + 0.5, ESC), (t + 1.0, CTRL_Q)]
-    record([BIN, DB], steps, f"{OUT}/builders.cast", env=ENV, title="phosphor · qbe, reports, painter")
+    steps += [(t + 0.5, "L")]                          # mailing labels
+    t += 2.2
+    steps += [(t, ESC)]                                # close pager
+    steps += [(t + 1.0, CTRL_Q)]
+    record([BIN, DB], steps, f"{OUT}/builders.cast", env=ENV, title="phosphor · qbe, reports, labels")
 
 def health():
     # dbhealth(every=2) is auto-sampling; the console is live on top.

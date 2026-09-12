@@ -5302,13 +5302,7 @@ impl App {
         if self.readonly {
             return self.err("read-only mode: import is disabled");
         }
-        let mut rest = line["import".len()..].trim();
-        if rest.to_ascii_lowercase().starts_with("csv") {
-            rest = rest[3..].trim();
-            if rest.starts_with(char::is_whitespace) {
-                rest = rest.trim_start();
-            }
-        }
+        let rest = strip_csv_keyword(line["import".len()..].trim());
         // table and path are last two whitespace-separated tokens; path may be quoted
         let mut parts = rest.rsplitn(2, char::is_whitespace);
         let raw_path = parts.next().unwrap_or("").trim();
@@ -5330,13 +5324,7 @@ impl App {
     }
 
     fn handle_export(&mut self, line: &str) {
-        let mut rest = line["export".len()..].trim();
-        if rest.to_ascii_lowercase().starts_with("csv") {
-            rest = rest[3..].trim();
-            if rest.starts_with(char::is_whitespace) {
-                rest = rest.trim_start();
-            }
-        }
+        let rest = strip_csv_keyword(line["export".len()..].trim());
         let idx = rest.rfind(char::is_whitespace);
         let (raw_source, raw_path) = match idx {
             Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
@@ -5613,6 +5601,20 @@ impl App {
 /// An EDIT form's final values for a lifecycle script:
 /// (table, inserting, current field, column/value pairs).
 type EditValues = (String, bool, Option<String>, Vec<(String, PValue)>);
+
+/// Drop an optional standalone `csv` token: `import csv t path` and
+/// `import t path` both work, but a table actually named `csvtest` is
+/// not mistaken for the keyword (found on film — the demo caught it).
+fn strip_csv_keyword(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 3 && b[..3].eq_ignore_ascii_case(b"csv") {
+        let after = &s[3..];
+        if after.starts_with(char::is_whitespace) {
+            return after.trim_start();
+        }
+    }
+    s
+}
 
 /// The editable text for a value a script set: raw text is preserved
 /// (unlike `render`, which folds newlines), everything else renders.
@@ -6382,6 +6384,53 @@ mod tests {
         a.apply(Command::DeleteRow); // re-arm on new row
         a.apply(Command::DeleteRow); // fire
         assert_eq!(a.grid.as_ref().unwrap().total, 500);
+    }
+
+    /// The optional `csv` keyword must be a standalone token: a table
+    /// named `csvtest` was being parsed as `test` (caught by the UI reel).
+    #[test]
+    fn csv_keyword_is_not_a_table_prefix() {
+        assert_eq!(
+            strip_csv_keyword("csvtest /tmp/x.csv"),
+            "csvtest /tmp/x.csv"
+        );
+        assert_eq!(
+            strip_csv_keyword("csv people /tmp/x.csv"),
+            "people /tmp/x.csv"
+        );
+        assert_eq!(
+            strip_csv_keyword("CSV people /tmp/x.csv"),
+            "people /tmp/x.csv"
+        );
+        assert_eq!(strip_csv_keyword("people /tmp/x.csv"), "people /tmp/x.csv");
+    }
+
+    /// End-to-end: `import csvtest path` fills a table whose name starts
+    /// with `csv`.
+    #[test]
+    fn prompt_import_into_csv_prefixed_table() {
+        let dir = std::env::temp_dir();
+        let csv = dir.join(format!("phosphor-csvpref-{}.csv", std::process::id()));
+        std::fs::write(&csv, "name\nAda\n").unwrap();
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE csvtest(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        for c in format!("import csvtest {}", csv.display()).chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(
+            a.status
+                .as_ref()
+                .is_some_and(|(m, e)| !*e && m.contains("1 row(s)")),
+            "status: {:?}",
+            a.status
+        );
+        let q = a.db.query("SELECT count(*) FROM csvtest").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Int(1));
+        let _ = std::fs::remove_file(&csv);
     }
 
     /// #11: Enter on an untouched NEW form advances but does not INSERT

@@ -86,6 +86,13 @@
   old `_phosphor_reports` row, so a source can feed several reports.
 - **#7**: the Applications Generator can name/rename the app with `r`
   (items link by id, so they survive); the menu title follows.
+- `import csv <table>` / `export csv <source>` mistook a table whose name
+  starts with `csv` for the optional `csv` keyword (`csvtest` → `test`;
+  caught by the new `data` UI reel).
+- The `builders` demo no longer shows the incoherent painter beat (the
+  dedicated, asserted `forms` reel owns the painter); new asserted reels
+  cover scripting, CSV + advisor, QBE joins/group, PICTURE/F7 pickers,
+  and the read-only kiosk.
 - `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).
 - TABLE EDITOR `ALTER TABLE RENAME` + `DROP/ADD COLUMN` targeting the old name after a table rename (now targets the live name); column renames already handled.
 - `DbHandle::call` buffering `Duration::ZERO` for async responses arriving during a sync call (now preserves worker-measured latency).

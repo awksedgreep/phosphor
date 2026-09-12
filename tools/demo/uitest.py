@@ -176,6 +176,9 @@ def seed():
     )
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
+    # Fixture for the `data` reel's CSV import.
+    with open(os.path.join(WORK, "people-import.csv"), "w") as f:
+        f.write("id,name\n1,Imported Ada\n2,Imported Grace\n")
 
 
 def reels():
@@ -382,6 +385,82 @@ def reels():
     r.key(PGDN, 0.8).expect("invoices (1)").expect("router")
     r.key(F4, 0.9).expect("router").expect_absent("modem")  # filtered browse
     r.key(ESC, 0.5)
+    out.append(r)
+
+    # ── S · scripting: lifecycle events + menu action + the editor ───
+    r = Reel("scripting", "Lua scripting: lifecycle · menu action · editor")
+    # Bind an OnChange lifecycle script that uppercases the note.
+    r.key(".", 0.3).type(
+        'script people OnChange if field == "note" then set("note", string.upper(record.note)) end'
+    )
+    r.key(ENTER, 0.7)
+    r.key(ESC, 0.4)                                   # leave the prompt
+    r.key("p", 0.5).key(ENTER, 0.6).expect("BROWSE people")
+    r.key(ENTER, 0.7).expect("EDIT people")
+    r.keys([DOWN] * 3, gap=0.25)                      # -> note
+    r.type("padded").key(ENTER, 0.8).expect("PADDED") # OnChange rewrote it
+    r.key(ESC, 0.4).key(ESC, 0.5)
+    # A script menu item, authored in the full-screen editor, run by hotkey.
+    r.key("A", 0.7).expect("APPLICATIONS GENERATOR · crm")
+    r.key("n", 0.5).key(ENTER, 0.4).type("Tally").key(ENTER, 0.4)
+    r.keys(["c"] * 4, gap=0.4)                        # browse→query→report→sql→script
+    r.key("E", 0.8).expect("SCRIPT · crm · Tally")
+    r.type('local n = scalar("select count(*) from people")')
+    r.key(ENTER, 0.5)
+    r.type('say("people: " .. n)')
+    r.key(F6, 0.9).expect("APPLICATIONS GENERATOR · crm")  # saved, back to designer
+    r.key(F2, 0.9).expect("CRM").expect("Tally")
+    r.key("t", 1.2).expect("people: 500")
+    r.key(ESC, 0.5).key(ESC, 0.5)
+    out.append(r)
+
+    # ── P · PICTURE masks + the F7 foreign-key picker ────────────────
+    r = Reel("pickers", "PICTURE masks · F7 foreign-key value picker")
+    r.key("o", 0.5).key(ENTER, 0.6).expect("BROWSE orders")
+    r.key("F", 0.7).expect("FORM · orders")
+    r.keys([DOWN] * 2, gap=0.25)                      # id -> customer -> product
+    r.key("m", 0.4).type("99-99").key(ENTER, 0.5).expect("99-99")
+    r.key(F6, 0.7).expect("saved form")
+    r.key(ESC, 0.5)                                   # back to the grid
+    r.key(ENTER, 0.8).expect("EDIT orders")
+    r.keys([DOWN] * 6, gap=0.2)                       # -> customer_id (FK)
+    r.key(F7, 0.8).expect("PICK · customers")
+    r.key(DOWN, 0.3).key(ENTER, 0.6)                  # choose Grace
+    r.key(F10, 0.7)                                   # save + close
+    r.key(ESC, 0.4)
+    out.append(r)
+
+    # ── J · QBE joins (J) + GROUP BY (g) ─────────────────────────────
+    r = Reel("qbeextras", "QBE: FK joins (J) and GROUP BY (g)")
+    r.key("o", 0.5).key(ENTER, 0.6).expect("BROWSE orders")
+    r.key("Q", 0.7).expect("QUERY BY EXAMPLE · orders")
+    r.key("J", 0.6).expect("JOIN").expect("customers")
+    r.key("g", 0.6).expect("GROUP").expect("count(*) AS n")
+    r.key(F2, 0.9).expect("row(s)")
+    r.key(ESC, 0.4).key(ESC, 0.4)
+    out.append(r)
+
+    # ── D · data plumbing: CSV in/out + the advisor ──────────────────
+    r = Reel("data", "CSV import/export · the index/vacuum advisor")
+    r.key(".", 0.3)
+    r.type("CREATE TABLE csvtest(id INTEGER PRIMARY KEY, name TEXT)")
+    r.key(ENTER, 0.6)
+    r.type(f"import csvtest {WORK}/people-import.csv").key(ENTER, 0.7)
+    r.expect("imported 2 row(s)")
+    r.type(f"export csvtest {WORK}/csvtest-out.csv").key(ENTER, 0.7)
+    r.expect("exported 2 row(s)")
+    r.type("advise").key(ENTER, 0.9)
+    r.expect("INDEX & VACUUM ADVISOR").expect("orders.customer_id has no index")
+    r.key(ESC, 0.5)
+    out.append(r)
+
+    # ── K · read-only kiosk: every write refused ─────────────────────
+    r = Reel("kiosk", "--app --readonly: browsable, never writable",
+             argv=[BIN, "--app", "--readonly", DB])
+    r.pause(1.0).expect("Customers")
+    r.key("c", 1.0).expect("BROWSE customers")
+    r.key("a", 0.7).expect("read-only")
+    r.key(ESC, 0.4).key(ESC, 0.5)
     out.append(r)
 
     # ── I · app mode: the database IS the application ────────────────

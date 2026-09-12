@@ -196,9 +196,10 @@ from the real program.
 
 </details>
 | **Split BROWSE** — `v` splits a related table onto the screen; the cursor drives it, the mouse re-points it, layouts are remembered | ![split browse: customer ↔ orders on one screen](docs/demo/split.gif) |
-| **The builders** — QBE writing its SQL, the banded report with group subtotals, the form painter | ![qbe, reports, painter](docs/demo/builders.gif) |
+| **The builders** — QBE writing its SQL, the banded report with group subtotals, mailing labels | ![qbe, reports, labels](docs/demo/builders.gif) |
 | **DBHEALTH, live** — the report and sparklines moving on their own (auto-collection + the live console) | ![dbhealth console](docs/demo/health.gif) |
 | **`--app` mode** — the ▓▓ CRM ▓▓ menu; hotkeys run reports and browses; the database IS the application | ![app mode](docs/demo/appmode.gif) |
+| **The form painter** — CREATE SCREEN: place fields, titles, boxes, save, and EDIT renders it | ![form painter](docs/demo/ui/forms.gif) |
 
 **Read more:** the [manual](docs/MANUAL.md) (generated from the
 in-app F1 help — `phosphor --manual`), the ten-minute
