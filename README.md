@@ -128,8 +128,9 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   deployed it.
 
   Need logic the declarative layer can't express? Bind a sandboxed **Lua
-  lifecycle script** — `script customers OnValidate ...` — and it runs on
-  save with a read/write record, or add a `script` menu action.
+  lifecycle script** — `script customers OnValidate ...`, or edit it
+  full-screen with `edit customers OnValidate` — and it runs on save with
+  a read/write record. Menu items can carry a `script` action too.
 
 ## The CRM user story — empty file to running app in 5 minutes
 

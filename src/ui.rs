@@ -81,6 +81,7 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
         Overlay::Apps(_) => draw_apps(f, app),
         Overlay::AppMenu(_) => draw_app_menu(f, app),
         Overlay::Create(_) => draw_create(f, app),
+        Overlay::ScriptEditor(_) => draw_script_editor(f, app),
         Overlay::None => {}
     }
     // The FK value picker draws over the record form (same overlay).
@@ -1437,6 +1438,64 @@ fn draw_picker(f: &mut Frame, app: &App, ed: &crate::app::EditState) {
                 .map(|v| Span::styled(pad(&v.render(), 20), style))
                 .collect::<Vec<_>>(),
         ));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The multi-line Lua editor: line numbers, an inverse caret, dirty
+/// marker, and a hint footer. Full screen so long scripts breathe.
+fn draw_script_editor(f: &mut Frame, app: &App) {
+    let th = app.theme;
+    let Overlay::ScriptEditor(st) = &app.overlay else {
+        return;
+    };
+    let area = f.area().inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    f.render_widget(Clear, area);
+    let dirty = if st.dirty { " *" } else { "" };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" SCRIPT · {} · {}{dirty} ", st.table, st.event),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " type · Enter newline · Tab indent · F6 save · Esc close ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let visible = inner.height as usize;
+    let start = st.row.saturating_sub(visible.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::with_capacity(visible);
+    for (i, text) in st.lines.iter().enumerate().skip(start).take(visible) {
+        let num = format!("{:>3} ", i + 1);
+        if i == st.row {
+            let chars: Vec<char> = text.chars().collect();
+            let col = st.col.min(chars.len());
+            let before: String = chars[..col].iter().collect();
+            let cur = chars.get(col).copied().unwrap_or(' ');
+            let after: String = chars
+                .get(col + 1..)
+                .map(|s| s.iter().collect())
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(num, th.dim()),
+                Span::styled(before, th.base()),
+                Span::styled(cur.to_string(), th.cursor()),
+                Span::styled(after, th.base()),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(num, th.dim()),
+                Span::styled(text.clone(), th.base()),
+            ]));
+        }
     }
     f.render_widget(Paragraph::new(lines), inner);
 }

@@ -58,8 +58,12 @@
   `ui.query(name)`, `ui.report(name)`, `ui.form(t)`, `ui.prompt()`, and
   `ui.quit()`. Menu-script effects are dispatched through the same
   command bus a keystroke uses (rule 1), so readonly and every guard
-  apply. New `script` F1 topic documents the whole surface. Still open:
-  a dedicated script editor and a richer host API.
+  apply. New `script` F1 topic documents the whole surface.
+- **Scripting hook, slice 4** (#12): the multi-line Lua editor.
+  `edit <table> <event>` opens a full-screen editor — line numbers,
+  inverse caret, Enter newline, Tab indent, Backspace that joins lines,
+  F6 save, Esc close. The `scripts` pager now names the exact `edit`
+  command per binding. Still open: a richer host API.
 
 ### Fixed
 - `ui::draw` duplicated split-view layout/hit-rect computation (dead block removed).

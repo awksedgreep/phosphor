@@ -193,9 +193,11 @@ Three layers, one philosophy — the artifact proves itself:
    `_phosphor_scripts`. Slice 3 shipped rule 5/rule 1: a sandboxed `ui`
    table queues effects (`refresh`, `browse`, `query`, `report`, `form`,
    `prompt`, `quit`) that the app dispatches as the same `Command`s a
-   keystroke would. Still open: a dedicated script editor and a richer
-   host API. The original note stands: the declarative layer covers the
-   90% case, so scripting stays additive.
+   keystroke would. Slice 4 added the multi-line editor (`edit <table>
+   <event>`). Still open: a richer host API and multi-line menu-item
+   scripts (menu items stay one-line today). The original note stands:
+   the declarative layer covers the 90% case, so scripting stays
+   additive.
 3. Printing path — **decided 2026-09-12**: always write the text file,
    then `p` pipes it to `$PHOSPHOR_PRINT` (default `lp`, fallback `lpr`).
    Direct-to-`lp` only as a convenience; the file is the artifact.

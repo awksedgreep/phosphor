@@ -121,6 +121,7 @@ Beyond SQL, the prompt knows a few short commands:
   script <table> <event> <lua>  bind a form lifecycle script
                     (OnValidate, OnSave, OnChange); no lua clears it
   scripts [table]   list bound lifecycle scripts
+  edit <table> <event>  multi-line script editor (F6 saves)
   quit / exit       leave phosphor (q and Ctrl-Q work anywhere
                     outside the prompt)
   health            the DBHEALTH console
@@ -291,7 +292,10 @@ Bind form events with:
   script <table> OnSave    <lua>   after a successful write
 Inside them, record is a read/write table of the fields, field is
 the field you were on, and is_new says whether it is a new row.
-List bindings with  scripts [table]; no lua clears one.
+List bindings with  scripts [table]; no lua clears one, and
+  edit <table> <event>
+opens a multi-line editor (type, Enter for a new line, Tab to
+indent, F6 saves, Esc closes without saving).
 
 Sandbox: a 32 MB heap cap and an instruction budget stop runaway
 scripts. A script reaches the database, never the filesystem or

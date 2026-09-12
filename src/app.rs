@@ -48,6 +48,49 @@ pub enum Overlay {
     Create(CreateState),
     Apps(AppDesignState),
     AppMenu(AppMenuState),
+    /// The multi-line Lua editor for a form lifecycle script.
+    ScriptEditor(ScriptState),
+}
+
+/// A full-screen text buffer for one lifecycle script.
+pub struct ScriptState {
+    pub table: String,
+    pub event: String,
+    pub lines: Vec<String>,
+    /// Line index and char index (not bytes) of the caret.
+    pub row: usize,
+    pub col: usize,
+    pub dirty: bool,
+}
+
+impl ScriptState {
+    pub fn new(table: String, event: String, source: &str) -> Self {
+        let mut lines: Vec<String> = source.split('\n').map(str::to_owned).collect();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        ScriptState {
+            table,
+            event,
+            lines,
+            row: 0,
+            col: 0,
+            dirty: false,
+        }
+    }
+
+    pub fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn line_len(&self) -> usize {
+        self.lines[self.row].chars().count()
+    }
+}
+
+/// The byte offset of character index `n` (clamped to the end).
+fn byte_at(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map_or(s.len(), |(b, _)| b)
 }
 
 /// Phase 3: the dbhealth console — the report rendered as a system
@@ -302,6 +345,22 @@ pub enum Command {
     OpenTable(String),
     OpenSavedQuery(String),
     OpenSavedReport(String),
+    /// Open the multi-line Lua editor for a form lifecycle script.
+    OpenFormScript {
+        table: String,
+        event: String,
+    },
+    ScriptChar(char),
+    ScriptTab,
+    ScriptNewline,
+    ScriptBackspace,
+    ScriptMove {
+        dl: i64,
+        dc: i64,
+    },
+    /// Move the caret to the start (false) or end (true) of the line.
+    ScriptLineEdge(bool),
+    ScriptSave,
     OpenApps(Option<String>),
     OpenAppMenu(Option<String>),
     OpenInsert,
@@ -1084,6 +1143,32 @@ impl App {
                 _ => return None,
             });
         }
+        if matches!(self.overlay, Overlay::ScriptEditor(_)) {
+            return Some(match key.code {
+                Esc => Command::Back,
+                Enter => Command::ScriptNewline,
+                Backspace => Command::ScriptBackspace,
+                Left => Command::ScriptMove { dl: 0, dc: -1 },
+                Right => Command::ScriptMove { dl: 0, dc: 1 },
+                Up => Command::ScriptMove { dl: -1, dc: 0 },
+                Down => Command::ScriptMove { dl: 1, dc: 0 },
+                PageUp => Command::ScriptMove { dl: -10, dc: 0 },
+                PageDown => Command::ScriptMove { dl: 10, dc: 0 },
+                Home => Command::ScriptLineEdge(false),
+                End => Command::ScriptLineEdge(true),
+                Tab => Command::ScriptTab,
+                F(6) => Command::ScriptSave,
+                F(1) => Command::Help,
+                Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    Command::ScriptChar(c)
+                }
+                _ => return None,
+            });
+        }
         if matches!(self.overlay, Overlay::Help(_)) {
             return Some(match key.code {
                 Esc | Char('q') | F(1) => Command::Back,
@@ -1826,6 +1911,17 @@ impl App {
                     Err(e) => self.err(e),
                 }
             }
+            Command::OpenFormScript { table, event } => self.open_form_script(table, event),
+            Command::ScriptChar(c) => self.script_char(c),
+            Command::ScriptTab => {
+                self.script_char(' ');
+                self.script_char(' ');
+            }
+            Command::ScriptNewline => self.script_newline(),
+            Command::ScriptBackspace => self.script_backspace(),
+            Command::ScriptMove { dl, dc } => self.script_move(dl, dc),
+            Command::ScriptLineEdge(end) => self.script_line_edge(end),
+            Command::ScriptSave => self.script_save(),
             Command::OpenApps(name) => self.open_apps(name),
             Command::OpenAppMenu(name) => self.open_app_menu(name),
             Command::OpenInsert => self.open_insert(),
@@ -1940,7 +2036,8 @@ impl App {
             | Overlay::Form(_)
             | Overlay::Apps(_)
             | Overlay::Create(_)
-            | Overlay::AppMenu(_) => self.overlay = Overlay::None,
+            | Overlay::AppMenu(_)
+            | Overlay::ScriptEditor(_) => self.overlay = Overlay::None,
             Overlay::None => match self.focus {
                 Focus::Prompt => {
                     self.focus = if self.grid.is_some() {
@@ -2052,6 +2149,7 @@ impl App {
             Overlay::Form(_) | Overlay::Paint(_) => "forms",
             Overlay::Apps(_) | Overlay::AppMenu(_) => "apps",
             Overlay::Create(_) => "browse",
+            Overlay::ScriptEditor(_) => "script",
             Overlay::Help(_) => return,
             Overlay::None => match self.focus {
                 Focus::Prompt => "prompt",
@@ -4540,6 +4638,7 @@ impl App {
             "advise",
             "script",
             "scripts",
+            "edit",
             "set theme",
         ];
         let matches: Vec<&str> = self
@@ -4911,6 +5010,18 @@ impl App {
         if line == "health" {
             return self.open_health();
         }
+        if let Some(rest) = line.strip_prefix("edit ") {
+            let mut it = rest.splitn(2, char::is_whitespace);
+            let table = it.next().unwrap_or("").trim();
+            let event = it.next().unwrap_or("").trim();
+            if table.is_empty() || event.is_empty() {
+                return self.err("usage: edit <table> <event>  (OnValidate, OnSave, OnChange)");
+            }
+            return self.apply(Command::OpenFormScript {
+                table: table.to_owned(),
+                event: event.to_owned(),
+            });
+        }
         if let Some(rest) = line.strip_prefix("script ") {
             return self.set_form_script(rest);
         }
@@ -5154,8 +5265,10 @@ impl App {
             });
         }
         for (t, ev, src) in filtered {
-            lines.push(format!("{t}  {ev}"));
-            lines.push(format!("  {src}"));
+            lines.push(format!("{t}  {ev}   (edit {t} {ev})"));
+            for l in src.lines() {
+                lines.push(format!("  {l}"));
+            }
             lines.push(String::new());
         }
         self.overlay = Overlay::Pager(PagerState {
@@ -5168,6 +5281,98 @@ impl App {
             offset: 0,
             file_stem: "scripts".into(),
         });
+    }
+
+    // ── the multi-line script editor ─────────────────────────────────
+
+    fn open_form_script(&mut self, table: String, event: String) {
+        if self.readonly {
+            return self.err("read-only mode: cannot edit scripts");
+        }
+        let Some(ev) = crate::script::normalize_event(&event) else {
+            return self.err("events: OnValidate, OnSave, OnChange");
+        };
+        let src = crate::script::get_script(self.db.link(), &table, ev).unwrap_or_default();
+        self.overlay = Overlay::ScriptEditor(ScriptState::new(table, ev.to_owned(), &src));
+    }
+
+    fn script_char(&mut self, c: char) {
+        if let Overlay::ScriptEditor(st) = &mut self.overlay {
+            let b = byte_at(&st.lines[st.row], st.col);
+            st.lines[st.row].insert(b, c);
+            st.col += 1;
+            st.dirty = true;
+        }
+    }
+
+    fn script_newline(&mut self) {
+        if let Overlay::ScriptEditor(st) = &mut self.overlay {
+            let b = byte_at(&st.lines[st.row], st.col);
+            let rest = st.lines[st.row].split_off(b);
+            st.lines.insert(st.row + 1, rest);
+            st.row += 1;
+            st.col = 0;
+            st.dirty = true;
+        }
+    }
+
+    fn script_backspace(&mut self) {
+        if let Overlay::ScriptEditor(st) = &mut self.overlay {
+            if st.col > 0 {
+                let b = byte_at(&st.lines[st.row], st.col);
+                let prev = st.lines[st.row][..b]
+                    .chars()
+                    .next_back()
+                    .map_or(1, |c| c.len_utf8());
+                st.lines[st.row].replace_range(b - prev..b, "");
+                st.col -= 1;
+            } else if st.row > 0 {
+                let joined = st.lines.remove(st.row);
+                st.row -= 1;
+                st.col = st.lines[st.row].chars().count();
+                st.lines[st.row].push_str(&joined);
+            }
+            st.dirty = true;
+        }
+    }
+
+    fn script_move(&mut self, dl: i64, dc: i64) {
+        if let Overlay::ScriptEditor(st) = &mut self.overlay {
+            if dc != 0 {
+                let len = st.line_len() as i64;
+                st.col = (st.col as i64 + dc).clamp(0, len) as usize;
+            }
+            if dl != 0 {
+                let n = st.lines.len() as i64;
+                st.row = (st.row as i64 + dl).clamp(0, n - 1) as usize;
+                st.col = st.col.min(st.line_len());
+            }
+        }
+    }
+
+    fn script_line_edge(&mut self, end: bool) {
+        if let Overlay::ScriptEditor(st) = &mut self.overlay {
+            st.col = if end { st.line_len() } else { 0 };
+        }
+    }
+
+    fn script_save(&mut self) {
+        let Overlay::ScriptEditor(st) = &self.overlay else {
+            return;
+        };
+        let (table, event, text) = (st.table.clone(), st.event.clone(), st.text());
+        let result = if text.trim().is_empty() {
+            crate::script::clear_script(self.db.link(), &table, &event)
+        } else {
+            crate::script::set_script(self.db.link(), &table, &event, &text)
+        };
+        match result {
+            Ok(()) => {
+                self.say(format!("saved {table} {event}"));
+                self.overlay = Overlay::None;
+            }
+            Err(e) => self.err(e),
+        }
     }
 }
 
@@ -5475,6 +5680,54 @@ mod tests {
         a.sync();
         let q = a.db.query("SELECT name FROM people").unwrap();
         assert_eq!(q.rows[0][0], PValue::Text("GRACE".into()));
+    }
+
+    /// #12: the `edit` command opens the multi-line editor; typing,
+    /// Enter, and F6 round-trip a real script.
+    #[test]
+    fn script_editor_edits_and_saves() {
+        let mut a = app();
+        for c in "edit t OnValidate".chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        assert!(matches!(a.overlay, Overlay::ScriptEditor(_)));
+        for c in "say(\"hi\")".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::ScriptNewline);
+        for c in "return 1".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::ScriptSave);
+        assert!(matches!(a.overlay, Overlay::None));
+        let src = crate::script::get_script(a.db.link(), "t", "OnValidate").unwrap();
+        assert_eq!(src, "say(\"hi\")\nreturn 1");
+    }
+
+    /// Backspace at column 0 joins with the previous line.
+    #[test]
+    fn script_editor_backspace_joins_lines() {
+        let mut a = app();
+        a.apply(Command::OpenFormScript {
+            table: "t".into(),
+            event: "OnSave".into(),
+        });
+        for c in "ab".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::ScriptNewline);
+        for c in "cd".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::ScriptBackspace); // drop 'd'
+        a.apply(Command::ScriptBackspace); // drop 'c'
+        a.apply(Command::ScriptBackspace); // join onto "ab"
+        a.apply(Command::ScriptSave);
+        assert_eq!(
+            crate::script::get_script(a.db.link(), "t", "OnSave").as_deref(),
+            Some("ab")
+        );
     }
 
     /// #12: `ui.*` effects from a script are dispatched as bus commands.
