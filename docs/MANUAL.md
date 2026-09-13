@@ -26,7 +26,8 @@ A few habits worth forming on day one:
   · Editing any prefilled value: just TYPE — the first keystroke
     replaces it. Backspace instead to edit it in place.
   · F1 opens this help on the topic for wherever you are.
-    Left and Right arrows move between topics; Esc leaves.
+    Left and Right arrows move between topics. Esc or F1 returns
+    to your previous screen, preserving drafts and unfinished input.
   · The dot prompt (press .) accepts real SQL and short commands.
   · q quits from the top level; Ctrl-Q quits from anywhere.
 

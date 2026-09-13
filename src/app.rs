@@ -35,8 +35,8 @@ pub enum Focus {
 }
 
 // The design states differ widely in size (a full EDIT form vs a small
-// help cursor); they live one-at-a-time in one App field, so the enum
-// being as large as its biggest variant is fine.
+// help cursor); App holds the active screen and, while Help is open,
+// one suspended screen, so the largest variant sets a bounded cost.
 #[allow(clippy::large_enum_variant)]
 pub enum Overlay {
     None,
@@ -556,6 +556,9 @@ pub struct App {
     pub shimmer: bool,
     pub focus: Focus,
     pub overlay: Overlay,
+    /// The complete screen suspended by Help, including uncommitted
+    /// input. Taking it on return prevents a second Help from nesting.
+    help_return: Option<Overlay>,
     pub tables: Vec<TableInfo>,
     pub sidebar_idx: usize,
     pub grid: Option<Grid>,
@@ -647,6 +650,7 @@ impl App {
             shimmer: false,
             focus: Focus::Sidebar,
             overlay: Overlay::None,
+            help_return: None,
             tables: Vec::new(),
             sidebar_idx: 0,
             grid: None,
@@ -746,6 +750,29 @@ impl App {
     /// Unknown tags are ignored (already handled — each tag resolves
     /// exactly once and is removed here).
     fn finish_db(
+        &mut self,
+        tag: crate::worker::Token,
+        took: std::time::Duration,
+        resp: DbResponse,
+    ) {
+        // Complete pending work against the screen that requested it.
+        // Help stays visible while a parked EDIT or health view arrives,
+        // and closing Help reveals the completed underlying screen.
+        let help = if matches!(self.overlay, Overlay::Help(_)) {
+            Some(std::mem::replace(
+                &mut self.overlay,
+                self.help_return.take().unwrap_or(Overlay::None),
+            ))
+        } else {
+            None
+        };
+        self.finish_db_inner(tag, took, resp);
+        if let Some(help) = help {
+            self.help_return = Some(std::mem::replace(&mut self.overlay, help));
+        }
+    }
+
+    fn finish_db_inner(
         &mut self,
         tag: crate::worker::Token,
         took: std::time::Duration,
@@ -1208,6 +1235,14 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == Char('q') {
             return Some(Command::Quit);
         }
+        // Help is available during input as well as between edits.
+        if key.code == F(1) {
+            return Some(if matches!(self.overlay, Overlay::Help(_)) {
+                Command::Back
+            } else {
+                Command::Help
+            });
+        }
         if let Overlay::Edit(ed) = &self.overlay {
             // The FK picker, when open, owns the keyboard.
             if ed.picker.is_some() {
@@ -1216,7 +1251,6 @@ impl App {
                     Down | Char('j') => Command::PickerMove(1),
                     Enter => Command::PickerCommit,
                     Esc | Char('q') => Command::PickerCancel,
-                    F(1) => Command::Help,
                     _ => return None,
                 });
             }
@@ -1248,7 +1282,6 @@ impl App {
                 (None, Char('s')) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     Command::EditSave
                 }
-                (None, F(1)) => Command::Help,
                 (None, F(4)) => Command::EditOpenLink(0),
                 (None, F(5)) => Command::EditOpenLink(1),
                 (None, F(6)) => Command::EditOpenLink(2),
@@ -1282,7 +1315,6 @@ impl App {
                 End => Command::ScriptLineEdge(true),
                 Tab => Command::ScriptTab,
                 F(6) => Command::ScriptSave,
-                F(1) => Command::Help,
                 Char(c)
                     if !key
                         .modifiers
@@ -1295,7 +1327,7 @@ impl App {
         }
         if matches!(self.overlay, Overlay::Help(_)) {
             return Some(match key.code {
-                Esc | Char('q') | F(1) => Command::Back,
+                Esc | Char('q') => Command::Back,
                 Up | Char('k') => Command::HelpScroll(-1),
                 Down | Char('j') => Command::HelpScroll(1),
                 PageUp => Command::HelpScroll(-20),
@@ -1311,7 +1343,6 @@ impl App {
                 Esc | Char('q') | F(10) => Command::Back,
                 Char('s') => Command::HealthSample,
                 Char('r') | F(5) => Command::OpenHealth,
-                F(1) => Command::Help,
                 _ => return None,
             });
         }
@@ -1330,7 +1361,6 @@ impl App {
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
                 (None, F(6)) => Command::DesignerSave,
-                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -1347,7 +1377,6 @@ impl App {
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
                 (None, F(6)) => Command::DesignerSave,
-                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -1374,7 +1403,6 @@ impl App {
                 (None, Char(']')) => Command::DesignerSwap(1),
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
-                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 // Plain letters TYPE the field (or table) name.
                 (None, Char(c))
@@ -1398,7 +1426,6 @@ impl App {
                 End | Char('G') => Command::PagerScroll(i64::MAX / 2),
                 Char('w') => Command::PagerWrite,
                 Char('p') => Command::PagerPrint,
-                F(1) => Command::Help,
                 _ => return None,
             });
         }
@@ -1421,7 +1448,6 @@ impl App {
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun, // → the painter
                 (None, F(6)) => Command::DesignerSave,
-                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -1444,7 +1470,6 @@ impl App {
                 (None, Char('+') | Char('=')) => Command::DesignerSwap(1),
                 (None, Char('-')) => Command::DesignerSwap(-1),
                 (None, F(6)) => Command::DesignerSave,
-                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -1467,7 +1492,6 @@ impl App {
                 (None, Char('[')) => Command::DesignerSwap(-1),
                 (None, Char(']')) => Command::DesignerSwap(1),
                 (None, F(2)) => Command::DesignerRun,
-                (None, F(1)) => Command::Help,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -1478,13 +1502,9 @@ impl App {
                 Up => Command::DesignerMove(-1),
                 Down => Command::DesignerMove(1),
                 Enter => Command::DesignerRun,
-                F(1) => Command::Help,
                 Char(c) => Command::DesignerChar(c), // hotkey jump-and-run
                 _ => return None,
             });
-        }
-        if key.code == F(1) {
-            return Some(Command::Help);
         }
         if key.code == F(10) {
             return Some(Command::OpenHealth);
@@ -2151,6 +2171,10 @@ impl App {
     }
 
     fn back(&mut self) {
+        if matches!(self.overlay, Overlay::Help(_)) {
+            self.overlay = self.help_return.take().unwrap_or(Overlay::None);
+            return;
+        }
         // A parked EDIT target belongs to a form that's about to close:
         // otherwise a still-flying window would resurrect it (the user
         // Esc'd once; the form must stay closed).
@@ -2326,10 +2350,11 @@ impl App {
                 _ => "browse",
             },
         };
-        self.overlay = Overlay::Help(HelpState {
+        let help = Overlay::Help(HelpState {
             topic: help::topic_index(key),
             scroll: 0,
         });
+        self.help_return = Some(std::mem::replace(&mut self.overlay, help));
     }
 
     /// The whole health console in one worker job: base discovery,
@@ -3998,6 +4023,14 @@ impl App {
         row: u16,
     ) {
         use ratatui::crossterm::event::MouseEventKind as K;
+        if matches!(self.overlay, Overlay::Help(_)) {
+            match kind {
+                K::ScrollUp => self.apply(Command::HelpScroll(-1)),
+                K::ScrollDown => self.apply(Command::HelpScroll(1)),
+                _ => {}
+            }
+            return;
+        }
         match kind {
             K::ScrollUp | K::ScrollDown => {
                 let d: i64 = if matches!(kind, K::ScrollUp) { -1 } else { 1 };
@@ -7606,6 +7639,8 @@ mod tests {
         assert_eq!(st.scroll, 0);
         // Esc closes back toward where the user was.
         a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::Qbe(_)));
+        a.apply(Command::Back);
         assert!(matches!(a.overlay, Overlay::None));
         // From the prompt, F1 lands on the prompt topic.
         a.apply(Command::Focus(Focus::Prompt));
@@ -7614,6 +7649,125 @@ mod tests {
             panic!()
         };
         assert_eq!(crate::help::TOPICS[st.topic].key, "prompt");
+    }
+
+    #[test]
+    fn help_preserves_table_draft_while_typing() {
+        let mut a = app();
+        a.apply(Command::OpenCreate(Some("gadgets".into())));
+        a.apply(Command::DesignerAdd);
+        a.apply(Command::DesignerEditBegin);
+        for c in "label".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        let cursor = match &a.overlay {
+            Overlay::Create(st) => st.cursor,
+            _ => panic!(),
+        };
+        // F1 must work even in a live input buffer. All three Help
+        // exit keys return to that same buffer, cursor, and draft.
+        for exit in [KeyCode::Esc, KeyCode::F(1), KeyCode::Char('q')] {
+            let command = a.map_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+            assert!(matches!(command, Some(Command::Help)));
+            a.apply(command.unwrap());
+            assert!(matches!(a.overlay, Overlay::Help(_)));
+            a.apply(a.map_key(KeyEvent::new(exit, KeyModifiers::NONE)).unwrap());
+            let Overlay::Create(st) = &a.overlay else {
+                panic!("Help lost the draft");
+            };
+            assert_eq!(st.editing.as_deref(), Some("label"));
+            assert_eq!(st.cursor, cursor);
+            assert_eq!(st.draft.table, "gadgets");
+        }
+        a.apply(Command::DesignerChar('s'));
+        a.apply(Command::DesignerCommit);
+        a.apply(Command::DesignerRun);
+        a.sync();
+        assert_eq!(a.db.columns("gadgets").unwrap()[1].name, "labels");
+    }
+
+    #[test]
+    fn help_preserves_memo_buffer_caret_and_return_form() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditMemo);
+        a.apply(Command::ScriptNewline);
+        for c in "draft".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::ScriptMove { dl: 0, dc: -2 });
+        a.apply(Command::Help);
+        a.apply(Command::Back);
+        let Overlay::ScriptEditor(st) = &a.overlay else {
+            panic!("Help lost the memo");
+        };
+        assert_eq!(st.text(), "row1\ndraft");
+        assert_eq!((st.row, st.col), (1, 3));
+        assert!(st.dirty);
+        a.apply(Command::ScriptChar('!'));
+        a.apply(Command::ScriptSave);
+        assert!(matches!(a.overlay, Overlay::Edit(_)));
+        a.apply(Command::EditSave);
+        a.sync();
+        assert_eq!(
+            a.db.query("SELECT b FROM t WHERE a = 1").unwrap().rows[0][0],
+            PValue::Text("row1\ndra!ft".into())
+        );
+    }
+
+    #[test]
+    fn help_parks_async_edit_and_health_results_until_return() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.grid.as_mut().unwrap().cur_row = 499;
+        a.build_edit_for(499);
+        assert_eq!(a.pending_edit, Some(499));
+        a.apply(Command::Help);
+        a.sync();
+        assert!(
+            matches!(a.overlay, Overlay::Help(_)),
+            "late EDIT replaced Help"
+        );
+        a.apply(Command::Back);
+        assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.row_abs == 499));
+
+        a.apply(Command::Back);
+        a.db.execute(
+            "CREATE TABLE m(name TEXT, value REAL, ts INTEGER);
+            CREATE VIEW m_report AS SELECT 'c' AS \"check\", 'ok' AS status,
+                1.0 AS value, 'a' AS advice;",
+        )
+        .unwrap();
+        a.apply(Command::OpenHealth);
+        a.apply(Command::Help);
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::Help(_)));
+        a.apply(Command::Back);
+        assert!(matches!(&a.overlay, Overlay::Health(st) if st.table == "m"));
+    }
+
+    #[test]
+    fn help_mouse_events_leave_the_underlying_screen_alone() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.hit.master = Some(ratatui::layout::Rect::new(20, 1, 60, 20));
+        a.hit.prompt = Some(ratatui::layout::Rect::new(0, 22, 80, 1));
+        a.apply(Command::OpenQbe(Some("t".into())));
+        a.apply(Command::Help);
+        a.on_mouse(&MouseEventKind::ScrollDown, 30, 5);
+        a.on_mouse(&MouseEventKind::Down(MouseButton::Left), 30, 2);
+        a.on_mouse(&MouseEventKind::Down(MouseButton::Left), 5, 22);
+        assert!(matches!(&a.overlay, Overlay::Help(st) if st.scroll > 0));
+        a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::Qbe(_)));
+        assert_eq!(a.focus, Focus::Grid);
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 0);
     }
 
     /// Full-stack: the LIVE console samples on tick without keys.
