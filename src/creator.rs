@@ -99,6 +99,9 @@ impl FieldDefault {
 
 #[derive(Debug, Clone)]
 pub struct FieldDef {
+    /// Stable source column for live edits; renaming must never turn a
+    /// type change into an inferred drop/add that discards values.
+    original_name: Option<String>,
     pub name: String,
     pub ftype: FType,
     pub pk: bool,
@@ -113,6 +116,7 @@ pub struct FieldDef {
 impl FieldDef {
     fn new(name: &str, ftype: FType) -> FieldDef {
         FieldDef {
+            original_name: None,
             name: name.to_owned(),
             ftype,
             pk: false,
@@ -199,7 +203,7 @@ pub struct TableDraft {
 
 /// The live schema a TABLE EDITOR session opened with: introspected
 /// columns plus this table's outgoing FK targets. F2 diffs the draft
-/// against it and produces either ALTER statements or a rebuild.
+/// against it and produces native ALTER statements or a refusal.
 #[derive(Debug, Clone)]
 pub struct EditorSchema {
     pub table: String,
@@ -239,6 +243,7 @@ impl TableDraft {
             .iter()
             .map(|c| {
                 let mut f = FieldDef::new(&c.name, FType::of_decl(&c.decl_type));
+                f.original_name = Some(c.name.clone());
                 f.pk = c.pk;
                 f.notnull = c.notnull;
                 if let Some(d) = &c.dflt_value {
@@ -272,8 +277,7 @@ impl TableDraft {
         self.sql_for(&self.table)
     }
 
-    /// The CREATE TABLE for `name` — same shape as sql(), used by the
-    /// rebuild script to create the shadow table before swapping.
+    /// The CREATE TABLE for `name`.
     pub fn sql_for(&self, name: &str) -> String {
         let pks: Vec<&FieldDef> = self.fields.iter().filter(|f| f.pk).collect();
         let inline_pk = pks.len() == 1 && pks[0].ftype == FType::Integer;
@@ -352,17 +356,13 @@ impl TableDraft {
 
     /// The SQL script that turns the schema the editor opened with
     /// into this draft. Cheap structural changes (add / rename / drop
-    /// column, rename table) compile to ALTER statements; anything
-    /// that SQLite can't ALTER in place — type or constraint changes
-    /// on existing columns — compiles to the full REBUILD procedure
-    /// (new table, copy, drop, swap) wrapped in a transaction.
-    /// Empty result = no changes. `index_sql`: captured CREATE INDEX
-    /// statements for the table, re-run after a rebuild.
-    pub fn apply_script(
-        &self,
-        schema: &EditorSchema,
-        index_sql: &[String],
-    ) -> DbResult<Vec<String>> {
+    /// column, rename table) compile to ALTER statements. Rebuilding
+    /// from this partial model would lose CHECK/UNIQUE constraints,
+    /// triggers, collations, FK actions and table options, so type and
+    /// constraint changes must be authored as a separate SQL migration.
+    /// Empty result = no changes. No SQL runs when compilation fails.
+    pub fn apply_script(&self, schema: &EditorSchema) -> DbResult<Vec<String>> {
+        self.validate()?;
         if schema.columns.iter().any(|c| c.generated) {
             return Err(
                 "table has generated columns; use SQL to preserve their expressions".into(),
@@ -371,51 +371,36 @@ impl TableDraft {
         let orig_table = schema.table.as_str();
         let renamed_table = !self.table.eq_ignore_ascii_case(orig_table);
 
-        // Pair draft fields to original columns by name first, then
-        // positionally (a rename keeps a column's place). Unpaired
-        // originals = dropped; unpaired fields = added.
+        // Track origin explicitly across rename, type changes and moves.
         let mut src_of: Vec<Option<usize>> = vec![None; self.fields.len()];
         for (ni, f) in self.fields.iter().enumerate() {
-            if let Some(oi) = schema
-                .columns
-                .iter()
-                .position(|o| o.name.eq_ignore_ascii_case(&f.name))
-            {
-                src_of[ni] = Some(oi);
+            if let Some(name) = &f.original_name {
+                src_of[ni] = Some(
+                    schema
+                        .columns
+                        .iter()
+                        .position(|o| &o.name == name)
+                        .ok_or("original column missing; reopen the table editor")?,
+                );
             }
         }
-        let mut unmatched_orig: Vec<usize> = (0..schema.columns.len())
+        let unmatched_orig: Vec<usize> = (0..schema.columns.len())
             .filter(|oi| !src_of.contains(&Some(*oi)))
             .collect();
-        let unmatched_new: Vec<usize> = (0..self.fields.len())
-            .filter(|ni| src_of[*ni].is_none())
-            .collect();
-        // Positional pairs are renames; leftover unpaired originals
-        // are DROPS — but a positional drop that lost its name-mate
-        // (rename to an unrelated name) must not silently lose data,
-        // so a drop pair only forms when types agree too.
-        for &ni in &unmatched_new {
-            let f = &self.fields[ni];
-            if let Some(pos) = unmatched_orig.iter().position(|&oi| {
-                schema.columns[oi]
-                    .decl_type
-                    .eq_ignore_ascii_case(f.ftype.as_str())
-                    && schema.columns[oi].pk == f.pk
-            }) {
-                let oi = unmatched_orig[pos];
-                if !self
-                    .fields
-                    .iter()
-                    .any(|g| g.name.eq_ignore_ascii_case(&schema.columns[oi].name))
-                {
-                    src_of[ni] = Some(oi);
-                    unmatched_orig.retain(|&x| x != oi);
-                }
-            }
+        let existing: Vec<usize> = src_of.iter().flatten().copied().collect();
+        if existing.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("reordering existing columns requires a SQL migration".into());
+        }
+        if src_of
+            .windows(2)
+            .any(|pair| pair[0].is_none() && pair[1].is_some())
+        {
+            return Err(
+                "SQLite appends new columns; move new fields after existing columns".into(),
+            );
         }
 
         // What kind of change set is this?
-        let mut needs_rebuild = false;
         let mut alter_lines: Vec<String> = Vec::new();
         let mut drop_lines: Vec<String> = Vec::new();
         let mut add_lines: Vec<String> = Vec::new();
@@ -440,7 +425,7 @@ impl TableDraft {
             ));
         }
         // Paired columns: renames are ALTERs; constraint/type/default
-        // drift forces the rebuild.
+        // changes need a migration that preserves the complete schema.
         for (ni, f) in self.fields.iter().enumerate() {
             let Some(oi) = src_of[ni] else {
                 // Added: ALTER-able unless it needs rebuild-level features.
@@ -488,69 +473,14 @@ impl TableDraft {
             if f.ftype.as_str() != FType::of_decl(&orig.decl_type).as_str()
                 || f.pk != orig.pk
                 || f.notnull != orig.notnull
+                || f.unique
                 || raw_default_of(f) != orig.dflt_value.as_deref().unwrap_or("")
                 || fk_of(f) != schema.fk_of(&orig.name)
             {
-                needs_rebuild = true;
+                return Err(
+                    "cannot safely rebuild: use a SQL migration for type/constraint changes".into(),
+                );
             }
-        }
-
-        if needs_rebuild {
-            // The SQLite canonical rebuild, wrapped in a transaction.
-            // FK enforcement is suspended for the copy (the canonical
-            // procedure) and restored at the end — existing parent
-            // tables stay referenced and named correctly after the
-            // final swap. Lines are semicolon-free; the caller joins.
-            const SHADOW: &str = "__phosphor_rebuild";
-            let mut lines = vec!["PRAGMA foreign_keys = OFF".to_owned(), "BEGIN".to_owned()];
-            lines.push(self.sql_for(SHADOW));
-            let targets: Vec<(String, String)> = self
-                .fields
-                .iter()
-                .enumerate()
-                .filter_map(|(ni, f)| {
-                    src_of[ni]
-                        .as_ref()
-                        .map(|oi| {
-                            (
-                                quote_ident(&f.name).to_string(),
-                                quote_ident(&schema.columns[*oi].name).to_string(),
-                            )
-                        })
-                        .or_else(|| {
-                            // Added columns get their DEFAULT (or NULL).
-                            let d = if f.default.is_empty() {
-                                "NULL".to_owned()
-                            } else {
-                                f.default.sql()
-                            };
-                            Some((quote_ident(&f.name).to_string(), d))
-                        })
-                })
-                .collect();
-            let ins: Vec<String> = targets.iter().map(|(a, _)| a.clone()).collect();
-            let sel: Vec<String> = targets.iter().map(|(_, b)| b.clone()).collect();
-            lines.push(format!(
-                "INSERT INTO \"{SHADOW}\" ({}) SELECT {} FROM {q_old}",
-                ins.join(", "),
-                sel.join(", ")
-            ));
-            lines.push(format!("DROP TABLE {q_old}"));
-            lines.push(format!(
-                "ALTER TABLE \"{SHADOW}\" RENAME TO {}",
-                quote_ident(&self.table)
-            ));
-            for ix in index_sql {
-                lines.push(format!("{ix};"));
-            }
-            lines.push("COMMIT".to_owned());
-            lines.push("PRAGMA foreign_key_check".to_owned());
-            lines.push("PRAGMA foreign_keys = ON".to_owned());
-            // Semicolon-free lines; the caller joins with ";\n".
-            return Ok(lines
-                .into_iter()
-                .map(|l| l.trim_end_matches(';').to_owned())
-                .collect());
         }
 
         let mut out = alter_lines;
@@ -599,8 +529,7 @@ pub struct CreateState {
     /// Which text cell of the row the buffer edits.
     pub slot: EditSlot,
     /// Set when editing an EXISTING table: the live schema it was
-    /// opened with. F2 then applies apply_script(schema) — ALTERs or
-    /// the full rebuild — instead of CREATE TABLE.
+    /// opened with. F2 applies native ALTERs instead of CREATE TABLE.
     pub original: Option<EditorSchema>,
 }
 
@@ -675,7 +604,7 @@ mod editor_tests {
         let mut bal = FieldDef::new("balance", FType::Real);
         bal.default = "0".into();
         d.fields.push(bal);
-        let script = d.apply_script(&sch, &[]).unwrap();
+        let script = d.apply_script(&sch).unwrap();
         assert_eq!(
             script,
             ["ALTER TABLE \"t\" ADD COLUMN \"balance\" REAL DEFAULT 0"]
@@ -695,7 +624,7 @@ mod editor_tests {
         let mut d = TableDraft::from_live(&sch);
         d.fields.remove(2); // drop zip
         d.fields[1].name = "locality".into(); // rename city -> locality
-        let script = d.apply_script(&sch, &[]).unwrap();
+        let script = d.apply_script(&sch).unwrap();
         assert_eq!(
             script,
             [
@@ -705,22 +634,29 @@ mod editor_tests {
         );
     }
 
-    /// Changing an existing column's type now compiles to the REBUILD
-    /// procedure (previously declined) — data-preserving by design.
+    /// A partial column model cannot safely recreate a live schema.
     #[test]
-    fn editor_type_change_rebuilds() {
+    fn editor_type_change_is_refused_before_sql_runs() {
         let cols = vec![col("score", "INTEGER", false, false)];
         let sch = schema(cols.clone());
         let mut d = TableDraft::from_live(&sch);
         d.fields[0].ftype = FType::Text;
-        let script = d.apply_script(&sch, &[]).unwrap();
+        assert!(d
+            .apply_script(&sch)
+            .unwrap_err()
+            .contains("cannot safely rebuild"));
+        d.fields[0].name = "renamed".into();
         assert!(
-            script.iter().any(|l| l.contains("INSERT INTO")),
-            "{script:?}"
+            d.apply_script(&sch)
+                .unwrap_err()
+                .contains("cannot safely rebuild"),
+            "rename plus type change must not compile to a destructive drop/add"
         );
+        d.fields[0].ftype = FType::Integer;
+        d.fields[0].unique = true;
         assert!(
-            script.iter().any(|l| l.contains("DROP TABLE")),
-            "{script:?}"
+            d.apply_script(&sch).is_err(),
+            "UNIQUE changes must not be silently ignored"
         );
     }
 
@@ -740,7 +676,7 @@ mod editor_tests {
             fks: Vec::new(),
         };
         let d = TableDraft::from_live(&sch);
-        assert!(d.apply_script(&sch, &[]).unwrap().is_empty());
+        assert!(d.apply_script(&sch).unwrap().is_empty());
     }
 
     #[test]
@@ -758,7 +694,7 @@ mod editor_tests {
         .unwrap();
         let sch = schema(db.columns("t").unwrap());
         let d = TableDraft::from_live(&sch);
-        let changes = d.apply_script(&sch, &[]).unwrap();
+        let changes = d.apply_script(&sch).unwrap();
         assert!(
             changes.is_empty(),
             "untouched defaults changed: {changes:?}"
@@ -766,7 +702,7 @@ mod editor_tests {
     }
 
     #[test]
-    fn editor_rebuild_keeps_default_values_for_future_inserts() {
+    fn editor_native_alter_keeps_default_values_for_future_inserts() {
         use crate::db::PValue;
         let (db, _) = crate::db::EmbeddedDb::open(":memory:").unwrap();
         db.execute(
@@ -780,8 +716,8 @@ mod editor_tests {
         .unwrap();
         let sch = schema(db.columns("t").unwrap());
         let mut d = TableDraft::from_live(&sch);
-        d.fields.last_mut().unwrap().ftype = FType::Real;
-        db.execute(&d.apply_script(&sch, &[]).unwrap().join(";\n"))
+        d.fields.last_mut().unwrap().name = "number".into();
+        db.apply_schema_changes(&d.apply_script(&sch).unwrap())
             .unwrap();
         db.execute("INSERT INTO t DEFAULT VALUES").unwrap();
         let rows = db
@@ -818,7 +754,7 @@ mod editor_tests {
         let mut extra = FieldDef::new("extra", FType::Integer);
         extra.default = "1".into();
         d.fields.push(extra);
-        let script = d.apply_script(&sch, &[]).unwrap();
+        let script = d.apply_script(&sch).unwrap();
         assert_eq!(script[0], "ALTER TABLE \"t\" RENAME TO \"renamed\"");
         assert!(
             script

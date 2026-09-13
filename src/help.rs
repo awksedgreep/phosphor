@@ -72,9 +72,13 @@ down; F2 builds the table and opens the empty BROWSE.
 
 Press E (in the sidebar or a BROWSE) for the TABLE EDITOR: the
 same structure screen, preloaded with the table's live columns.
-Add, rename, or drop columns, change types and constraints, even
-rename the table; F2 applies it as ALTERs (or a rebuild when
-SQLite can't ALTER in place), showing the exact changes first.
+Add, rename, or drop columns, or rename the table. The preview
+shows the exact changes; F2 applies them together and checks
+foreign keys before committing. A failed edit rolls back and
+leaves your draft open. Type and constraint changes on existing
+columns require a SQL migration: the editor refuses to rebuild
+a table from incomplete schema details, protecting constraints,
+triggers, indexes, relationships, and table options.
 D twice drops the whole table — the same confirm as row delete.
 Tables with generated columns need SQL for structure changes;
 the designer refuses changes that would lose their expressions.
@@ -439,6 +443,14 @@ Everything the UI does has a startup flag for the shell:
 
 With no argument phosphor opens an in-memory database — a
 scratchpad for trying SQL.
+
+--readonly also works without --app. Database writes are blocked
+by the backend, including writes hidden in query SQL. Theme,
+shimmer, and layout adjustments do not save to the database;
+startup preferences cannot be changed. Remote read-only queries
+must be SELECTs (including WITH ... SELECT); use SQLite's
+pragma_* table functions for metadata. The server parses each
+remote read as a SELECT subquery; write APIs are disabled.
 
 The startup destination is a remembered preference:  set boot
 menu  opens the app menu on launch,  set boot browser  the table

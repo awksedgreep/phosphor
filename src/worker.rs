@@ -162,6 +162,7 @@ struct Job {
 /// across threads — hence RefCell/Cell interior mutability.
 pub struct DbHandle {
     backend: &'static str,
+    readonly: bool,
     display: String,
     tx: mpsc::Sender<Job>,
     rx: mpsc::Receiver<(Token, std::time::Duration, DbResponse)>,
@@ -174,6 +175,7 @@ pub struct DbHandle {
 /// Spawn the worker owning `link`; returns the UI-side handle.
 pub fn spawn(link: Box<dyn DbLink>) -> DbHandle {
     let backend = link.backend();
+    let readonly = link.readonly();
     let display = link.name().to_owned();
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (res_tx, res_rx) = mpsc::channel::<(Token, std::time::Duration, DbResponse)>();
@@ -197,6 +199,7 @@ pub fn spawn(link: Box<dyn DbLink>) -> DbHandle {
         .expect("db worker thread failed to spawn");
     DbHandle {
         backend,
+        readonly,
         display,
         tx: job_tx,
         rx: res_rx,
@@ -267,6 +270,9 @@ impl DbHandle {
 /// Slice-1 behavior is identical to direct calls; later slices bypass
 /// this façade for hot paths via submit/poll.
 impl DbLink for DbHandle {
+    fn readonly(&self) -> bool {
+        self.readonly
+    }
     fn backend(&self) -> &'static str {
         self.backend
     }
@@ -330,6 +336,18 @@ impl DbLink for DbHandle {
         let s = sql.to_owned();
         self.call(Box::new(move |db| DbResponse::Query(db.query(&s))))
             .query()
+    }
+
+    fn apply_schema_changes(&self, statements: &[String]) -> DbResult<Duration> {
+        let statements = statements.to_owned();
+        self.call(Box::new(move |db| {
+            DbResponse::Execute(
+                db.apply_schema_changes(&statements)
+                    .map(|elapsed| (0, elapsed)),
+            )
+        }))
+        .execute()
+        .map(|(_, elapsed)| elapsed)
     }
 
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)> {

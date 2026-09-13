@@ -23,6 +23,7 @@ pub struct RemoteDb {
     pipeline_url: String,
     display: String,
     auth: Option<String>,
+    readonly: bool,
     rowid_cache: Mutex<HashMap<String, Option<String>>>,
 }
 
@@ -35,6 +36,10 @@ struct StmtOut {
 
 impl RemoteDb {
     pub fn open(url: &str) -> DbResult<Self> {
+        Self::open_with_mode(url, false)
+    }
+
+    pub fn open_with_mode(url: &str, readonly: bool) -> DbResult<Self> {
         let base = url.trim_end_matches('/');
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(15))
@@ -43,6 +48,7 @@ impl RemoteDb {
             agent,
             pipeline_url: format!("{base}/v3/pipeline"),
             display: base.to_owned(),
+            readonly,
             // Preformatted once (was format! per HTTP request).
             auth: std::env::var("PHOSPHOR_TOKEN")
                 .ok()
@@ -56,28 +62,24 @@ impl RemoteDb {
     }
 
     fn pipeline(&self, stmts: &[(&str, Vec<Json>)]) -> DbResult<Vec<StmtOut>> {
+        // SQLite parses every read-only request as a SELECT subquery.
+        // CTE writes, PRAGMAs, ATTACH and DDL cannot appear in that position.
+        // sqld also rejects multiple statements in an execute request, so
+        // closing the parentheses cannot escape into a SQL script.
         let mut requests: Vec<Json> = stmts
             .iter()
-            .map(|(sql, args)| json!({"type": "execute", "stmt": {"sql": sql, "args": args}}))
+            .map(|(sql, args)| {
+                let sql = if self.readonly {
+                    format!("SELECT * FROM (\n{}\n)", sql.trim().trim_end_matches(';'))
+                } else {
+                    (*sql).to_owned()
+                };
+                json!({"type": "execute", "stmt": {"sql": sql, "args": args}})
+            })
             .collect();
         requests.push(json!({"type": "close"}));
 
-        let mut req = self.agent.post(&self.pipeline_url);
-        if let Some(a) = &self.auth {
-            req = req.set("Authorization", a);
-        }
-        let body: Json = req
-            .send_json(json!({"requests": requests}))
-            .map_err(|e| match e {
-                ureq::Error::Status(code, resp) => format!(
-                    "sqld HTTP {code}: {}",
-                    resp.into_string().unwrap_or_default()
-                ),
-                other => format!("sqld unreachable: {other}"),
-            })?
-            .into_json()
-            .map_err(|e| format!("sqld response was not JSON: {e}"))?;
-
+        let body = self.send(requests)?;
         let results = body["results"]
             .as_array()
             .ok_or("sqld response missing results[]")?;
@@ -88,18 +90,37 @@ impl RemoteDb {
                     let resp = &r["response"];
                     if resp["type"] == "execute" {
                         out.push(decode_result(&resp["result"])?);
-                    } // close acks are skipped
+                    }
                 }
                 Some("error") => {
-                    return Err(r["error"]["message"]
-                        .as_str()
-                        .unwrap_or("unknown sqld error")
-                        .to_owned());
+                    let error = remote_error(&r["error"]);
+                    return Err(if self.readonly {
+                        format!("read-only query: {error}")
+                    } else {
+                        error
+                    });
                 }
                 _ => return Err("sqld result with unknown type".into()),
             }
         }
         Ok(out)
+    }
+
+    fn send(&self, requests: Vec<Json>) -> DbResult<Json> {
+        let mut req = self.agent.post(&self.pipeline_url);
+        if let Some(a) = &self.auth {
+            req = req.set("Authorization", a);
+        }
+        req.send_json(json!({"requests": requests}))
+            .map_err(|e| match e {
+                ureq::Error::Status(code, resp) => format!(
+                    "sqld HTTP {code}: {}",
+                    resp.into_string().unwrap_or_default()
+                ),
+                other => format!("sqld unreachable: {other}"),
+            })?
+            .into_json()
+            .map_err(|e| format!("sqld response was not JSON: {e}"))
     }
 
     fn one(&self, sql: &str, args: Vec<Json>) -> DbResult<StmtOut> {
@@ -116,7 +137,14 @@ impl RemoteDb {
     }
 }
 
-fn encode(v: &PValue) -> Json {
+fn remote_error(error: &Json) -> String {
+    error["message"]
+        .as_str()
+        .unwrap_or("unknown sqld error")
+        .to_owned()
+}
+
+pub(crate) fn encode(v: &PValue) -> Json {
     match v {
         PValue::Null => json!({"type": "null"}),
         // 64-bit precision survives only as a string on the wire.
@@ -130,7 +158,7 @@ fn encode(v: &PValue) -> Json {
     }
 }
 
-fn decode(v: &Json) -> DbResult<PValue> {
+pub(crate) fn decode(v: &Json) -> DbResult<PValue> {
     Ok(match v["type"].as_str().unwrap_or("") {
         "null" => PValue::Null,
         "integer" => PValue::Int(
@@ -189,6 +217,9 @@ fn decode_result(result: &Json) -> DbResult<StmtOut> {
 }
 
 impl DbLink for RemoteDb {
+    fn readonly(&self) -> bool {
+        self.readonly
+    }
     fn backend(&self) -> &'static str {
         "sqld"
     }
@@ -357,7 +388,84 @@ impl DbLink for RemoteDb {
         })
     }
 
+    fn apply_schema_changes(&self, statements: &[String]) -> DbResult<Duration> {
+        self.require_writable()?;
+        let start = Instant::now();
+        // One stream, with every step conditional on its predecessor. A
+        // failed ALTER or FK check skips COMMIT and takes the rollback path.
+        // CASE evaluates the overflow expression only when FK violations
+        // exist, turning validation into a server-side step failure before
+        // COMMIT. sqld forbids temporary tables.
+        let mut sql = vec!["PRAGMA foreign_keys=ON".to_owned(), "BEGIN".to_owned()];
+        sql.extend_from_slice(statements);
+        let check_step = sql.len();
+        sql.push(
+            "SELECT CASE WHEN EXISTS(SELECT 1 FROM pragma_foreign_key_check) \
+             THEN abs(-9223372036854775808) ELSE 0 END"
+                .into(),
+        );
+        sql.push("COMMIT".into());
+        let commit_step = sql.len() - 1;
+        let mut steps: Vec<Json> = sql
+            .iter()
+            .enumerate()
+            .map(|(i, sql)| {
+                let mut step = json!({"stmt": {"sql": sql}});
+                if i > 0 {
+                    step["condition"] = json!({"type": "ok", "step": i - 1});
+                }
+                step
+            })
+            .collect();
+        steps.push(json!({"condition": {"type": "and", "conds": [
+            {"type": "not", "cond": {"type": "ok", "step": commit_step}},
+            {"type": "not", "cond": {"type": "is_autocommit"}}
+        ]}, "stmt": {"sql": "ROLLBACK"}}));
+        self.rowid_cache.lock().unwrap().clear();
+        let body = self.send(vec![
+            json!({"type": "batch", "batch": {"steps": steps}}),
+            json!({"type": "close"}),
+        ])?;
+        let response = &body["results"][0];
+        if response["type"] == "error" {
+            return Err(remote_error(&response["error"]));
+        }
+        if response["response"]["type"] != "batch" {
+            return Err("sqld did not return the schema batch".into());
+        }
+        let result = &response["response"]["result"];
+        let results = result["step_results"]
+            .as_array()
+            .ok_or("missing schema results")?;
+        let errors = result["step_errors"]
+            .as_array()
+            .ok_or("missing schema errors")?;
+        if results.len() != steps.len() || errors.len() != steps.len() {
+            return Err("incomplete schema response; refresh to check the database".into());
+        }
+        for (i, error) in errors.iter().enumerate() {
+            if !error.is_null() {
+                let message = if i == check_step {
+                    format!("foreign key check failed: {}", remote_error(error))
+                } else {
+                    remote_error(error)
+                };
+                let rollback = &errors[commit_step + 1];
+                return Err(if rollback.is_null() {
+                    message
+                } else {
+                    format!("{message}; rollback: {}", remote_error(rollback))
+                });
+            }
+        }
+        if results[..=commit_step].iter().any(Json::is_null) {
+            return Err("server skipped a schema step; refresh to check the database".into());
+        }
+        Ok(start.elapsed())
+    }
+
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)> {
+        self.require_writable()?;
         let start = Instant::now();
         // Hrana takes one statement per execute request; split batches
         // naively on ';' (string literals with ';' will mis-split — the
@@ -383,6 +491,7 @@ impl DbLink for RemoteDb {
     }
 
     fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
+        self.require_writable()?;
         if changes.is_empty() {
             return Ok(());
         }
@@ -414,6 +523,7 @@ impl DbLink for RemoteDb {
     }
 
     fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64> {
+        self.require_writable()?;
         let sql = if changes.is_empty() {
             format!("INSERT INTO {} DEFAULT VALUES", Self::quote(table))
         } else {
@@ -433,6 +543,7 @@ impl DbLink for RemoteDb {
     }
 
     fn delete_row(&self, table: &str, rowid: i64) -> DbResult<()> {
+        self.require_writable()?;
         let alias = self
             .rowid_column(table)?
             .ok_or("no unambiguous row identity; deleting is read-only")?;
@@ -571,6 +682,95 @@ impl DbLink for RemoteDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_schema_changes_preserve_constraints_and_roll_back_failures() {
+        let server = crate::test_support::HranaFixture::new(false);
+        server
+            .db
+            .connect()
+            .execute_batch(crate::test_support::SCHEMA_SQL)
+            .unwrap();
+        let db = RemoteDb::open(&server.url).unwrap();
+        crate::test_support::assert_native_schema_safety(&db);
+    }
+
+    #[test]
+    fn remote_schema_changes_check_foreign_keys_before_commit() {
+        let server = crate::test_support::HranaFixture::new(false);
+        server
+            .db
+            .connect()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+            CREATE TABLE p(id INTEGER PRIMARY KEY); CREATE TABLE c(pid INTEGER REFERENCES p(id));
+            INSERT INTO c VALUES (7)",
+            )
+            .unwrap();
+        let db = RemoteDb::open(&server.url).unwrap();
+        let error = db
+            .apply_schema_changes(&["ALTER TABLE c ADD COLUMN note TEXT".into()])
+            .unwrap_err();
+        assert!(error.contains("foreign key check"), "{error}");
+        assert_eq!(db.columns("c").unwrap().len(), 1);
+        assert_eq!(db.count("c").unwrap(), 1);
+        let log = server.executed.lock().unwrap();
+        assert!(log.iter().any(|sql| sql == "ROLLBACK"));
+        assert!(!log.iter().any(|sql| sql == "COMMIT"));
+    }
+
+    #[test]
+    fn readonly_remote_queries_are_selects_on_each_connection() {
+        let server = crate::test_support::HranaFixture::new(false);
+        server.db.connect().execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1, 'Ada')").unwrap();
+        let db = RemoteDb::open_with_mode(&server.url, true).unwrap();
+        assert!(db.readonly());
+        assert_eq!(db.tables().unwrap().len(), 1);
+        assert_eq!(db.columns("t").unwrap().len(), 2);
+        assert_eq!(db.open_window("t", 0, 10).unwrap().1, 1);
+        assert_eq!(
+            db.query("WITH x AS (SELECT name FROM t) SELECT * FROM x")
+                .unwrap()
+                .rows[0][0],
+            PValue::Text("Ada".into())
+        );
+        for sql in [
+            "WITH x AS (SELECT 1) INSERT INTO t(name) SELECT 'bad' FROM x RETURNING * -- limit",
+            "UPDATE t SET name='bad' RETURNING * -- limit",
+            "DELETE FROM t RETURNING * -- limit",
+            "PRAGMA query_only=OFF -- limit",
+            "PRAGMA user_version=99 -- limit",
+            "ATTACH ':memory:' AS extra -- limit",
+            "SELECT 1); DELETE FROM t; SELECT (1 -- limit",
+        ] {
+            assert!(db.query(sql).is_err(), "allowed {sql}");
+        }
+        assert!(db.execute("DELETE FROM t").is_err());
+        assert!(db
+            .update_row("t", 1, &[("name".into(), PValue::Null)])
+            .is_err());
+        assert!(db.insert_row("t", &[]).is_err());
+        assert!(db.delete_row("t", 1).is_err());
+        assert!(db
+            .apply_schema_changes(&["ALTER TABLE t ADD COLUMN extra TEXT".into()])
+            .is_err());
+        crate::store::pref_set(&db, "theme", "amber");
+        assert_eq!(
+            db.query("SELECT name FROM t").unwrap().rows,
+            vec![vec![PValue::Text("Ada".into())]]
+        );
+        assert_eq!(db.tables().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn readonly_remote_does_not_retry_rejected_reads_as_raw_sql() {
+        let server = crate::test_support::HranaFixture::new(true);
+        assert!(RemoteDb::open_with_mode(&server.url, true).is_err());
+        assert_eq!(
+            *server.executed.lock().unwrap(),
+            ["SELECT * FROM (\nSELECT 1\n)"]
+        );
+    }
 
     #[test]
     fn hrana_value_round_trip() {

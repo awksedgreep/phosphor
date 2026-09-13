@@ -26,7 +26,7 @@ pub enum PValue {
 }
 
 impl PValue {
-    fn from_ref(v: ValueRef<'_>) -> Self {
+    pub(crate) fn from_ref(v: ValueRef<'_>) -> Self {
         match v {
             ValueRef::Null => PValue::Null,
             ValueRef::Integer(i) => PValue::Int(i),
@@ -218,6 +218,14 @@ pub const QUERY_CAP: usize = 10_000;
 pub trait DbLink: Send {
     fn backend(&self) -> &'static str;
     fn name(&self) -> &str;
+    fn readonly(&self) -> bool;
+    fn require_writable(&self) -> DbResult<()> {
+        if self.readonly() {
+            Err("read-only mode: database writes are disabled".into())
+        } else {
+            Ok(())
+        }
+    }
     fn tables(&self) -> DbResult<Vec<TableInfo>>;
     fn columns(&self, table: &str) -> DbResult<Vec<ColumnInfo>>;
     fn count(&self, table: &str) -> DbResult<i64>;
@@ -237,6 +245,9 @@ pub trait DbLink: Send {
         Ok((page, total))
     }
     fn query(&self, sql: &str) -> DbResult<QueryResult>;
+    /// Native ALTER statements, applied atomically with an FK check before
+    /// commit. Failure must leave the original schema and rows intact.
+    fn apply_schema_changes(&self, statements: &[String]) -> DbResult<Duration>;
     /// Non-SELECT statement; returns affected-row count (-1 if unknown).
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)>;
     fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()>;
@@ -362,6 +373,7 @@ pub(crate) fn rowid_predicate(table: &str, alias: &str, parameter: &str) -> Stri
 pub struct EmbeddedDb {
     conn: Connection,
     name: String,
+    readonly: bool,
     // Mutexes, not RefCells: the whole backend moves to the worker
     // thread (worker.rs), which needs Send. They are never contended —
     // one thread owns the backend — so lock().unwrap() never blocks
@@ -485,11 +497,24 @@ impl EmbeddedDb {
     /// (e.g. libtimeless_ext.so), load it — capability, not dependency:
     /// failures are reported but the db still opens.
     pub fn open(path: &str) -> DbResult<(Self, Option<String>)> {
-        let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        Self::open_with_mode(path, false)
+    }
+
+    pub fn open_with_mode(path: &str, readonly: bool) -> DbResult<(Self, Option<String>)> {
+        let flags = if readonly {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        } else {
+            rusqlite::OpenFlags::default()
+        };
+        let conn = Connection::open_with_flags(path, flags).map_err(|e| e.to_string())?;
         // Declared foreign keys should MEAN something: enforce them.
         // (SQLite defaults to off; existing orphan rows only surface
         // as errors on writes that would violate a constraint.)
         let _ = conn.execute_batch("PRAGMA foreign_keys = ON");
+        if readonly {
+            conn.execute_batch("PRAGMA query_only = ON")
+                .map_err(|e| e.to_string())?;
+        }
         let mut warning = None;
         if let Ok(ext) = std::env::var("PHOSPHOR_EXT") {
             if !ext.is_empty() {
@@ -503,10 +528,75 @@ impl EmbeddedDb {
                 }
             }
         }
+        if readonly {
+            // Restore the setting after extension initialization too.
+            conn.execute_batch("PRAGMA query_only = ON")
+                .map_err(|e| e.to_string())?;
+            // query_only also protects temp/attached databases and a scratch
+            // connection. The authorizer prevents SQL from undoing it or
+            // attaching another file. SQLite itself rejects writes, including
+            // CTEs and RETURNING statements submitted through query().
+            conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+                use rusqlite::hooks::{AuthAction, Authorization};
+                match ctx.action {
+                    AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
+                    AuthAction::Pragma {
+                        pragma_name,
+                        pragma_value,
+                    } => {
+                        let name = pragma_name.to_ascii_lowercase();
+                        let metadata = matches!(
+                            name.as_str(),
+                            "table_info"
+                                | "table_xinfo"
+                                | "table_list"
+                                | "index_list"
+                                | "index_info"
+                                | "index_xinfo"
+                                | "foreign_key_list"
+                                | "foreign_key_check"
+                                | "integrity_check"
+                                | "quick_check"
+                        );
+                        let setting = pragma_value.is_none()
+                            && matches!(
+                                name.as_str(),
+                                "query_only"
+                                    | "foreign_keys"
+                                    | "database_list"
+                                    | "compile_options"
+                                    | "data_version"
+                                    | "schema_version"
+                                    | "user_version"
+                                    | "page_count"
+                                    | "page_size"
+                                    | "freelist_count"
+                                    | "pragma_list"
+                                    | "function_list"
+                                    | "module_list"
+                                    | "collation_list"
+                            );
+                        if metadata || setting {
+                            Authorization::Allow
+                        } else {
+                            Authorization::Deny
+                        }
+                    }
+                    AuthAction::Function { function_name }
+                        if function_name.eq_ignore_ascii_case("load_extension")
+                            || function_name.eq_ignore_ascii_case("writefile") =>
+                    {
+                        Authorization::Deny
+                    }
+                    _ => Authorization::Allow,
+                }
+            }));
+        }
         Ok((
             EmbeddedDb {
                 conn,
                 name: path.to_owned(),
+                readonly,
                 rowid_cache: Mutex::new(HashMap::new()),
                 anchors: Mutex::new(HashMap::new()),
             },
@@ -682,6 +772,9 @@ impl EmbeddedDb {
 }
 
 impl DbLink for EmbeddedDb {
+    fn readonly(&self) -> bool {
+        self.readonly
+    }
     fn backend(&self) -> &'static str {
         "embedded"
     }
@@ -832,9 +925,21 @@ impl DbLink for EmbeddedDb {
         // of planning/executing a full scan we truncate client-side.
         // QUERY_CAP+1 rows => truncated flag stays exact.
         let capped = apply_cap(sql, QUERY_CAP + 1);
-        let mut stmt = self.conn.prepare(&capped).map_err(|e| e.to_string())?;
+        let mut stmt = self.conn.prepare(&capped).map_err(|e| {
+            if self.readonly {
+                format!("read-only query: {e}")
+            } else {
+                e.to_string()
+            }
+        })?;
         let columns: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
-        let (mut rows, _) = Self::collect_rows(&mut stmt, &[], QUERY_CAP + 1)?;
+        let (mut rows, _) = Self::collect_rows(&mut stmt, &[], QUERY_CAP + 1).map_err(|e| {
+            if self.readonly {
+                format!("read-only query: {e}")
+            } else {
+                e
+            }
+        })?;
         let truncated = rows.len() > QUERY_CAP;
         rows.truncate(QUERY_CAP);
         Ok(QueryResult {
@@ -845,7 +950,52 @@ impl DbLink for EmbeddedDb {
         })
     }
 
+    fn apply_schema_changes(&self, statements: &[String]) -> DbResult<Duration> {
+        self.require_writable()?;
+        if self
+            .conn
+            .pragma_query_value(None, "legacy_alter_table", |r| r.get::<_, bool>(0))
+            .map_err(|e| e.to_string())?
+        {
+            return Err(
+                "table editing requires PRAGMA legacy_alter_table=OFF to preserve dependencies"
+                    .into(),
+            );
+        }
+        let start = Instant::now();
+        // Refuse to take over a caller's open transaction. The transaction
+        // object rolls back both statement and validation failures on drop.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let result = (|| {
+            for sql in statements {
+                tx.execute_batch(sql).map_err(|e| e.to_string())?;
+            }
+            let mut check = tx
+                .prepare("PRAGMA foreign_key_check")
+                .map_err(|e| e.to_string())?;
+            if check
+                .query([])
+                .map_err(|e| e.to_string())?
+                .next()
+                .map_err(|e| e.to_string())?
+                .is_some()
+            {
+                return Err("foreign key check failed; schema changes rolled back".into());
+            }
+            drop(check);
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(start.elapsed())
+        })();
+        self.rowid_cache.lock().unwrap().clear();
+        self.anchors.lock().unwrap().clear();
+        result
+    }
+
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)> {
+        self.require_writable()?;
         let start = Instant::now();
         // Multi-statement input goes through execute_batch (count
         // unknown): single-statement execute would prepare later
@@ -887,6 +1037,7 @@ impl DbLink for EmbeddedDb {
     }
 
     fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
+        self.require_writable()?;
         if changes.is_empty() {
             return Ok(());
         }
@@ -915,6 +1066,7 @@ impl DbLink for EmbeddedDb {
     }
 
     fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64> {
+        self.require_writable()?;
         let sql = if changes.is_empty() {
             format!("INSERT INTO {} DEFAULT VALUES", Self::quote(table))
         } else {
@@ -939,6 +1091,7 @@ impl DbLink for EmbeddedDb {
     }
 
     fn delete_row(&self, table: &str, rowid: i64) -> DbResult<()> {
+        self.require_writable()?;
         let alias = self
             .rowid_column(table)?
             .ok_or("no unambiguous row identity; deleting is read-only")?;
@@ -1025,6 +1178,103 @@ impl DbLink for EmbeddedDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_schema_changes_preserve_constraints_and_roll_back_failures() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(crate::test_support::SCHEMA_SQL).unwrap();
+        crate::test_support::assert_native_schema_safety(&db);
+        db.execute("BEGIN; INSERT INTO audit VALUES ('pending')")
+            .unwrap();
+        assert!(db
+            .apply_schema_changes(&["ALTER TABLE audit ADD COLUMN extra TEXT".into()])
+            .is_err());
+        assert!(!db.conn.is_autocommit(), "caller transaction retained");
+        assert_eq!(db.count("audit").unwrap(), 3);
+        db.execute("ROLLBACK").unwrap();
+        assert_eq!(db.count("audit").unwrap(), 2);
+        db.execute("PRAGMA legacy_alter_table=ON").unwrap();
+        assert!(db
+            .apply_schema_changes(&["ALTER TABLE goods RENAME TO broken".into()])
+            .is_err());
+        assert_eq!(db.count("goods").unwrap(), 2);
+    }
+
+    #[test]
+    fn schema_changes_check_foreign_keys_before_commit() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "PRAGMA foreign_keys=OFF; CREATE TABLE p(id INTEGER PRIMARY KEY);
+            CREATE TABLE c(pid INTEGER REFERENCES p(id)); INSERT INTO c VALUES (7);",
+        )
+        .unwrap();
+        let error = db
+            .apply_schema_changes(&["ALTER TABLE c ADD COLUMN note TEXT".into()])
+            .unwrap_err();
+        assert!(error.contains("foreign key check"), "{error}");
+        assert_eq!(db.columns("c").unwrap().len(), 1);
+        assert_eq!(db.count("c").unwrap(), 1);
+        assert!(db.conn.is_autocommit());
+        assert_eq!(
+            db.conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "connection settings retained"
+        );
+    }
+
+    #[test]
+    fn readonly_connection_blocks_every_write_path_and_pragma_escape() {
+        let file = crate::test_support::TestDb::new();
+        file.connect().execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1, 'Ada')").unwrap();
+        let before = std::fs::read(file.path()).unwrap();
+        let (db, _) = EmbeddedDb::open_with_mode(file.path(), true).unwrap();
+        assert!(db.readonly());
+        assert_eq!(db.columns("t").unwrap().len(), 2);
+        assert_eq!(db.open_window("t", 0, 10).unwrap().1, 1);
+        assert!(db.query("WITH x AS (SELECT 1) SELECT * FROM t").is_ok());
+        for sql in [
+            "WITH x AS (SELECT 1) INSERT INTO t(name) SELECT 'bad' FROM x RETURNING * -- limit",
+            "UPDATE t SET name='bad' RETURNING * -- limit",
+            "DELETE FROM t RETURNING * -- limit",
+            "PRAGMA query_only=OFF -- limit",
+            "PRAGMA user_version=99 -- limit",
+            "ATTACH ':memory:' AS extra -- limit",
+        ] {
+            assert!(db.query(sql).is_err(), "allowed {sql}");
+        }
+        assert!(db
+            .execute("PRAGMA query_only=OFF; INSERT INTO t VALUES (2, 'bad')")
+            .is_err());
+        assert!(db
+            .update_row("t", 1, &[("name".into(), PValue::Text("bad".into()))])
+            .is_err());
+        assert!(db.insert_row("t", &[]).is_err());
+        assert!(db.delete_row("t", 1).is_err());
+        assert!(db
+            .apply_schema_changes(&["ALTER TABLE t ADD COLUMN extra TEXT".into()])
+            .is_err());
+        // Even an internal caller bypassing DbLink cannot disable the guard.
+        assert!(db.conn.execute_batch("PRAGMA query_only=OFF").is_err());
+        assert!(db
+            .conn
+            .execute_batch("CREATE TEMP TABLE scratch(x)")
+            .is_err());
+        crate::store::pref_set(&db, "theme", "amber");
+        assert_eq!(db.tables().unwrap().len(), 1);
+        assert_eq!(std::fs::read(file.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn readonly_open_does_not_create_missing_file_and_protects_scratch() {
+        let missing = crate::test_support::TestDb::new();
+        assert!(EmbeddedDb::open_with_mode(missing.path(), true).is_err());
+        assert!(!std::path::Path::new(missing.path()).exists());
+        let (db, _) = EmbeddedDb::open_with_mode(":memory:", true).unwrap();
+        assert!(db.query("SELECT 1").is_ok());
+        assert!(db.conn.execute_batch("CREATE TABLE t(x)").is_err());
+    }
 
     fn testdb() -> EmbeddedDb {
         let (db, _) = EmbeddedDb::open(":memory:").unwrap();

@@ -551,7 +551,7 @@ pub struct App {
     pub app_home: Option<String>,
     /// `--app --readonly`: a kiosk that browses and runs reports but
     /// refuses every write. Set by main before the loop starts.
-    pub readonly: bool,
+    readonly: bool,
     /// Split orientation: false = side by side (default), true = master
     /// stacked above the detail pane (`H` toggles; remembered).
     pub split_horizontal: bool,
@@ -644,12 +644,13 @@ pub struct App {
 
 impl App {
     pub fn new(db: Box<dyn DbLink>, warning: Option<String>) -> Self {
+        let readonly = db.readonly();
         let mut app = App {
             // The worker takes ownership of the connection here; every
             // db call below round-trips to it (slice 1: blocking parity).
             db: crate::worker::spawn(db),
             app_home: None,
-            readonly: false,
+            readonly,
             split_horizontal: false,
             theme: &theme::GREEN,
             shimmer: false,
@@ -3256,41 +3257,21 @@ impl App {
                 let draft = st.draft.clone();
                 let schema = st.original.clone();
                 match schema {
-                    // TABLE EDITOR: apply the compiled script (ALTERs,
-                    // or the rebuild — both transactional).
+                    // TABLE EDITOR: native ALTERs, applied atomically.
                     Some(schema) => {
                         let table = draft.table.clone();
-                        // Capture index definitions BEFORE applying: a
-                        // rebuild drops them with the old table.
-                        let idx_sql: Vec<String> = self
-                            .db
-                            .query(&format!(
-                                "SELECT sql FROM sqlite_master WHERE type = 'index' \
-                                 AND tbl_name = {} AND sql IS NOT NULL",
-                                crate::store::q(&schema.table)
-                            ))
-                            .map(|q| {
-                                q.rows
-                                    .iter()
-                                    .filter_map(|r| match r.first() {
-                                        Some(PValue::Text(t)) => Some(t.clone()),
-                                        _ => None,
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        match draft.apply_script(&schema, &idx_sql) {
+                        match draft.apply_script(&schema) {
                             Ok(lines) if lines.is_empty() => {
                                 self.say("no structural changes to apply");
                             }
                             Ok(lines) => {
                                 let count = lines.len();
-                                let sql = lines.join(";\n");
-                                match self.db.execute(&sql) {
-                                    Ok((_, elapsed)) => {
+                                match self.db.apply_schema_changes(&lines) {
+                                    Ok(elapsed) => {
                                         self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
                                         self.overlay = Overlay::None;
                                         self.columns_cache.remove(&table);
+                                        self.columns_cache.remove(&schema.table);
                                         self.reload_tables();
                                         self.open_table(&table);
                                         self.say(format!(
@@ -3299,12 +3280,8 @@ impl App {
                                         ));
                                     }
                                     Err(e) => {
-                                        // The batch aborted before COMMIT:
-                                        // roll back so nothing partial
-                                        // stays, and restore FK enforcement
-                                        // (the rebuild toggles it OFF).
-                                        let _ =
-                                            self.db.execute("ROLLBACK; PRAGMA foreign_keys = ON");
+                                        // The backend owns rollback. Keep
+                                        // this draft open for correction.
                                         self.err(e);
                                     }
                                 }
@@ -5432,7 +5409,15 @@ impl App {
                 Some(t) => {
                     self.theme = t;
                     store::pref_set(self.db.link(), "theme", t.name);
-                    self.say(format!("theme: {} (remembered)", t.name));
+                    self.say(format!(
+                        "theme: {} ({})",
+                        t.name,
+                        if self.readonly {
+                            "session only"
+                        } else {
+                            "remembered"
+                        }
+                    ));
                 }
                 None => self.err(format!(
                     "unknown theme {:?}; themes: green, amber, paper, blue",
@@ -5445,17 +5430,28 @@ impl App {
                 "on" => {
                     self.shimmer = true;
                     store::pref_set(self.db.link(), "shimmer", "on");
-                    self.say("shimmer: on (remembered)");
+                    self.say(if self.readonly {
+                        "shimmer: on (session only)"
+                    } else {
+                        "shimmer: on (remembered)"
+                    });
                 }
                 "off" => {
                     self.shimmer = false;
                     store::pref_set(self.db.link(), "shimmer", "off");
-                    self.say("shimmer: off (remembered)");
+                    self.say(if self.readonly {
+                        "shimmer: off (session only)"
+                    } else {
+                        "shimmer: off (remembered)"
+                    });
                 }
                 other => self.err(format!("set shimmer on|off (got {other:?})")),
             };
         }
         if let Some(rest) = line.strip_prefix("set boot ") {
+            if self.readonly {
+                return self.err("read-only mode: startup preferences cannot be saved");
+            }
             return match rest.trim().to_ascii_lowercase().as_str() {
                 "menu" => {
                     store::pref_set(self.db.link(), "boot", "menu");
@@ -8176,29 +8172,42 @@ mod tests {
     /// The editor declines a type change on an existing column with a
     /// clear message instead of a raw SQLite error.
     #[test]
-    fn table_editor_rebuilds_type_change() {
+    fn table_editor_refuses_lossy_rebuild_and_keeps_draft() {
         let (db, _) = EmbeddedDb::open(":memory:").unwrap();
-        db.execute("CREATE TABLE things(id INTEGER PRIMARY KEY, size TEXT);")
+        db.execute("CREATE TABLE log(value TEXT);
+                    CREATE TABLE things(id INTEGER PRIMARY KEY AUTOINCREMENT, size TEXT UNIQUE CHECK(length(size)>0));
+                    CREATE INDEX things_size ON things(size);
+                    CREATE TRIGGER things_insert AFTER INSERT ON things BEGIN INSERT INTO log VALUES(new.size); END;")
             .unwrap();
         db.execute("INSERT INTO things(size) VALUES ('big')")
             .unwrap();
         let mut a = App::new(Box::new(db), None);
+        let before =
+            a.db.query("SELECT type,name,sql FROM sqlite_schema ORDER BY name")
+                .unwrap()
+                .rows;
+        a.apply(Command::SidebarSeek('t'));
         a.apply(Command::OpenSelected);
         a.sync();
         a.apply(Command::OpenTableEditor);
         a.apply(Command::DesignerCycle); // TEXT -> REAL: a type change
         a.apply(Command::DesignerRun);
         a.sync();
-        assert!(matches!(a.overlay, Overlay::None), "applied and closed");
-        // The rebuild re-declared the column and preserved the row.
+        assert!(matches!(a.overlay, Overlay::Create(_)), "draft stays open");
         let cols = a.db.columns("things").unwrap();
-        assert_eq!(cols[1].decl_type.to_ascii_uppercase(), "REAL");
+        assert_eq!(cols[1].decl_type.to_ascii_uppercase(), "TEXT");
+        assert_eq!(
+            a.db.query("SELECT type,name,sql FROM sqlite_schema ORDER BY name")
+                .unwrap()
+                .rows,
+            before
+        );
         let q = a.db.query("SELECT size FROM things").unwrap();
         assert_eq!(q.rows[0][0], PValue::Text("big".into()));
         assert!(a
             .status
             .as_ref()
-            .is_some_and(|(m, _)| m.contains("applied")));
+            .is_some_and(|(m, error)| *error && m.contains("cannot safely rebuild")));
     }
 
     /// #15: a computed field shows a calculated, read-only value and is
@@ -8449,8 +8458,17 @@ mod tests {
     /// #21: `--readonly` refuses every write shape through the bus.
     #[test]
     fn readonly_kiosk_refuses_writes() {
-        let mut a = app();
-        a.readonly = true;
+        let file = crate::test_support::TestDb::new();
+        file.connect()
+            .execute_batch(
+                "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+            WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 500)
+            INSERT INTO t(b) SELECT 'row' || x FROM c",
+            )
+            .unwrap();
+        let before = std::fs::read(file.path()).unwrap();
+        let (db, _) = EmbeddedDb::open_with_mode(file.path(), true).unwrap();
+        let mut a = App::new(Box::new(db), None);
         a.apply(Command::OpenSelected);
         a.sync();
         // Insert form never opens.
@@ -8475,6 +8493,62 @@ mod tests {
             .is_some_and(|(m, e)| *e && m.contains("read-only")));
         let n = a.db.query("SELECT count(*) FROM t").unwrap();
         assert_eq!(n.rows[0][0], PValue::Int(500), "no row written");
+        for line in [
+            "WITH x AS (SELECT 1) INSERT INTO t(b) SELECT 'bad' FROM x RETURNING * -- limit",
+            "set boot menu",
+        ] {
+            a.prompt.input = line.into();
+            a.apply(Command::PromptRun);
+            a.sync();
+            assert!(
+                a.status
+                    .as_ref()
+                    .is_some_and(|(m, e)| *e && m.contains("read-only")),
+                "{:?}",
+                a.status
+            );
+        }
+        for line in ["set theme amber", "set shimmer on"] {
+            a.prompt.input = line.into();
+            a.apply(Command::PromptRun);
+            assert!(a
+                .status
+                .as_ref()
+                .is_some_and(|(m, e)| !*e && m.contains("session only")));
+        }
+        assert_eq!(a.theme.name, "amber");
+        assert!(a.shimmer);
+        a.apply(Command::ToggleSplitDir);
+        assert_eq!(
+            a.db.tables().unwrap().len(),
+            1,
+            "no preference catalogs created"
+        );
+        assert_eq!(std::fs::read(file.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn readonly_saved_query_cannot_mutate_the_database() {
+        let file = crate::test_support::TestDb::new();
+        file.connect()
+            .execute_batch(
+                "CREATE TABLE t(name TEXT); INSERT INTO t VALUES ('Ada');
+            CREATE TABLE _phosphor_queries(name TEXT, sql_text TEXT);
+            INSERT INTO _phosphor_queries VALUES ('unsafe', 'DELETE FROM t RETURNING * -- limit')",
+            )
+            .unwrap();
+        let before = std::fs::read(file.path()).unwrap();
+        let (db, _) = EmbeddedDb::open_with_mode(file.path(), true).unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.prompt.input = "run unsafe".into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, e)| *e && m.contains("read-only")));
+        assert_eq!(a.db.count("t").unwrap(), 1);
+        assert_eq!(std::fs::read(file.path()).unwrap(), before);
     }
 
     /// #15: F7 on an FK field opens a picker over the parent table and
@@ -8804,7 +8878,7 @@ mod tests {
     }
 
     #[test]
-    fn table_editor_preserves_untouched_defaults_and_accepts_changes() {
+    fn table_editor_preserves_defaults_and_refuses_lossy_default_changes() {
         let (db, _) = EmbeddedDb::open(":memory:").unwrap();
         db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, state TEXT DEFAULT 'new')")
             .unwrap();
@@ -8828,8 +8902,8 @@ mod tests {
             Some("'new'")
         );
 
-        // Changing the default retains the designer's plain-text input
-        // rules; clearing it removes the DEFAULT clause altogether.
+        // A changed default would need a rebuild. Preserve the live
+        // default and the user's draft until a full migration is authored.
         for input in [Some("ready"), None] {
             a.apply(Command::DesignerEditAlt);
             if let Some(input) = input {
@@ -8844,16 +8918,17 @@ mod tests {
             a.apply(Command::DesignerCommit);
             a.apply(Command::DesignerRun);
             a.sync();
-            assert!(matches!(a.overlay, Overlay::None), "{:?}", a.status);
+            assert!(matches!(a.overlay, Overlay::Create(_)), "{:?}", a.status);
+            assert!(a
+                .status
+                .as_ref()
+                .is_some_and(|(m, e)| *e && m.contains("cannot safely rebuild")));
             a.db.execute("INSERT INTO t DEFAULT VALUES").unwrap();
             let rows =
                 a.db.query("SELECT state FROM t ORDER BY id DESC LIMIT 1")
                     .unwrap()
                     .rows;
-            assert_eq!(
-                rows[0][0],
-                input.map_or(PValue::Null, |s| PValue::Text(s.into()))
-            );
+            assert_eq!(rows[0][0], PValue::Text("new".into()));
             a.apply(Command::OpenTableEditor);
         }
     }

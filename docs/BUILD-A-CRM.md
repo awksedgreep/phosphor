@@ -41,9 +41,12 @@ here: if you loaded the extension, `CREATE VIRTUAL TABLE dbhealth USING
 dbhealth` gives the database a pulse — the ● in the status bar.)*
 
 Designs change. Stand on a table and press **`E`** for the TABLE
-EDITOR: add, rename, or drop columns, change types, even rename the
-table; **`F2`** applies it as `ALTER`s (or a rebuild when SQLite can't
-ALTER in place), showing the exact changes first. `D` twice drops the
+EDITOR: add, rename, or drop columns, or rename the table. The preview
+shows the changes; **`F2`** applies them together and checks foreign
+keys before committing. Failures roll back and keep the draft open.
+Type, constraint, and column-order changes need a SQL migration;
+the editor refuses rebuilds that could discard schema details.
+`D` twice drops the
 whole table. *(Watch it: [tableeditor.gif](demo/ui/tableeditor.gif))*
 
 ## 2 · Put some customers in it

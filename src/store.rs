@@ -39,6 +39,9 @@ CREATE INDEX IF NOT EXISTS idx_phosphor_items_app ON _phosphor_items(app_id);
 /// namespaced key/value store. `user` is fixed for now (single-user
 /// desktop, 1988 spirit); the column is here for sqld multi-user later.
 pub fn pref_set(db: &dyn DbLink, key: &str, value: &str) {
+    if db.readonly() {
+        return; // UI preferences still apply for this session.
+    }
     ensure(db).ok(); // first pref write creates the table
     let k = q(key);
     let v = q(value);

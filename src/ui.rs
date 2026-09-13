@@ -199,7 +199,7 @@ fn draw_create(f: &mut Frame, app: &App) {
         Layout::vertical([Constraint::Length(rows_h), Constraint::Fill(1)]).areas(inner);
     f.render_widget(Paragraph::new(lines), rows_area);
     // The SQL that F2 will run: CREATE for a new table, the compiled
-    // script (ALTERs or the rebuild) for an existing one — or the
+    // native ALTERs for an existing one — or the
     // reason it can't be applied.
     let empty_schema = crate::creator::EditorSchema {
         table: String::new(),
@@ -209,23 +209,11 @@ fn draw_create(f: &mut Frame, app: &App) {
     let default_schema = &empty_schema;
     let schema = st.original.as_ref().unwrap_or(default_schema);
     let sql_lines: Vec<Line> = if st.original.is_some() {
-        // TABLE EDITOR: preview the compiled script (ALTERs or the
-        // rebuild) — or the reason it can't be applied.
-        match st.draft.apply_script(schema, &[]) {
+        // TABLE EDITOR: preview native ALTERs or the refusal reason.
+        match st.draft.apply_script(schema) {
             Ok(stmts) => {
-                let renamed = !st.draft.table.eq_ignore_ascii_case(&schema.table);
                 let mut v = vec![Line::styled("CHANGES:", th.dim())];
-                if renamed {
-                    v.push(Line::styled(
-                        format!(
-                            "ALTER TABLE {} RENAME TO {};",
-                            crate::creator::quote_ident(&schema.table),
-                            crate::creator::quote_ident(&st.draft.table)
-                        ),
-                        th.bright(),
-                    ));
-                }
-                if stmts.is_empty() && !renamed {
+                if stmts.is_empty() {
                     v.push(Line::styled("(no changes)", th.dim()));
                 }
                 for s in &stmts {

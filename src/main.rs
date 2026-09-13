@@ -19,6 +19,8 @@ mod remote;
 mod report;
 mod script;
 mod store;
+#[cfg(test)]
+mod test_support;
 mod theme;
 mod ui;
 mod worker;
@@ -42,8 +44,8 @@ USAGE
 OPTIONS
     --app [NAME]   boot into an application menu crafted with the
                    Applications Generator (A inside phosphor)
-    --readonly     with --app: a kiosk; browses and reports work,
-                   every write is refused
+    --readonly     browse and run reports without database writes;
+                   combine with --app for a kiosk
     --manual       print the full manual as markdown and exit
     -h, --help     this help
     -V, --version  version
@@ -90,7 +92,11 @@ fn main() -> std::io::Result<()> {
     // over Hrana HTTP (PHOSPHOR_TOKEN for authenticated servers).
     let (link, warning): (Box<dyn DbLink>, Option<String>) =
         if path.starts_with("http://") || path.starts_with("https://") {
-            match RemoteDb::open(&path) {
+            match if readonly {
+                RemoteDb::open_with_mode(&path, true)
+            } else {
+                RemoteDb::open(&path)
+            } {
                 Ok(db) => (Box::new(db), None),
                 Err(e) => {
                     eprintln!("phosphor: cannot reach {path}: {e}");
@@ -98,7 +104,11 @@ fn main() -> std::io::Result<()> {
                 }
             }
         } else {
-            match EmbeddedDb::open(&path) {
+            match if readonly {
+                EmbeddedDb::open_with_mode(&path, true)
+            } else {
+                EmbeddedDb::open(&path)
+            } {
                 Ok((db, warn)) => (Box::new(db), warn),
                 Err(e) => {
                     eprintln!("phosphor: cannot open {path}: {e}");
@@ -107,7 +117,6 @@ fn main() -> std::io::Result<()> {
             }
         };
     let mut app = App::new(link, warning);
-    app.readonly = readonly;
     let apps = crate::appsgen::list_apps(app.db.link());
     if app_mode {
         // The database IS the application (DESIGN.md phase 5).

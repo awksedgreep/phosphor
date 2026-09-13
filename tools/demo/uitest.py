@@ -509,6 +509,9 @@ def reels():
     r.pause(1.0).expect("Customers")
     r.key("c", 1.0).expect("BROWSE customers")
     r.key("a", 0.7).expect("read-only")
+    r.key(".", 0.3).type("set theme amber").key(ENTER, 0.6).expect("session only")
+    r.type("WITH x AS (SELECT 1) INSERT INTO customers(name) SELECT 'bad' FROM x RETURNING * -- limit").key(ENTER, 0.8).expect("read-only")
+    r.type("SELECT count(*) AS unchanged_eight FROM customers").key(ENTER, 0.7).expect("unchanged_eight")
     r.key(ESC, 0.4).key(ESC, 0.5)
     out.append(r)
 
@@ -532,6 +535,9 @@ def reels():
     r.key("E", 0.8).expect("TABLE EDITOR · orders")
     r.key(F9, 0.5)                                    # cursor lands on the last field
     r.key(F2, 1.0).expect("applied 1 change")         # drop the column
+    r.key("E", 0.6).key(F3, 0.4).expect("cannot safely rebuild")
+    r.key(F2, 0.6).expect("TABLE EDITOR · orders").expect("cannot safely rebuild")
+    r.key(ESC, 0.4)
     # A throwaway table, dropped with the two-press confirm.
     r.key(".", 0.3).type("CREATE TABLE scratch(x TEXT)").key(ENTER, 0.6)
     r.key(ESC, 0.4).key(ESC, 0.4)                     # prompt -> grid -> sidebar
