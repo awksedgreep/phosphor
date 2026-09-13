@@ -78,28 +78,35 @@ pub fn import_csv(db: &dyn DbLink, table: &str, path: &str) -> DbResult<String> 
         return Err("import: no matching columns".into());
     }
 
-    // Begin transaction (best-effort; RemoteDb will batch as separate pipelines but still correct)
-    let _ = db.execute("BEGIN");
-
-    let mut inserted: i64 = 0;
-    for result in rdr.records() {
-        let record = result.map_err(|e| format!("import: csv record: {e}"))?;
-        let mut changes: Vec<(String, PValue)> = Vec::with_capacity(hdr_to_col.len());
-        for (hi, col_name, decl) in &hdr_to_col {
-            // Empty field → NULL, the dBASE contract; NOT NULL constraints
-            // then fire, which is exactly what the user wants to know.
-            let raw = record.get(*hi).unwrap_or("").trim();
-            changes.push((col_name.clone(), PValue::parse(raw, decl)));
+    // Own this transaction: a failed BEGIN must never let the import
+    // join, commit, or roll back an existing caller's work.
+    db.execute("BEGIN")
+        .map_err(|e| format!("import: begin: {e}"))?;
+    let result = (|| {
+        let mut inserted: i64 = 0;
+        for result in rdr.records() {
+            let record = result.map_err(|e| format!("import: csv record: {e}"))?;
+            let mut changes: Vec<(String, PValue)> = Vec::with_capacity(hdr_to_col.len());
+            for (hi, col_name, decl) in &hdr_to_col {
+                // Empty field → NULL; NOT NULL constraints still apply.
+                let raw = record.get(*hi).unwrap_or("").trim();
+                changes.push((col_name.clone(), PValue::parse(raw, decl)));
+            }
+            db.insert_row(table, &changes)
+                .map_err(|e| format!("import: row {}: {e}", inserted + 1))?;
+            inserted += 1;
         }
-        db.insert_row(table, &changes).map_err(|e| {
-            let _ = db.execute("ROLLBACK");
-            format!("import: row {}: {e}", inserted + 1)
-        })?;
-        inserted += 1;
+        db.execute("COMMIT")
+            .map_err(|e| format!("import: commit: {e}"))?;
+        Ok(format!("imported {inserted} row(s) into {table:?}"))
+    })();
+    match result {
+        Ok(message) => Ok(message),
+        Err(error) => match db.execute("ROLLBACK") {
+            Ok(_) => Err(error),
+            Err(rollback) => Err(format!("{error}; rollback: {rollback}")),
+        },
     }
-
-    let _ = db.execute("COMMIT");
-    Ok(format!("imported {inserted} row(s) into {table:?}"))
 }
 
 /// `export <source> <path>` — `source` is a table name or a SELECT/WITH.
@@ -198,6 +205,42 @@ mod tests {
         let err = import_csv(&db, "t", &path).unwrap_err();
         assert!(err.contains("unknown column"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failed_import_rolls_back_rows_and_releases_its_transaction() {
+        for (case, csv, ddl, expected_error) in [
+            ("short", "name,city\nAda,London\nGrace\n", "CREATE TABLE t(name TEXT, city TEXT)", "csv record"),
+            ("constraint", "name,city\nAda,London\nAda,Arlington\n", "CREATE TABLE t(name TEXT UNIQUE, city TEXT)", "row 2"),
+            ("commit", "name,city\nAda,London\n", "CREATE TABLE cities(name TEXT PRIMARY KEY); CREATE TABLE t(name TEXT, city TEXT REFERENCES cities(name) DEFERRABLE INITIALLY DEFERRED)", "commit"),
+        ] {
+            let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+            db.execute(ddl).unwrap();
+            let path = tmp_path(case);
+            fs::write(&path, csv).unwrap();
+            let error = import_csv(&db, "t", &path).unwrap_err();
+            fs::remove_file(path).unwrap();
+            assert!(error.contains(expected_error), "{case}: {error}");
+            assert_eq!(db.count("t").unwrap(), 0, "{case}: partial import survived");
+            db.execute("BEGIN").expect("the import must release its transaction");
+            db.execute("ROLLBACK").unwrap();
+        }
+    }
+
+    #[test]
+    fn import_refuses_to_join_or_finish_an_existing_transaction() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(name TEXT); BEGIN; INSERT INTO t VALUES ('existing')")
+            .unwrap();
+        let path = tmp_path("existing-transaction");
+        fs::write(&path, "name\nimported\n").unwrap();
+        let error = import_csv(&db, "t", &path).unwrap_err();
+        fs::remove_file(path).unwrap();
+        assert!(error.contains("begin"), "{error}");
+        assert_eq!(db.count("t").unwrap(), 1);
+        // Our caller's work is still pending and under its control.
+        db.execute("ROLLBACK").unwrap();
+        assert_eq!(db.count("t").unwrap(), 0);
     }
 
     #[test]
