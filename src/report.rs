@@ -53,6 +53,7 @@ impl ReportSpec {
         })
     }
 
+    #[cfg(test)]
     pub fn save(&self, db: &dyn DbLink) -> DbResult<()> {
         store::upsert(
             db,
@@ -435,10 +436,10 @@ pub struct ReportState {
     pub editing: Option<String>,
     /// Columns of the current source (group_by cycles through these).
     pub columns: Vec<String>,
-    /// True while the F6 "save as" prompt owns the buffer.
+    /// True while a Save, Save As, or Rename prompt owns the buffer.
     pub naming: bool,
     /// The name this report was loaded under (None when it is unsaved),
-    /// so a rename can retire the old catalog row.
+    /// so Save updates it and Rename moves it atomically.
     pub original_name: Option<String>,
 }
 

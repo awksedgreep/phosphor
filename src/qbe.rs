@@ -120,6 +120,11 @@ fn starts_with_op(f: &str) -> bool {
 impl QbeSpec {
     pub fn new(db: &dyn DbLink, table: &str) -> DbResult<QbeSpec> {
         let info = db.columns(table)?;
+        if info.is_empty() {
+            return Err(format!(
+                "QBE needs an existing table with columns: {table:?}"
+            ));
+        }
         let relations = discover_relations(db, table, &info);
         let cols = info
             .into_iter()
@@ -244,6 +249,7 @@ impl QbeSpec {
         sql
     }
 
+    #[cfg(test)]
     pub fn save(&self, db: &dyn DbLink, name: &str) -> DbResult<()> {
         store::upsert(
             db,
@@ -264,7 +270,81 @@ impl QbeSpec {
             .filter(|s| !s.is_empty())
     }
 
-    fn to_json(&self) -> String {
+    pub fn load(db: &dyn DbLink, name: &str) -> DbResult<Option<Self>> {
+        if db
+            .query("SELECT 1 FROM sqlite_schema WHERE name = '_phosphor_queries'")?
+            .rows
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let rows = db
+            .query(&format!(
+                "SELECT qbe_json FROM _phosphor_queries WHERE name = {} LIMIT 1",
+                store::q(name)
+            ))?
+            .rows;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&store::text(row.first())).map_err(|_| {
+                format!(
+                    "query {name:?} has no valid QBE design; run {name} still runs its saved SQL"
+                )
+            })?;
+        let invalid = || format!("query {name:?} has an invalid or unsupported QBE design");
+        if json["v"].as_u64() != Some(1) {
+            return Err(invalid());
+        }
+        let table = json["table"].as_str().ok_or_else(invalid)?;
+        let mut spec = Self::new(db, table)?;
+        let cols = json["cols"].as_array().ok_or_else(invalid)?;
+        if cols.is_empty() {
+            return Err(invalid());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for col in cols {
+            let name = col["name"].as_str().ok_or_else(invalid)?;
+            if !seen.insert(name) {
+                return Err(invalid());
+            }
+            let target = spec.cols.iter_mut().find(|c| c.name == name)
+                .ok_or_else(|| format!("saved QBE column {name:?} is missing from {table:?}; repair the table or create a new query"))?;
+            target.show = col["show"].as_bool().ok_or_else(invalid)?;
+            target.filter = col["filter"].as_str().ok_or_else(invalid)?.into();
+            target.sort = match col["sort"].as_str() {
+                Some("") => Sort::None,
+                Some("asc") => Sort::Asc,
+                Some("desc") => Sort::Desc,
+                _ => return Err(invalid()),
+            };
+        }
+        if !json["join"].is_null() {
+            let j = &json["join"];
+            let join = Join {
+                table: j["table"].as_str().ok_or_else(invalid)?.into(),
+                left: j["left"].as_str().ok_or_else(invalid)?.into(),
+                right: j["right"].as_str().ok_or_else(invalid)?.into(),
+            };
+            if !spec.relations.contains(&join) {
+                return Err(
+                    "the saved QBE join is no longer declared in the table's foreign keys".into(),
+                );
+            }
+            spec.join = Some(join);
+        }
+        if !json["group_by"].is_null() {
+            let group = json["group_by"].as_str().ok_or_else(invalid)?;
+            if !spec.cols.iter().any(|c| c.name == group) {
+                return Err(invalid());
+            }
+            spec.group_by = Some(group.into());
+        }
+        Ok(Some(spec))
+    }
+
+    pub fn to_json(&self) -> String {
         let cols: Vec<serde_json::Value> = self
             .cols
             .iter()
@@ -297,6 +377,7 @@ pub struct QbeState {
     /// the same buffer with `naming = true`.
     pub editing: Option<String>,
     pub naming: bool,
+    pub original_name: Option<String>,
 }
 
 impl QbeState {
@@ -306,6 +387,7 @@ impl QbeState {
             cursor: 0,
             editing: None,
             naming: false,
+            original_name: None,
         }
     }
 }

@@ -1,5 +1,5 @@
 //! Rendering. Reads App, draws; the only state it writes back is the
-//! measured viewport (visible_rows / visible_cols_width) for paging math.
+//! measured viewport and the status panel's clamped scroll position.
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -67,7 +67,6 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
         draw_detail_panel(f, app, state, d_area);
     }
     draw_prompt(f, app, prompt_line);
-    draw_status(f, app, status_line);
 
     match &app.overlay {
         Overlay::Help(_) => draw_help(f, app),
@@ -89,6 +88,11 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
         if ed.picker.is_some() {
             draw_picker(f, app, ed);
         }
+    }
+    // Outcomes stay visible even when a designer fills the screen.
+    draw_status(f, app, status_line);
+    if app.status_details.is_some() {
+        draw_status_details(f, app);
     }
     // Optional CRT scanlines (DESIGN.md "CRT affectations"): dim every
     // other screen row. A no-op unless the user opted in.
@@ -596,7 +600,7 @@ fn draw_qbe(f: &mut Frame, app: &App) {
     let area = centered(
         f.area(),
         76,
-        (st.spec.cols.len() as u16 + 10).min(f.area().height),
+        (st.spec.cols.len() as u16 + 12).min(f.area().height.saturating_sub(2)),
     );
     f.render_widget(Clear, area);
     let block = Block::default()
@@ -604,11 +608,15 @@ fn draw_qbe(f: &mut Frame, app: &App) {
         .border_style(th.bright())
         .style(th.base())
         .title(Span::styled(
-            format!(" QUERY BY EXAMPLE · {} ", st.spec.table),
+            format!(
+                " QUERY BY EXAMPLE · {} · {} ",
+                st.spec.table,
+                st.original_name.as_deref().unwrap_or("unsaved")
+            ),
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " Space show · Enter filter · s sort · J join · g group · F2 run · F6 save ",
+            " Space show · Enter filter · s sort · J join · g group · F1 help ",
             th.dim(),
         ));
     let inner = block.inner(area);
@@ -653,9 +661,13 @@ fn draw_qbe(f: &mut Frame, app: &App) {
         ]));
     }
     lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "F2 run · F6 save · F7 save as · F8 rename · Esc close",
+        th.dim(),
+    ));
     if st.naming {
         lines.push(Line::from(vec![
-            Span::styled("save as: ", th.bright()),
+            Span::styled(format!("{}: ", app.design_name_action.label()), th.bright()),
             editing_span(st.editing.as_deref().unwrap_or(""), 0, th),
         ]));
     }
@@ -692,7 +704,7 @@ fn draw_report(f: &mut Frame, app: &App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " Enter edit · Space cycle group · F2 preview · F6 save-as · Esc ",
+            " F2 preview · F6 save · F7 save as · F8 rename · Esc close ",
             th.dim(),
         ));
     let inner = block.inner(area);
@@ -727,13 +739,16 @@ fn draw_report(f: &mut Frame, app: &App) {
     if st.naming {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("save as : ", th.bright()),
+            Span::styled(
+                format!("{} : ", app.design_name_action.label()),
+                th.bright(),
+            ),
             editing_span(st.editing.as_deref().unwrap_or(""), 0, th),
         ]));
     } else {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "numeric columns total automatically; grouping adds bands + subtotals",
+            "Enter edits · Space cycles group · numeric columns total automatically",
             th.dim(),
         ));
     }
@@ -1170,7 +1185,71 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let th = app.theme;
-    let left = format!(" {} [{}]", app.db.name(), app.db.backend());
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(th.base()), area);
+    let hint = " F12 details ";
+    let hint_w = (hint.len() as u16).min(area.width);
+    let content = Rect {
+        width: area.width - hint_w,
+        ..area
+    };
+    f.render_widget(
+        Paragraph::new(hint).style(th.dim()),
+        Rect {
+            x: area.x + content.width,
+            width: hint_w,
+            ..area
+        },
+    );
+    // A message owns the available width. Connection/position telemetry
+    // must never hide a validation failure or destructive confirmation.
+    if let Some((msg, error)) = &app.status {
+        let style = if *error { th.error() } else { th.bright() };
+        let text = format!(" {}", msg.replace(['\n', '\r', '\t'], " "));
+        if let Some(g) = app.grid.as_ref().filter(|g| g.total > 0) {
+            let position = format!(" row {}/{} ", g.cur_row + 1, g.total);
+            let width = position.len() as u16;
+            if Line::raw(&text).width() + (width as usize) < content.width as usize {
+                f.render_widget(
+                    Paragraph::new(position).style(th.dim()),
+                    Rect {
+                        x: content.x + content.width - width,
+                        width,
+                        ..content
+                    },
+                );
+            }
+        }
+        let clipped = Line::raw(&text).width() > content.width as usize;
+        let text_area = Rect {
+            width: content.width.saturating_sub(u16::from(clipped)),
+            ..content
+        };
+        f.render_widget(Paragraph::new(text).style(style), text_area);
+        if clipped && content.width > 0 {
+            f.render_widget(
+                Paragraph::new("…").style(style),
+                Rect {
+                    x: content.x + content.width - 1,
+                    width: 1,
+                    ..content
+                },
+            );
+        }
+        return;
+    }
+    let name = app.db.name();
+    let short_name = if name.contains("://") {
+        name.split_once("://")
+            .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+            .unwrap_or(name)
+    } else {
+        std::path::Path::new(name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(name)
+    };
+    let left = format!(" {short_name} [{}]", app.db.backend());
     // Borrowed mid/message (were format!+clone per frame): the spans
     // borrow from `app`, which outlives the frame render.
     // The source name is deliberately omitted: the pane title above
@@ -1191,18 +1270,9 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         None => ("○", th.dim()),
     };
 
-    let (msg, msg_style) = match &app.status {
-        Some((m, true)) => (m.as_str(), th.error()),
-        Some((m, false)) => (m.as_str(), th.dim()),
-        None => ("", th.dim()),
-    };
-
-    // The position/latency/health cluster is pinned to the right edge so a
-    // long status message (startup hints, import errors) can never shove it
-    // off-screen; the message gets truncated instead.
     let right = format!("{}  {ms} {dot} ", mid.as_ref());
-    let right_w = (right.chars().count() as u16).min(area.width);
-    let split = area.width.saturating_sub(right_w);
+    let right_w = (Line::raw(&right).width() as u16).min(content.width);
+    let split = content.width.saturating_sub(right_w);
     let left_area = Rect {
         width: split,
         ..area
@@ -1212,12 +1282,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         width: right_w,
         ..area
     };
-    let line = Line::from(vec![
-        Span::styled(left, th.dim()),
-        Span::styled("  ", th.dim()),
-        Span::styled(msg, msg_style),
-    ]);
-    f.render_widget(Paragraph::new(line), left_area);
+    f.render_widget(Paragraph::new(left).style(th.dim()), left_area);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(mid.into_owned(), th.dim()),
@@ -1228,6 +1293,46 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         .alignment(Alignment::Right),
         right_area,
     );
+}
+
+fn draw_status_details(f: &mut Frame, app: &mut App) {
+    let th = app.theme;
+    let area = f.area().inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(th.base())
+        .border_style(th.bright())
+        .title(" STATUS & CONNECTION ")
+        .title_bottom(" ↑↓ scroll · PgUp/PgDn · Esc/F12 return ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let (msg, error) = app
+        .status
+        .as_ref()
+        .map(|(s, e)| (s.as_str(), *e))
+        .unwrap_or(("No status message.", false));
+    let mut text: Vec<Line> = msg
+        .lines()
+        .map(|line| Line::styled(line, if error { th.error() } else { th.bright() }))
+        .collect();
+    text.extend([
+        Line::raw(""),
+        Line::styled("Connection", th.bright()),
+        Line::raw(app.db.name()),
+        Line::raw(format!("Backend: {}", app.db.backend())),
+    ]);
+    let paragraph = Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false });
+    let max = paragraph
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    let offset = app.status_details.unwrap_or(0).min(max);
+    app.status_details = Some(offset);
+    f.render_widget(paragraph.scroll((offset, 0)), inner);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

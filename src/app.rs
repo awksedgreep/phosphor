@@ -34,9 +34,8 @@ pub enum Focus {
     Prompt,
 }
 
-// The design states differ widely in size (a full EDIT form vs a small
-// help cursor); App holds the active screen and, while Help is open,
-// one suspended screen, so the largest variant sets a bounded cost.
+// Design states differ widely in size (a full EDIT form vs a help
+// cursor). Help and preview history own suspended screens intact.
 #[allow(clippy::large_enum_variant)]
 pub enum Overlay {
     None,
@@ -53,6 +52,18 @@ pub enum Overlay {
     AppMenu(AppMenuState),
     /// The multi-line Lua editor for a form lifecycle script.
     ScriptEditor(ScriptState),
+}
+
+struct PreviewReturn {
+    overlay: Overlay,
+    browser: Option<BrowserReturn>,
+    focus: Focus,
+    menu_launched: bool,
+}
+
+struct BrowserReturn {
+    grid: Option<Grid>,
+    detail: Option<DetailState>,
 }
 
 /// What the script editor is bound to: a form lifecycle event, or the
@@ -417,6 +428,8 @@ pub enum Command {
     DesignerCommit,
     DesignerRun,
     DesignerSave,
+    DesignerSaveAs,
+    DesignerRename,
     DesignerAdd,
     DesignerDelete,
     DesignerSwap(i64),
@@ -478,6 +491,8 @@ pub enum Command {
     PaintDelete,
     HelpScroll(i64),
     HelpTopic(i64),
+    StatusDetails,
+    StatusScroll(i64),
     /// The TABLE DESIGNER (dBASE CREATE structure screen).
     OpenCreate(Option<String>),
     CreatePk,
@@ -518,13 +533,13 @@ pub enum Command {
 }
 
 /// An outstanding async worker job and what to do with its answer.
-/// The single worker answers FIFO, so arrivals install in submit
-/// order and converge on the latest state without generation guards.
+/// The single worker answers FIFO. QBE also tracks cancellation so a
+/// result cannot replace a revised or closed design.
 enum PendingOp {
     /// Table open: build + swap in a fresh grid on arrival.
     Open { name: String },
     /// Ad-hoc SELECT: build a query grid on arrival.
-    Select { seq: u64 },
+    Select { seq: u64, preview: bool },
     /// Refresh: total + window into the live grid, then re-seek.
     Refill {
         name: String,
@@ -582,6 +597,9 @@ pub struct App {
     /// The complete screen suspended by Help, including uncommitted
     /// input. Taking it on return prevents a second Help from nesting.
     help_return: Option<Overlay>,
+    preview_returns: Vec<PreviewReturn>,
+    query_preview: Option<crate::worker::Token>,
+    pub design_name_action: store::DesignSave,
     pub tables: Vec<TableInfo>,
     pub sidebar_idx: usize,
     pub grid: Option<Grid>,
@@ -591,6 +609,8 @@ pub struct App {
     pub prompt: Prompt,
     /// (message, is_error) for the status line.
     pub status: Option<(String, bool)>,
+    /// Full message and connection details; opening this leaves drafts intact.
+    pub status_details: Option<u16>,
     pub last_ms: Option<f64>,
     pub health: Option<String>,
     pub quit: bool,
@@ -675,6 +695,10 @@ impl App {
             focus: Focus::Sidebar,
             overlay: Overlay::None,
             help_return: None,
+            preview_returns: Vec::new(),
+            query_preview: None,
+            design_name_action: store::DesignSave::Save,
+            status_details: None,
             tables: Vec::new(),
             sidebar_idx: 0,
             grid: None,
@@ -856,41 +880,59 @@ impl App {
                 }
                 Err(e) => self.err(e),
             },
-            (PendingOp::Select { seq }, DbResponse::Query(r)) => match r {
-                Ok(q) => {
-                    let n = q.rows.len();
-                    let truncated = q.truncated;
-                    let mut grid = Grid {
-                        source: GridSource::Query { truncated },
-                        columns: q.columns,
-                        total: n as i64,
-                        cache: q.rows,
-                        cache_start: 0,
-                        rowids: None,
-                        cur_row: 0,
-                        cur_col: 0,
-                        row_off: 0,
-                        col_off: 0,
-                        widths: Vec::new(),
-                        manual: HashMap::new(),
-                        frozen: 0,
-                    };
-                    grid.compute_widths();
-                    self.grid = Some(grid);
-                    self.focus = Focus::Grid;
-                    self.pending_edit = None; // new result: parked rows are void
-                    self.close_detail(); // query results have no child links
-                    self.last_ms = Some(took.as_secs_f64() * 1000.0);
-                    if self.status_seq == seq {
-                        self.say(if truncated {
-                            format!("{n} rows (capped) — add a WHERE or LIMIT")
-                        } else {
-                            format!("{n} row(s)")
-                        });
+            (PendingOp::Select { seq, preview }, DbResponse::Query(r)) => {
+                if preview {
+                    if self.query_preview != Some(tag) || !matches!(self.overlay, Overlay::Qbe(_)) {
+                        return;
                     }
+                    self.query_preview = None;
                 }
-                Err(e) => self.err(e),
-            },
+                match r {
+                    Ok(q) => {
+                        if preview {
+                            self.park_preview();
+                        }
+                        let n = q.rows.len();
+                        let truncated = q.truncated;
+                        let mut grid = Grid {
+                            source: GridSource::Query { truncated },
+                            columns: q.columns,
+                            total: n as i64,
+                            cache: q.rows,
+                            cache_start: 0,
+                            rowids: None,
+                            cur_row: 0,
+                            cur_col: 0,
+                            row_off: 0,
+                            col_off: 0,
+                            widths: Vec::new(),
+                            manual: HashMap::new(),
+                            frozen: 0,
+                        };
+                        grid.compute_widths();
+                        self.grid = Some(grid);
+                        self.focus = Focus::Grid;
+                        self.pending_edit = None; // new result: parked rows are void
+                        self.close_detail(); // query results have no child links
+                        self.last_ms = Some(took.as_secs_f64() * 1000.0);
+                        if self.status_seq == seq {
+                            self.say(if truncated {
+                                format!("{n} rows (capped) — add a WHERE or LIMIT")
+                            } else {
+                                format!(
+                                    "{n} row(s){}",
+                                    if preview {
+                                        " · Esc returns to QBE"
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            });
+                        }
+                    }
+                    Err(e) => self.err(e),
+                }
+            }
             (
                 PendingOp::Refill {
                     name,
@@ -1264,6 +1306,20 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == Char('q') {
             return Some(Command::Quit);
         }
+        if key.code == F(12) {
+            return Some(Command::StatusDetails);
+        }
+        if self.status_details.is_some() {
+            return Some(match key.code {
+                Esc | Char('q') => Command::Back,
+                Up | Char('k') => Command::StatusScroll(-1),
+                Down | Char('j') => Command::StatusScroll(1),
+                PageUp => Command::StatusScroll(-10),
+                PageDown | Char(' ') => Command::StatusScroll(10),
+                Home => Command::StatusScroll(i64::MIN),
+                _ => return None,
+            });
+        }
         // Help is available during input as well as between edits.
         if key.code == F(1) {
             return Some(if matches!(self.overlay, Overlay::Help(_)) {
@@ -1390,6 +1446,8 @@ impl App {
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
                 (None, F(6)) => Command::DesignerSave,
+                (None, F(7)) => Command::DesignerSaveAs,
+                (None, F(8)) => Command::DesignerRename,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -1406,6 +1464,8 @@ impl App {
                 (None, Enter) => Command::DesignerEditBegin,
                 (None, F(2)) => Command::DesignerRun,
                 (None, F(6)) => Command::DesignerSave,
+                (None, F(7)) => Command::DesignerSaveAs,
+                (None, F(8)) => Command::DesignerRename,
                 (None, Esc) => Command::Back,
                 _ => return None,
             });
@@ -1669,6 +1729,8 @@ impl App {
                 | Command::EditPage(_)
                 | Command::DeleteRow
                 | Command::DesignerSave
+                | Command::DesignerSaveAs
+                | Command::DesignerRename
                 | Command::DesignerAdd
                 | Command::DesignerDelete
                 | Command::DesignerSwap(_)
@@ -1681,14 +1743,30 @@ impl App {
         // The command bus is the ONLY place state changes, so one flag
         // here drives the main loop's dirty-flag redraw (main.rs).
         self.dirty = true;
+        // An edited/cancelled QBE must not be replaced by an older result.
+        if !matches!(
+            cmd,
+            Command::DbReady(..)
+                | Command::Help
+                | Command::HelpScroll(_)
+                | Command::HelpTopic(_)
+                | Command::StatusDetails
+                | Command::StatusScroll(_)
+        ) && !(matches!(cmd, Command::Back)
+            && (matches!(self.overlay, Overlay::Help(_)) || self.status_details.is_some()))
+        {
+            self.query_preview = None;
+        }
         // Read-only kiosk (`--app --readonly`): every write-shaped
         // command is refused centrally, before any mutation.
         if self.readonly && Self::is_write_command(&cmd) {
             self.err("read-only mode: this application does not allow edits");
             return;
         }
-        let is_delete = matches!(cmd, Command::DeleteRow);
-        let is_drop = matches!(cmd, Command::DropTable);
+        let inspecting_status = matches!(cmd, Command::StatusDetails | Command::StatusScroll(_))
+            || (self.status_details.is_some() && matches!(cmd, Command::Back));
+        let is_delete = inspecting_status || matches!(cmd, Command::DeleteRow);
+        let is_drop = inspecting_status || matches!(cmd, Command::DropTable);
         match cmd {
             Command::Quit => self.quit = true,
             Command::EditType(c) => {
@@ -1770,6 +1848,18 @@ impl App {
             Command::Focus(f) => self.focus = f,
             Command::Back => self.back(),
             Command::Help => self.open_help(),
+            Command::StatusDetails => {
+                self.status_details = if self.status_details.is_some() {
+                    None
+                } else {
+                    Some(0)
+                };
+            }
+            Command::StatusScroll(d) => {
+                if let Some(offset) = &mut self.status_details {
+                    *offset = (*offset as i64).saturating_add(d).clamp(0, u16::MAX as i64) as u16;
+                }
+            }
             Command::HelpScroll(d) => {
                 if let Overlay::Help(st) = &mut self.overlay {
                     st.scroll = (st.scroll as i64 + d).clamp(0, 500) as u16;
@@ -2071,6 +2161,8 @@ impl App {
             Command::DesignerCommit => self.designer_commit(),
             Command::DesignerRun => self.designer_run(),
             Command::DesignerSave => self.designer_save(),
+            Command::DesignerSaveAs => self.designer_name_begin(store::DesignSave::SaveAs),
+            Command::DesignerRename => self.designer_name_begin(store::DesignSave::Rename),
             Command::PagerScroll(d) => {
                 if let Overlay::Pager(p) = &mut self.overlay {
                     let max = p.lines.len().saturating_sub(10) as i64;
@@ -2203,8 +2295,39 @@ impl App {
     }
 
     fn back(&mut self) {
+        if self.status_details.take().is_some() {
+            return;
+        }
         if matches!(self.overlay, Overlay::Help(_)) {
             self.overlay = self.help_return.take().unwrap_or(Overlay::None);
+            return;
+        }
+        if !self.preview_returns.is_empty()
+            && (matches!(self.overlay, Overlay::Pager(_) | Overlay::AppMenu(_))
+                || (matches!(self.overlay, Overlay::None) && self.focus != Focus::Prompt))
+        {
+            let previous = self.preview_returns.pop().unwrap();
+            self.overlay = previous.overlay;
+            self.focus = previous.focus;
+            self.menu_launched = previous.menu_launched;
+            self.say(if matches!(self.overlay, Overlay::AppMenu(_)) {
+                "returned to menu · Esc returns to designer"
+            } else {
+                "returned to design · F2 preview · F6 save"
+            });
+            if let Some(browser) = previous.browser {
+                self.grid = browser.grid;
+                self.detail = browser.detail;
+                // Responses for a parked browser may have been discarded
+                // while its pane was absent. Refill without moving it.
+                self.pending_page = None;
+                self.refresh_grid_keep_position();
+                if self.detail.is_some() {
+                    if let Err(e) = self.reload_detail_window(None) {
+                        self.err(e);
+                    }
+                }
+            }
             return;
         }
         // A parked EDIT target belongs to a form that's about to close:
@@ -2700,11 +2823,34 @@ impl App {
     }
 
     fn open_qbe(&mut self, table: Option<String>) {
+        if table.is_none()
+            && matches!(self.overlay, Overlay::None)
+            && self
+                .preview_returns
+                .last()
+                .is_some_and(|p| matches!(p.overlay, Overlay::Qbe(_)))
+        {
+            self.focus = Focus::Grid;
+            self.back();
+            return;
+        }
         let Some(table) = self.target_table(table) else {
             return self.err("qbe: no table selected (qbe <table>)");
         };
-        match QbeSpec::new(self.db.link(), &table) {
-            Ok(spec) => self.overlay = Overlay::Qbe(QbeState::new(spec)),
+        let saved = match QbeSpec::load(self.db.link(), &table) {
+            Ok(saved) => saved,
+            Err(e) => return self.err(e),
+        };
+        let original_name = saved.as_ref().map(|_| table.clone());
+        match saved
+            .map(Ok)
+            .unwrap_or_else(|| QbeSpec::new(self.db.link(), &table))
+        {
+            Ok(spec) => {
+                let mut state = QbeState::new(spec);
+                state.original_name = original_name;
+                self.overlay = Overlay::Qbe(state);
+            }
             Err(e) => self.err(e),
         }
     }
@@ -3079,33 +3225,24 @@ impl App {
     }
 
     fn designer_commit(&mut self) {
-        let mut save_as: Option<String> = None;
-        let mut save_report = false;
+        let naming = match &self.overlay {
+            Overlay::Qbe(st) if st.naming => st.editing.clone(),
+            Overlay::Report(st) if st.naming => st.editing.clone(),
+            _ => None,
+        };
+        if let Some(name) = naming {
+            self.save_named_design(name.trim());
+            return;
+        }
         let mut app_rename: Option<String> = None;
         match &mut self.overlay {
             Overlay::Qbe(st) => {
                 if let Some(buf) = st.editing.take() {
-                    if st.naming {
-                        st.naming = false;
-                        if !buf.trim().is_empty() {
-                            save_as = Some(buf.trim().to_owned());
-                        }
-                    } else {
-                        st.spec.cols[st.cursor].filter = buf;
-                    }
+                    st.spec.cols[st.cursor].filter = buf;
                 }
             }
             Overlay::Report(st) => {
-                if st.naming {
-                    st.naming = false;
-                    if let Some(buf) = st.editing.take() {
-                        let n = buf.trim().to_owned();
-                        if !n.is_empty() {
-                            st.spec.name = n;
-                        }
-                    }
-                    save_report = true;
-                } else if let Some(buf) = st.editing.take() {
+                if let Some(buf) = st.editing.take() {
                     match st.cursor {
                         0 => st.spec.title = buf,
                         1 => {
@@ -3196,39 +3333,6 @@ impl App {
             }
             _ => {}
         }
-        if let (Some(name), Overlay::Qbe(st)) = (&save_as, &self.overlay) {
-            match st.spec.save(self.db.link(), name) {
-                Ok(()) => self.say(format!("saved query {name:?} (run {name})")),
-                Err(e) => self.err(e),
-            }
-        }
-        if save_report {
-            let payload = match &self.overlay {
-                Overlay::Report(st) => Some((st.spec.clone(), st.original_name.clone())),
-                _ => None,
-            };
-            if let Some((spec, old)) = payload {
-                match spec.save(self.db.link()) {
-                    Ok(()) => {
-                        // A rename retires the old catalog row.
-                        if let Some(old) = old.filter(|o| o != &spec.name) {
-                            let _ = self.db.execute(&format!(
-                                "DELETE FROM _phosphor_reports WHERE name = {}",
-                                crate::store::q(&old)
-                            ));
-                        }
-                        if let Overlay::Report(st) = &mut self.overlay {
-                            st.original_name = Some(spec.name.clone());
-                        }
-                        self.say(format!(
-                            "saved report {:?} (report {})",
-                            spec.name, spec.name
-                        ));
-                    }
-                    Err(e) => self.err(e),
-                }
-            }
-        }
         if let Some(new) = app_rename {
             let old = match &self.overlay {
                 Overlay::Apps(st) => Some(st.app.clone()),
@@ -3255,6 +3359,22 @@ impl App {
         }
     }
 
+    fn park_preview(&mut self) {
+        // Only QBE replaces the browser with its result. Reports and app
+        // menus leave it live so pending reads and menu writes still update it.
+        let browser = matches!(self.overlay, Overlay::Qbe(_)).then(|| BrowserReturn {
+            grid: self.grid.take(),
+            detail: self.detail.take(),
+        });
+        self.preview_returns.push(PreviewReturn {
+            overlay: std::mem::replace(&mut self.overlay, Overlay::None),
+            browser,
+            focus: self.focus,
+            menu_launched: self.menu_launched,
+        });
+        self.focus = Focus::Grid;
+    }
+
     fn designer_run(&mut self) {
         // The table designer/editor's F2 is DDL; a readonly kiosk
         // never gets there.
@@ -3264,13 +3384,13 @@ impl App {
         match &self.overlay {
             Overlay::Qbe(st) => {
                 let sql = st.spec.sql();
-                self.overlay = Overlay::None;
                 self.run_select(&sql);
             }
             Overlay::Report(st) => {
                 let spec = st.spec.clone();
                 match report::render(self.db.link(), &spec) {
                     Ok(lines) => {
+                        self.park_preview();
                         self.overlay = Overlay::Pager(PagerState {
                             title: format!("REPORT · {}", spec.title),
                             lines,
@@ -3283,6 +3403,10 @@ impl App {
             }
             Overlay::Apps(st) => {
                 let app = st.app.clone();
+                if st.items.is_empty() {
+                    return self.err("add an application menu item before previewing");
+                }
+                self.park_preview();
                 self.open_app_menu(Some(app));
             }
             Overlay::AppMenu(st) => {
@@ -3349,6 +3473,15 @@ impl App {
     }
 
     fn app_run_item(&mut self, item: &AppItem) {
+        if !self.preview_returns.is_empty()
+            && matches!(self.overlay, Overlay::AppMenu(_))
+            && matches!(
+                item.kind,
+                ActionKind::Browse | ActionKind::Query | ActionKind::Report
+            )
+        {
+            self.park_preview();
+        }
         // In app mode, whatever this launches should come home to the
         // menu when it closes (found on film: Esc from a menu-launched
         // report stranded the user at the bare browser).
@@ -3443,18 +3576,96 @@ impl App {
         }
     }
 
-    fn designer_save(&mut self) {
+    fn designer_name_begin(&mut self, action: store::DesignSave) {
+        let (previous, suggestion) = match &self.overlay {
+            Overlay::Qbe(st) => (
+                st.original_name.clone(),
+                st.original_name.clone().unwrap_or_default(),
+            ),
+            Overlay::Report(st) => (st.original_name.clone(), st.spec.name.clone()),
+            _ => return,
+        };
+        self.design_name_action = action;
+        if action == store::DesignSave::Save && previous.is_some() {
+            return self.save_named_design(&suggestion);
+        }
+        if action == store::DesignSave::Rename && previous.is_none() {
+            return self.err("save the design with F6 before renaming it");
+        }
         match &mut self.overlay {
             Overlay::Qbe(st) => {
                 st.naming = true;
-                st.editing = Some(String::new());
+                st.editing = Some(suggestion);
             }
             Overlay::Report(st) => {
-                // F6 prompts for a name (prefilled), so reports can be
-                // renamed and several can share a source (issue #8).
                 st.naming = true;
-                st.editing = Some(st.spec.name.clone());
-                self.editor_fresh = true; // first keystroke replaces it
+                st.editing = Some(suggestion);
+            }
+            _ => {}
+        }
+        self.editor_fresh = true;
+    }
+
+    fn save_named_design(&mut self, name: &str) {
+        let (table, kind, previous, cols) = match &self.overlay {
+            Overlay::Qbe(st) => (
+                "_phosphor_queries",
+                "query",
+                st.original_name.clone(),
+                vec![
+                    ("table_ref", st.spec.table.clone()),
+                    ("qbe_json", st.spec.to_json()),
+                    ("sql_text", st.spec.sql()),
+                ],
+            ),
+            Overlay::Report(st) => (
+                "_phosphor_reports",
+                "report",
+                st.original_name.clone(),
+                vec![
+                    ("title", st.spec.title.clone()),
+                    ("source_sql", st.spec.source.clone()),
+                    ("group_by", st.spec.group_by.clone().unwrap_or_default()),
+                ],
+            ),
+            _ => return,
+        };
+        match store::save_design(
+            self.db.link(),
+            table,
+            kind,
+            name,
+            previous.as_deref(),
+            self.design_name_action,
+            &cols,
+        ) {
+            Ok(()) => {
+                match &mut self.overlay {
+                    Overlay::Qbe(st) => {
+                        st.original_name = Some(name.into());
+                        st.naming = false;
+                        st.editing = None;
+                    }
+                    Overlay::Report(st) => {
+                        st.spec.name = name.into();
+                        st.original_name = Some(name.into());
+                        st.naming = false;
+                        st.editing = None;
+                    }
+                    _ => {}
+                }
+                self.say(format!(
+                    "saved {kind} {name:?} · F6 updates · F7 copies · F8 renames"
+                ));
+            }
+            Err(e) => self.err(e), // Keep both design and name buffer for correction.
+        }
+    }
+
+    fn designer_save(&mut self) {
+        match &mut self.overlay {
+            Overlay::Qbe(_) | Overlay::Report(_) => {
+                self.designer_name_begin(store::DesignSave::Save);
             }
             Overlay::Form(st) => {
                 let spec = st.spec.clone();
@@ -3699,7 +3910,11 @@ impl App {
             .submit(Box::new(move |db| DbResponse::Query(db.query(&query))))
         {
             Some(tag) => {
-                self.pending.insert(tag, PendingOp::Select { seq });
+                let preview = matches!(self.overlay, Overlay::Qbe(_));
+                if preview {
+                    self.query_preview = Some(tag);
+                }
+                self.pending.insert(tag, PendingOp::Select { seq, preview });
             }
             None => self.err("database worker is gone"),
         }
@@ -4093,6 +4308,14 @@ impl App {
         row: u16,
     ) {
         use ratatui::crossterm::event::MouseEventKind as K;
+        if self.status_details.is_some() {
+            match kind {
+                K::ScrollUp => self.apply(Command::StatusScroll(-1)),
+                K::ScrollDown => self.apply(Command::StatusScroll(1)),
+                _ => {}
+            }
+            return;
+        }
         if matches!(self.overlay, Overlay::Help(_)) {
             match kind {
                 K::ScrollUp => self.apply(Command::HelpScroll(-1)),
@@ -6578,10 +6801,374 @@ pub(crate) fn assert_related_record_workflow(db: Box<dyn DbLink>) {
     );
 }
 
+/// Same designer workflow against a reopened file, rotating Hrana fixture,
+/// and the official sqld release. Saves are checked through a new connection.
+#[cfg(test)]
+pub(crate) fn assert_builder_workflow(connect: impl Fn() -> Box<dyn DbLink>) {
+    fn type_name(a: &mut App, text: &str) {
+        for c in text.chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+    }
+    let mut a = App::new(connect(), None);
+    a.db.execute("CREATE TABLE design_parent(id INTEGER PRIMARY KEY);
+        INSERT INTO design_parent VALUES(1);
+        CREATE TABLE design_rows(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES design_parent(id), label TEXT NOT NULL);
+        INSERT INTO design_rows VALUES(1,1,'one'),(2,1,'two'),(3,1,'three')").unwrap();
+    a.open_table("design_rows");
+    a.sync();
+    a.grid.as_mut().unwrap().cur_row = 1;
+    a.open_qbe(Some("design_rows".into()));
+    if let Overlay::Qbe(st) = &mut a.overlay {
+        st.spec.cols[0].filter = "> 1".into();
+        st.cursor = 2;
+    }
+    a.apply(Command::DesignerRun);
+    a.sync();
+    assert_eq!(a.grid.as_ref().unwrap().total, 2);
+    a.apply(Command::Back);
+    assert_eq!(a.grid.as_ref().unwrap().cur_row, 1);
+    let sql = if let Overlay::Qbe(st) = &mut a.overlay {
+        assert_eq!(st.cursor, 2);
+        assert_eq!(st.spec.cols[0].filter, "> 1");
+        st.spec.cols[2].show = false;
+        st.spec.cols[1].sort = crate::qbe::Sort::Desc;
+        st.spec.join = Some(st.spec.relations[0].clone());
+        st.spec.group_by = Some("parent".into());
+        st.spec.sql()
+    } else {
+        panic!("QBE draft lost")
+    };
+    a.apply(Command::DesignerSave);
+    type_name(&mut a, "design query");
+    assert!(!a.status.as_ref().unwrap().1, "{:?}", a.status);
+    a.apply(Command::DesignerSaveAs);
+    type_name(&mut a, "design copy");
+    assert_eq!(
+        QbeSpec::load(a.db.link(), "design query")
+            .unwrap()
+            .unwrap()
+            .sql(),
+        sql
+    );
+    a.apply(Command::DesignerSaveAs);
+    type_name(&mut a, "design query");
+    assert!(a.status.as_ref().unwrap().0.contains("already exists"));
+    assert!(
+        matches!(&a.overlay, Overlay::Qbe(st) if st.naming && st.editing.as_deref() == Some("design query"))
+    );
+    a.apply(Command::Back);
+    appsgen::add_item(a.db.link(), "design app", "Query").unwrap();
+    let mut item = appsgen::items(a.db.link(), "design app").remove(0);
+    item.kind = ActionKind::Query;
+    item.action_ref = "design copy".into();
+    appsgen::update_item(a.db.link(), &item).unwrap();
+    // A failure updating a menu reference must roll back the rename too.
+    a.db.execute("CREATE TRIGGER block_design_rename BEFORE UPDATE ON _phosphor_items BEGIN SELECT RAISE(ABORT, 'menu locked'); END").unwrap();
+    a.apply(Command::DesignerRename);
+    type_name(&mut a, "design moved");
+    assert!(a.status.as_ref().unwrap().0.contains("menu locked"));
+    assert!(QbeSpec::load(a.db.link(), "design moved")
+        .unwrap()
+        .is_none());
+    assert!(QbeSpec::load(a.db.link(), "design copy").unwrap().is_some());
+    assert_eq!(
+        appsgen::items(a.db.link(), "design app")[0].action_ref,
+        "design copy"
+    );
+    a.db.execute("DROP TRIGGER block_design_rename").unwrap();
+    a.apply(Command::DesignerCommit); // retry the retained name buffer
+    assert!(!a.status.as_ref().unwrap().1, "{:?}", a.status);
+    assert!(QbeSpec::load(a.db.link(), "design copy").unwrap().is_none());
+    assert_eq!(
+        appsgen::items(a.db.link(), "design app")[0].action_ref,
+        "design moved"
+    );
+    a.apply(Command::Back);
+    a.open_report(Some("design_rows".into()));
+    if let Overlay::Report(st) = &mut a.overlay {
+        st.spec.title = "Draft title".into();
+        st.spec.group_by = Some("parent".into());
+        st.cursor = 2;
+    }
+    a.apply(Command::DesignerRun);
+    assert!(matches!(a.overlay, Overlay::Pager(_)));
+    a.apply(Command::Back);
+    assert!(
+        matches!(&a.overlay, Overlay::Report(st) if st.cursor == 2 && st.spec.title == "Draft title")
+    );
+    a.apply(Command::DesignerSave);
+    type_name(&mut a, "design report");
+    if let Overlay::Report(st) = &mut a.overlay {
+        st.spec.title = "Revised title".into();
+    }
+    a.apply(Command::DesignerSave);
+    assert_eq!(
+        ReportSpec::load(a.db.link(), "design report")
+            .unwrap()
+            .title,
+        "Revised title"
+    );
+    a.apply(Command::DesignerSaveAs);
+    type_name(&mut a, "report copy");
+    assert!(ReportSpec::load(a.db.link(), "design report").is_some());
+    a.apply(Command::DesignerRename);
+    type_name(&mut a, "design report");
+    assert!(a.status.as_ref().unwrap().0.contains("already exists"));
+    assert!(ReportSpec::load(a.db.link(), "report copy").is_some());
+    a.apply(Command::Back);
+    a.db.execute("CREATE TRIGGER block_design_save BEFORE UPDATE ON _phosphor_reports BEGIN SELECT RAISE(ABORT, 'report locked'); END").unwrap();
+    if let Overlay::Report(st) = &mut a.overlay {
+        st.spec.title = "Unsaved revision".into();
+    }
+    a.apply(Command::DesignerSave);
+    assert!(a.status.as_ref().unwrap().0.contains("report locked"));
+    assert_eq!(
+        ReportSpec::load(a.db.link(), "report copy").unwrap().title,
+        "Revised title"
+    );
+    assert!(matches!(&a.overlay, Overlay::Report(st) if st.spec.title == "Unsaved revision"));
+    a.db.execute("DROP TRIGGER block_design_save").unwrap();
+    a.apply(Command::DesignerSave);
+    a.apply(Command::Back);
+    a.open_form(Some("design_rows".into()));
+    if let Overlay::Form(st) = &mut a.overlay {
+        st.spec.fields[2].label = "Crafted label".into();
+    }
+    a.apply(Command::DesignerRun); // painter
+    a.apply(Command::Back); // list, same spec
+    assert!(matches!(&a.overlay, Overlay::Form(st) if st.spec.fields[2].label == "Crafted label"));
+    a.apply(Command::DesignerSave);
+    drop(a);
+    let mut reopened = App::new(connect(), None);
+    reopened.open_qbe(Some("design moved".into()));
+    assert!(
+        matches!(&reopened.overlay, Overlay::Qbe(st) if st.spec.sql() == sql && st.original_name.as_deref() == Some("design moved"))
+    );
+    reopened.open_report(Some("report copy".into()));
+    assert!(
+        matches!(&reopened.overlay, Overlay::Report(st) if st.spec.title == "Unsaved revision" && st.spec.group_by.as_deref() == Some("parent"))
+    );
+    reopened.open_form(Some("design_rows".into()));
+    assert!(
+        matches!(&reopened.overlay, Overlay::Form(st) if st.spec.fields[2].label == "Crafted label")
+    );
+    reopened.open_apps(Some("design app".into()));
+    assert!(
+        matches!(&reopened.overlay, Overlay::Apps(st) if st.items[0].action_ref == "design moved")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::EmbeddedDb;
+
+    fn assert_status_workflow(db: Box<dyn DbLink>) {
+        use ratatui::{backend::TestBackend, Terminal};
+        fn screen(a: &mut App, terminal: &mut Terminal<TestBackend>) -> String {
+            terminal
+                .draw(|f| {
+                    crate::ui::draw(f, a);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            buffer
+                .content
+                .chunks(buffer.area.width as usize)
+                .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let mut a = App::new(db, None);
+        a.db.execute(
+            "CREATE TABLE status_rows(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+            INSERT INTO status_rows VALUES(1,'one'),(2,'two')",
+        )
+        .unwrap();
+        a.open_table("status_rows");
+        a.sync();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        a.open_form(Some("status_rows".into()));
+        if let Overlay::Form(st) = &mut a.overlay {
+            st.spec.fields[1].required = true;
+        }
+        a.apply(Command::DesignerSave);
+        a.apply(Command::Back);
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some(String::new());
+        }
+        a.apply(Command::EditSave);
+        let visible = screen(&mut a, &mut terminal);
+        assert!(visible.contains("is required"), "{visible}");
+        a.apply(Command::StatusDetails);
+        let visible = screen(&mut a, &mut terminal);
+        assert!(visible.contains("STATUS & CONNECTION"));
+        assert!(visible.contains("is required"));
+        assert!(a
+            .map_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .is_none());
+        a.apply(Command::Back);
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some("two".into());
+        }
+        a.apply(Command::EditSave); // backend failure, not frontend validation
+        assert!(screen(&mut a, &mut terminal).contains("UNIQUE constraint failed"));
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some("revised".into());
+        }
+        a.apply(Command::StatusDetails);
+        a.apply(Command::StatusDetails);
+        assert!(
+            matches!(&a.overlay, Overlay::Edit(ed) if ed.editing.as_deref() == Some("revised"))
+        );
+        a.apply(Command::EditSave);
+        assert!(screen(&mut a, &mut terminal).contains("saved"));
+        a.apply(Command::DeleteRow);
+        assert!(screen(&mut a, &mut terminal).contains("DELETE status_rows rowid 1"));
+        a.apply(Command::StatusDetails);
+        assert!(screen(&mut a, &mut terminal).contains("DELETE status_rows rowid 1"));
+        a.apply(Command::Back);
+        a.apply(Command::DeleteRow);
+        assert_eq!(
+            a.db.count("status_rows").unwrap(),
+            1,
+            "inspecting the prompt disarmed delete"
+        );
+        a.err(format!(
+            "Long failure: {} END OF FAILURE",
+            "word ".repeat(500)
+        ));
+        assert!(screen(&mut a, &mut terminal).contains("… F12 details"));
+        a.apply(Command::StatusDetails);
+        a.apply(Command::StatusScroll(i64::MAX));
+        let visible = screen(&mut a, &mut terminal);
+        assert!(visible.contains("END OF FAILURE"), "{visible}");
+        let connection = a.db.name().to_owned();
+        assert!(
+            visible.replace(['\n', ' ', '│'], "").contains(&connection),
+            "full connection missing: {visible}"
+        );
+        a.apply(Command::Back);
+        a.status = None;
+        let visible = screen(&mut a, &mut terminal);
+        assert!(visible.contains("F12 details"));
+    }
+
+    #[test]
+    fn status_is_readable_at_80_columns_with_a_long_file_path() {
+        let file = crate::test_support::TestDb::new();
+        let path = format!("{}-{}.db", file.path(), "long-database-name-".repeat(8));
+        let db = EmbeddedDb::open(&path).unwrap().0;
+        assert_status_workflow(Box::new(db));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn status_is_readable_at_80_columns_with_a_long_remote_url() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let url = format!("{}/{}", server.url, "long-connection-path/".repeat(12));
+        assert_status_workflow(Box::new(crate::remote::RemoteDb::open(&url).unwrap()));
+    }
+
+    #[test]
+    fn corrupt_saved_qbe_does_not_replace_the_current_design() {
+        let mut a = app();
+        store::ensure(a.db.link()).unwrap();
+        a.db.execute("INSERT INTO _phosphor_queries(name,qbe_json,sql_text) VALUES('broken','{}','SELECT 1')").unwrap();
+        a.open_report(Some("t".into()));
+        a.open_qbe(Some("broken".into()));
+        assert!(a.status.as_ref().unwrap().1);
+        assert!(matches!(a.overlay, Overlay::Report(_)));
+        assert_eq!(
+            QbeSpec::saved_sql(a.db.link(), "broken").as_deref(),
+            Some("SELECT 1")
+        );
+    }
+
+    #[test]
+    fn preview_return_recovers_a_detail_request_that_finished_while_hidden() {
+        let mut a = app();
+        a.db.execute(
+            "CREATE TABLE child(parent INTEGER REFERENCES t(a), note TEXT);
+            INSERT INTO child VALUES(1,'visible child')",
+        )
+        .unwrap();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.visible_cols_width = 120;
+        a.apply(Command::ToggleSplit);
+        assert!(a.pending_detail.is_some());
+        a.open_report(Some("t".into()));
+        a.apply(Command::DesignerRun);
+        a.sync(); // detail result arrives while the browser is parked
+        a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::Report(_)));
+        assert_eq!(a.detail.as_ref().unwrap().grid.total, 1);
+        assert!(a.pending_detail.is_none());
+        a.apply(Command::Back);
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 0);
+        assert_eq!(
+            a.detail.as_ref().unwrap().grid.cache[0][1],
+            PValue::Text("visible child".into())
+        );
+    }
+
+    #[test]
+    fn builders_survive_preview_save_failure_and_restart() {
+        let file = crate::test_support::TestDb::new();
+        assert_builder_workflow(|| Box::new(EmbeddedDb::open(file.path()).unwrap().0));
+    }
+
+    #[test]
+    fn remote_builders_survive_preview_save_failure_and_restart() {
+        let server = crate::test_support::HranaFixture::new(false);
+        assert_builder_workflow(|| Box::new(crate::remote::RemoteDb::open(&server.url).unwrap()));
+    }
+
+    #[test]
+    fn failed_or_cancelled_previews_keep_the_design() {
+        let mut a = app();
+        a.open_qbe(Some("t".into()));
+        if let Overlay::Qbe(st) = &mut a.overlay {
+            st.spec.cols[0].filter = "> bad_column".into();
+        }
+        a.apply(Command::DesignerRun);
+        a.sync();
+        assert!(a.status.as_ref().unwrap().1);
+        assert!(matches!(&a.overlay, Overlay::Qbe(st) if st.spec.cols[0].filter == "> bad_column"));
+        if let Overlay::Qbe(st) = &mut a.overlay {
+            st.spec.cols[0].filter = "> 1".into();
+        }
+        a.apply(Command::DesignerRun);
+        a.apply(Command::Back); // cancel before the response is installed
+        a.open_report(Some("t".into()));
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::Report(_)));
+        assert!(a.grid.is_none(), "cancelled query installed a result");
+        if let Overlay::Report(st) = &mut a.overlay {
+            st.spec.source = "SELECT bad_column FROM t".into();
+        }
+        a.apply(Command::DesignerRun);
+        assert!(a.status.as_ref().unwrap().1);
+        assert!(matches!(&a.overlay, Overlay::Report(st) if st.spec.source.contains("bad_column")));
+        a.open_qbe(Some("t".into()));
+        a.apply(Command::DesignerRun);
+        a.apply(Command::Help);
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::Help(_)));
+        a.apply(Command::Back);
+        a.apply(Command::Back);
+        assert!(
+            matches!(a.overlay, Overlay::Qbe(_)),
+            "Help lost preview return path"
+        );
+    }
 
     #[test]
     fn related_record_commands_preserve_the_parent() {
@@ -7405,7 +7992,7 @@ mod tests {
         assert_eq!(counts, vec![2, 1]);
     }
 
-    /// #8: report F6 prompts for a name; renaming retires the old row.
+    /// Save, Save As, and Rename have distinct catalog effects.
     #[test]
     fn report_save_as_names_and_renames() {
         let mut a = app();
@@ -7423,8 +8010,8 @@ mod tests {
         assert!(names.contains(&"monthly".to_owned()), "{names:?}");
         assert!(!names.contains(&"t".to_owned()), "{names:?}");
 
-        // Rename again: the old catalog row is retired.
-        a.apply(Command::DesignerSave);
+        // Rename moves the old catalog row explicitly.
+        a.apply(Command::DesignerRename);
         for c in "quarterly".chars() {
             a.apply(Command::DesignerChar(c));
         }
@@ -7604,11 +8191,12 @@ mod tests {
             GridSource::Table { .. }
         ));
         assert_eq!(a.grid.as_ref().unwrap().total, 500);
-        // App-mode Esc-at-top returns to the menu.
+        // Preview navigation unwinds through the menu to the designer.
         a.app_home = Some("crm".into());
-        a.apply(Command::Back); // grid → sidebar
-        a.apply(Command::Back); // sidebar → app menu (app mode)
+        a.apply(Command::Back);
         assert!(matches!(a.overlay, Overlay::AppMenu(_)));
+        a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::Apps(_)));
     }
 
     #[test]

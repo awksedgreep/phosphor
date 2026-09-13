@@ -7,6 +7,98 @@
 
 use crate::db::{DbLink, DbResult, PValue};
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum DesignSave {
+    Save,
+    SaveAs,
+    Rename,
+}
+
+impl DesignSave {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Save => "save as",
+            Self::SaveAs => "save as (keep original)",
+            Self::Rename => "rename (move original)",
+        }
+    }
+}
+
+/// Named designer writes never silently replace another design. Renames
+/// update application-menu references in the same savepoint, including
+/// when the caller already owns a transaction.
+pub fn save_design(
+    db: &dyn DbLink,
+    table: &str,
+    kind: &str,
+    name: &str,
+    previous: Option<&str>,
+    action: DesignSave,
+    cols: &[(&str, String)],
+) -> DbResult<()> {
+    if name.trim().is_empty() {
+        return Err("a design name is required".into());
+    }
+    ensure(db)?;
+    db.execute("SAVEPOINT phosphor_design_save")?;
+    let result = (|| {
+        let update = previous.filter(|_| action != DesignSave::SaveAs);
+        let mut values = vec![PValue::Text(name.into())];
+        values.extend(cols.iter().map(|(_, v)| PValue::Text(v.clone())));
+        let sql = if let Some(old) = update {
+            let mut sets = vec!["name = ?1".to_owned()];
+            sets.extend(
+                cols.iter()
+                    .enumerate()
+                    .map(|(i, (c, _))| format!("{c} = ?{}", i + 2)),
+            );
+            values.push(PValue::Text(old.into()));
+            format!(
+                "UPDATE {table} SET {} WHERE name = ?{}",
+                sets.join(", "),
+                values.len()
+            )
+        } else {
+            let mut names = vec!["name"];
+            names.extend(cols.iter().map(|(c, _)| *c));
+            format!(
+                "INSERT INTO {table} ({}) VALUES ({})",
+                names.join(", "),
+                (1..=values.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let (changed, _) = db.execute_params(&sql, &values).map_err(|e| {
+            if e.contains("UNIQUE constraint failed") {
+                format!("{kind} {name:?} already exists; choose another name or reopen it and use F6 Save")
+            } else { e }
+        })?;
+        if changed != 1 {
+            return Err("the saved design no longer exists; use F7 Save As to create it".into());
+        }
+        if let Some(old) = update.filter(|old| *old != name) {
+            db.execute_params(
+                "UPDATE _phosphor_items SET action_ref = ?1 WHERE action_kind = ?2 AND action_ref = ?3",
+                &[PValue::Text(name.into()), PValue::Text(kind.into()), PValue::Text(old.into())],
+            )?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => db.execute("RELEASE phosphor_design_save").map(|_| ()),
+        Err(e) => {
+            let rollback = db.execute("ROLLBACK TO phosphor_design_save");
+            let release = db.execute("RELEASE phosphor_design_save");
+            match (rollback, release) {
+                (Ok(_), Ok(_)) => Err(e),
+                (r, s) => Err(format!("{e}; restoring design failed: {r:?}; {s:?}")),
+            }
+        }
+    }
+}
+
 pub const DDL: &str = "
 CREATE TABLE IF NOT EXISTS _phosphor_queries (
   id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,

@@ -7,7 +7,7 @@ description = "The 1988 green-screen database desktop, reborn: forms, reports, m
 repository = "https://github.com/awksedgreep/phosphor"
 
 [dependencies]
-ratatui = "0.29"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 # bundled: one binary, no system sqlite, no macOS "not authorized".
 # load_extension: opt-in loading of libtimeless_ext via PHOSPHOR_EXT.
 rusqlite = { version = "0.37", features = ["bundled", "load_extension", "hooks"] }

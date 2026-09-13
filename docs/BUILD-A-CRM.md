@@ -119,10 +119,13 @@ point):
 | `↓↓↓` to `balance`, `Enter`, type `> 100`, `Enter` | a filter |
 | `s` `s` | sort descending ▼ |
 | `F2` | run it — your best customers, in the grid |
-| `Q`, redo the filter, `F6`, type `big-spenders`, `Enter` | saved into the database |
+| `Esc` (or `Q`), `F6`, type `big-spenders`, `Enter` | return to the same filter and save it |
 
 From now on, `run big-spenders` at the dot prompt replays it — and menus
-can point at it. *(Watch it: [qbe.gif](demo/ui/qbe.gif))*
+can point at it. Use `qbe big-spenders` to reopen the graphical design,
+including after restarting. F6 updates it, F7 saves a separate copy, and
+F8 renames it while updating menu references.
+*(Watch it: [qbe.gif](demo/ui/qbe.gif))*
 
 ## 5 · Design the report the boss wants
 
@@ -135,7 +138,11 @@ On `orders` (seek with `o`), press **`R`**:
 | `F2` | preview: page header, ▌ bands, totals (ids are never summed) |
 | `w` | writes `report_orders.txt` for printing/mailing |
 | `p` | sends it to a printer (`lp`, or `$PHOSPHOR_PRINT`) |
-| `Esc`, `F6` | saved by name (F6 asks, so you can rename it) |
+| `Esc`, `F6`, type `orders-by-region`, `Enter` | return to the designer and save by name |
+
+Use `report orders-by-region` to reopen it later. F6 updates that report;
+F7 Save As keeps the original, and F8 Rename moves it. Existing names are
+protected. Close the designer with Esc before returning to the sidebar.
 
 Labels too, if you mail things: `L` on customers — three-across, done.
 *(Watch it: [reports.gif](demo/ui/reports.gif))*

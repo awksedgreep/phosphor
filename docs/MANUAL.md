@@ -28,6 +28,8 @@ A few habits worth forming on day one:
   · F1 opens this help on the topic for wherever you are.
     Left and Right arrows move between topics. Esc or F1 returns
     to your previous screen, preserving drafts and unfinished input.
+  · F12 shows the full status message and connection details.
+    Scroll with arrows or PgUp/PgDn; Esc or F12 returns to your work.
   · The dot prompt (press .) accepts real SQL and short commands.
   · q quits from the top level; Ctrl-Q quits from anywhere.
 
@@ -196,10 +198,15 @@ Two more keys teach the rest of SQL:
   g   cycles GROUP BY through the columns; grouping collapses the
       projection to the key plus count(*) AS n.
 
-F2 runs the query into the grid. F6 asks for a name and saves the
-query into the database; after that,  run <name>  at the prompt
-executes it, reports can use it as a source, and application menus
-can point at it.
+F2 runs the query into the grid. Esc returns to the same design to
+revise or save it. If the query fails, the design stays open.
+F6 saves (asks for a name once, then updates that saved query).
+F7 Save As creates a separate copy; F8 Rename moves the saved query
+and updates menu references. Neither replaces another named query:
+to replace one deliberately, reopen it and use F6 Save.
+At the prompt, qbe <saved-name> reopens the graphical design, even
+after restarting. run <name> executes its saved SQL. A saved query
+name takes precedence over a table with the same name.
 ```
 
 ## Reports & labels
@@ -225,9 +232,13 @@ wide enough for their own totals.
 
 F2 previews the report in a pager: arrows and PgUp/PgDn scroll,
 w writes the report to a text file, p sends it to a printer
-(lp, or $PHOSPHOR_PRINT), Esc returns. F6 asks for a name and
-saves the design (rename by typing a new one); application menus
-can run it by name.
+(lp, or $PHOSPHOR_PRINT), Esc returns to the same report designer.
+F6 saves (asks for a name once, then updates that saved report).
+F7 Save As creates a copy and keeps the original. F8 Rename moves
+the saved report and updates menu references. Existing names are
+protected: reopen a report and use F6 to replace its saved design.
+report <saved-name> reopens it after restarting; application menus
+can run it by name. A failed save leaves your design open to retry.
 
 Labels: press L on a table for mailing labels, three across, every
 visible column on its own line — Avery energy, zero configuration.
@@ -297,7 +308,7 @@ In the designer: n adds an item, Enter edits the label, e edits the
 target, c cycles the kind, [ and ] reorder, x deletes, and r
 renames the app itself. For a `script` item, E opens the full Lua
 editor (see Scripting). All changes save as you go. F2 opens the
-live menu to try it.
+live menu to try it; Esc returns to your place in the designer.
 
 The menu itself is pure 1988: arrow keys and Enter, or press the
 bright first letter of an item to run it instantly.

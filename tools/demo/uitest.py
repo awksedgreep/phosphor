@@ -31,6 +31,7 @@ WORK = "/tmp/phosphor-uitest-work"  # cwd for the app: report files land here
 ESC, ENTER, CTRL_Q, TAB, SPACE = "\x1b", "\r", "\x11", "\t", " "
 F1, F2, F3, F4, F5 = "\x1bOP", "\x1bOQ", "\x1bOR", "\x1bOS", "\x1b[15~"
 F6, F7, F8, F9, F10 = "\x1b[17~", "\x1b[18~", "\x1b[19~", "\x1b[20~", "\x1b[21~"
+F12 = "\x1b[24~"
 UP, DOWN, LEFT, RIGHT = "\x1b[A", "\x1b[B", "\x1b[D", "\x1b[C"
 PGDN, PGUP, HOME, END = "\x1b[6~", "\x1b[5~", "\x1b[H", "\x1b[F"
 
@@ -111,10 +112,12 @@ class Screen:
 
 
 class Reel:
-    def __init__(self, name, title, argv=None):
+    def __init__(self, name, title, argv=None, cols=100, rows=30):
         self.name = name
         self.title = title
         self.argv = argv or [BIN, DB]
+        self.cols, self.rows = cols, rows
+        self.restarts = 0
         self.steps = []
         self.expects = []
         self.t = 0.9
@@ -151,16 +154,25 @@ class Reel:
         self.expects.append((round(self.t - 0.05, 3), marker, False))
         return self
 
+    def restart(self):
+        self.restarts += 1
+        return self.key(CTRL_Q, wait=1.1)
+
     def run(self):
         cast = os.path.join(OUT, f"{self.name}.cast")
         self.key(CTRL_Q, wait=0.0)
-        record(self.argv, self.steps, cast, env=ENV, title=self.title, cwd=WORK)
+        argv = self.argv
+        if self.restarts:
+            argv = [sys.executable, "-c",
+                    "import subprocess, sys\nfor _ in range(int(sys.argv[1])):\n subprocess.run(sys.argv[2:], check=True)",
+                    str(self.restarts + 1), *argv]
+        record(argv, self.steps, cast, cols=self.cols, rows=self.rows, env=ENV, title=self.title, cwd=WORK)
         events = [
             json.loads(line)
             for line in open(cast).read().splitlines()[1:]
             if line
         ]
-        screen = Screen(100, 30)
+        screen = Screen(self.cols, self.rows)
         failures = []
         pending = sorted(self.expects)
         i = 0
@@ -275,8 +287,7 @@ def reels():
     # The SQL wraps in the QBE panel: assert the pieces per line.
     r.expect('WHERE "balance" > 100').expect('ORDER BY "balance"')
     r.key(F2, 0.8).expect("5 row(s)")
-    r.key("Q", 0.6)                                   # reopen (fresh spec)
-    r.keys([DOWN] * 3, gap=0.2).key(ENTER, 0.3).type("> 100").key(ENTER, 0.4)
+    r.key("Q", 0.6).expect('WHERE "balance" > 100')  # return to the same design
     r.key(F6, 0.4).type("big-spenders").key(ENTER, 0.6)
     r.expect('saved query "big-spenders"')
     r.key(ESC, 0.4)
@@ -294,7 +305,7 @@ def reels():
     r.key(F2, 1.0).expect("region = east").expect("subtotal").expect("TOTAL (8 rows)")
     r.keys(["j"] * 3, gap=0.25)
     r.key("w", 0.6).expect("wrote report_orders-by-region.txt")
-    r.key(ESC, 0.5)
+    r.key(ESC, 0.5).expect("REPORT · orders-by-region").key(ESC, 0.4)
     r.key("c").key("L", 0.8).expect("LABELS · customers").expect("Zurich")
     r.key(ESC, 0.4)
     out.append(r)
@@ -336,8 +347,7 @@ def reels():
     r.key(F2, 0.8).expect("CRM").expect("Zap orders").expect("Customers")
     r.key("z", 0.8).expect("BROWSE orders")           # hotkey runs it
     r.key(ESC, 0.4).key(ESC, 0.5)
-    r.key("A", 0.6)
-    r.keys(["j"], gap=0.3)                            # Zap sits at idx 1
+    r.expect("APPLICATIONS GENERATOR · crm")         # cursor is still on Zap
     r.key("x", 0.6).expect_absent("Zap orders")       # gone
     r.key("r", 0.5).type("crm-app").key(ENTER, 0.6)   # rename the app
     r.expect("APPLICATIONS GENERATOR · crm-app")
@@ -655,8 +665,48 @@ def reels():
     r.type("export outlarge all.csv").key(ENTER, 1.0).expect("exported 10005 row(s)")
     r.type("export SELECT CASE WHEN n=10005 THEN abs(-9223372036854775808) ELSE n END FROM outlarge all.csv").key(ENTER, 1.0).expect("export incomplete")
     r.type("report outlarge").key(ENTER, 0.6).key(F2, 1.0).key(END, 0.5).expect("TOTAL (10005 rows)")
-    r.key("w", 0.5).expect("wrote report_outlarge.txt").key(ESC, 0.5)
+    r.key("w", 0.5).expect("wrote report_outlarge.txt").key(ESC, 0.5).key(ESC, 0.4)
     r.type("labels outlarge").key(ENTER, 1.0).key(END, 0.5).expect("10005")
+    out.append(r)
+
+    # Preview, revise, save/copy/rename, and reopen in a new process.
+    r = Reel("builders", "builder drafts survive previews, collisions, and restart")
+    r.key("c").key("Q", 0.6).keys([DOWN] * 3, gap=0.2)
+    r.key(ENTER).type("> 100").key(ENTER).key(F2, 0.7).expect("5 row(s)")
+    r.key(ESC, 0.5).expect('WHERE "balance" > 100')
+    r.key(ENTER).type("> bad_column").key(ENTER).key(F2, 0.7)
+    r.expect("no such column").expect("QUERY BY EXAMPLE")
+    r.key(ENTER).type("> 100").key(ENTER).key(F6).type("draft-query").key(ENTER, 0.6)
+    r.expect('saved query "draft-query"')
+    r.key(F7).type("draft-copy").key(ENTER, 0.6).expect('saved query "draft-copy"')
+    r.key(F8).type("draft-query").key(ENTER, 0.6).expect("already exists")
+    r.key(F12, 0.4).expect("STATUS & CONNECTION").expect("reopen it")
+    r.key(ESC).key(ESC).key(F8).type("draft-renamed").key(ENTER, 0.6)
+    r.expect('saved query "draft-renamed"').key(ESC)
+    r.key("o").key("R", 0.5).key(ENTER).type("Unsaved report title").key(ENTER)
+    r.key(F2, 0.8).expect("Unsaved report title").expect("TOTAL (8 rows)")
+    r.key(ESC, 0.5).expect("REPORT · orders").expect("Unsaved report title")
+    r.key(F6).type("draft-report").key(ENTER, 0.6).expect('saved report "draft-report"')
+    r.key(F7).type("report-copy").key(ENTER, 0.6).expect('saved report "report-copy"')
+    r.key(F8).type("report-renamed").key(ENTER, 0.6).expect('saved report "report-renamed"')
+    r.restart()
+    r.key(".").type("qbe draft-renamed").key(ENTER, 0.6)
+    r.expect("QUERY BY EXAMPLE").expect('WHERE "balance" > 100')
+    r.key(F2, 0.7).expect("5 row(s)").key(ESC).key(ESC)
+    r.type("report draft-report").key(ENTER, 0.5).expect("Unsaved report title")
+    r.key(ESC).type("report report-renamed").key(ENTER, 0.5).expect("Unsaved report title")
+    out.append(r)
+
+    r = Reel("status80", "80-column validation, save failures, and delete confirmations", cols=80, rows=24)
+    r.key("c").key(ENTER, 0.6).key("a", 0.6).key(F10, 0.5)
+    r.expect('"Name" is required').expect("F12 details")
+    r.key(F12, 0.5).expect("STATUS & CONNECTION").expect('"Name" is required')
+    r.key(ESC).key(ENTER).type("Visible save").key(F12, 0.4).expect("STATUS & CONNECTION")
+    r.key(F12, 0.4).expect("Visible save").key(F10, 0.6).expect("inserted rowid")
+    r.key("x", 0.5).expect("DELETE customers rowid 9")
+    r.key(F12, 0.5).expect("DELETE customers rowid 9").key(ESC).key("x", 0.6).expect("row deleted")
+    r.key(".").type("INSERT INTO customers(id,name) VALUES(1,'duplicate')").key(ENTER, 0.6)
+    r.expect("UNIQUE constraint failed").expect("F12 details")
     out.append(r)
 
     return out
