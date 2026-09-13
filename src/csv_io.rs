@@ -51,15 +51,10 @@ pub fn import_csv(db: &dyn DbLink, table: &str, path: &str) -> DbResult<String> 
         .clone();
 
     let cols = db.columns(table)?;
-    // Header name (lowercased) -> (column name, declared type).
-    let col_map: std::collections::HashMap<String, (&str, &str)> = cols
+    // Header name (lowercased) -> metadata, including generated columns.
+    let col_map: std::collections::HashMap<String, _> = cols
         .iter()
-        .map(|c| {
-            (
-                c.name.to_ascii_lowercase(),
-                (c.name.as_str(), c.decl_type.as_str()),
-            )
-        })
+        .map(|c| (c.name.to_ascii_lowercase(), c))
         .collect();
 
     // (header_index, target_column, declared_type) for each CSV header.
@@ -69,10 +64,15 @@ pub fn import_csv(db: &dyn DbLink, table: &str, path: &str) -> DbResult<String> 
         if key.is_empty() {
             continue;
         }
-        let Some((col_name, decl)) = col_map.get(&key) else {
+        let Some(col) = col_map.get(&key) else {
             return Err(format!("import: unknown column {h:?} for table {table:?}"));
         };
-        hdr_to_col.push((hi, (*col_name).to_owned(), (*decl).to_owned()));
+        if col.generated {
+            return Err(format!(
+                "import: column {h:?} is generated; omit it from the CSV"
+            ));
+        }
+        hdr_to_col.push((hi, col.name.clone(), col.decl_type.clone()));
     }
     if hdr_to_col.is_empty() {
         return Err("import: no matching columns".into());
@@ -241,6 +241,24 @@ mod tests {
         // Our caller's work is still pending and under its control.
         db.execute("ROLLBACK").unwrap();
         assert_eq!(db.count("t").unwrap(), 0);
+    }
+
+    #[test]
+    fn import_omits_generated_columns_and_rejects_explicit_values() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(name TEXT, size INTEGER AS (length(name)))")
+            .unwrap();
+        let path = tmp_path("generated");
+        fs::write(&path, "name\nAlice\n").unwrap();
+        import_csv(&db, "t", &path).unwrap();
+        assert_eq!(
+            db.query("SELECT size FROM t").unwrap().rows[0][0],
+            PValue::Int(5)
+        );
+        fs::write(&path, "name,size\nGrace,5\n").unwrap();
+        assert!(import_csv(&db, "t", &path).unwrap_err().contains("omit it"));
+        fs::remove_file(path).unwrap();
+        assert_eq!(db.count("t").unwrap(), 1);
     }
 
     #[test]

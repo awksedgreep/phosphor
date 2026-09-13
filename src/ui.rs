@@ -1405,7 +1405,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
     let mut lines = Vec::new();
     for (i, (col, original)) in ed.fields.iter().enumerate() {
         // PICTURE-clause energy: ¶ pk, * required, ƒ computed.
-        let marker = if matches!(ed.computed.get(i), Some(Some(_))) {
+        let marker = if ed.read_only(i) {
             "ƒ"
         } else if col.pk {
             "¶"

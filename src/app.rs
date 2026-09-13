@@ -188,6 +188,11 @@ impl EditState {
     pub fn dirty(&self) -> bool {
         self.inputs.iter().any(Option::is_some)
     }
+
+    pub fn read_only(&self, field: usize) -> bool {
+        self.fields.get(field).is_some_and(|(c, _)| c.generated)
+            || matches!(self.computed.get(field), Some(Some(_)))
+    }
 }
 
 /// A value-lookup pop-up for a foreign-key field (dBASE-style `F7`):
@@ -1877,7 +1882,7 @@ impl App {
                         for _ in 0..d.unsigned_abs() {
                             for _ in 0..n {
                                 cur = (cur as i64 + step).rem_euclid(n as i64) as usize;
-                                if !matches!(ed.computed.get(cur), Some(Some(_))) {
+                                if !ed.read_only(cur) {
                                     break;
                                 }
                             }
@@ -1899,7 +1904,7 @@ impl App {
                     return self.open_memo_editor();
                 }
                 if let Overlay::Edit(ed) = &mut self.overlay {
-                    if matches!(ed.computed.get(ed.cursor), Some(Some(_))) {
+                    if ed.read_only(ed.cursor) {
                         self.say("computed field — read-only");
                         return;
                     }
@@ -1957,12 +1962,7 @@ impl App {
                     Overlay::Edit(ed) => ed.dirty() || !ed.inserting,
                     _ => true,
                 };
-                if let Overlay::Edit(ed) = &mut self.overlay {
-                    let n = ed.fields.len();
-                    if n > 0 {
-                        ed.cursor = (ed.cursor + 1) % n;
-                    }
-                }
+                self.apply(Command::EditMove(1));
                 if self.edit_required_ok() && can_autosave {
                     // Already validated quietly; skip the loud re-check
                     // inside commit_edit to avoid a second PValue::parse
@@ -2610,6 +2610,9 @@ impl App {
             Err(e) => return self.err(e),
         };
         let fks = self.db.outgoing_fks(&name);
+        if cols.iter().any(|c| c.generated) {
+            return self.err("table has generated columns; use SQL to preserve their expressions");
+        }
         self.overlay = Overlay::Create(CreateState::edit_existing(crate::creator::EditorSchema {
             table: name,
             columns: cols,
@@ -4339,12 +4342,12 @@ impl App {
         self.build_edit_for(abs); // re-parks itself if still uncovered
     }
 
-    /// Reload by the identity returned from INSERT, never by position.
+    /// Reload a saved record by identity, never by position.
     /// Fetch the row, its position, and total in one statement so another
     /// insert between requests cannot substitute a different record.
-    fn flip_to_inserted(&mut self, new_rowid: i64) -> Result<(), String> {
+    fn reload_saved_record(&mut self, new_rowid: i64) -> Result<(), String> {
         let Overlay::Edit(ed) = &mut self.overlay else {
-            return Err("inserted record has no open form".into());
+            return Err("saved record has no open form".into());
         };
         // The write already succeeded. Even if reloading fails, another
         // Enter must update this identity instead of inserting a twin.
@@ -4365,7 +4368,7 @@ impl App {
         let alias = self
             .db
             .rowid_column(&name)?
-            .ok_or("inserted record has no usable identity")?;
+            .ok_or("saved record has no usable identity")?;
         let q = Self::quote_ident(&name);
         let id = Self::quote_ident(&alias);
         let mut result = self.db.query(&format!(
@@ -4376,9 +4379,9 @@ impl App {
         let mut row = result
             .rows
             .pop()
-            .ok_or("inserted record no longer exists; refresh the table")?;
+            .ok_or("saved record no longer exists; refresh the table")?;
         let (Some(PValue::Int(total)), Some(PValue::Int(position))) = (row.pop(), row.pop()) else {
-            return Err("could not locate the inserted record in BROWSE".into());
+            return Err("could not locate the saved record in BROWSE".into());
         };
         // Keep neighboring rows ready for immediate paging/deletion.
         // A concurrent insert may shift positions before this fetch, so
@@ -4400,7 +4403,7 @@ impl App {
                 Some((page, at as i64 + start))
             });
         let Some(g) = &mut self.grid else {
-            return Err("inserted record has no BROWSE".into());
+            return Err("saved record has no BROWSE".into());
         };
         if !matches!(&g.source, GridSource::Table { name: current, .. } if current == &name) {
             return Err("BROWSE moved to another table".into());
@@ -4452,6 +4455,9 @@ impl App {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
+        if cols.len() != row.len() {
+            return self.err("table columns changed; refresh BROWSE before editing");
+        }
         let mut fields: Vec<(ColumnInfo, PValue)> = cols.into_iter().zip(row).collect();
         let mut labels: Vec<String> = fields.iter().map(|(c, _)| c.name.clone()).collect();
         let mut required: Vec<bool> = vec![false; fields.len()];
@@ -4792,6 +4798,7 @@ impl App {
                         decl_type: String::new(),
                         notnull: false,
                         pk: false,
+                        generated: false,
                         dflt_value: None,
                     },
                     PValue::Null,
@@ -5128,10 +5135,11 @@ impl App {
             return false;
         };
         ed.required.iter().enumerate().all(|(i, req)| {
-            !req || match &ed.inputs[i] {
-                Some(text) => PValue::parse(text, &ed.fields[i].0.decl_type) != PValue::Null,
-                None => ed.fields[i].1 != PValue::Null,
-            }
+            !req || ed.read_only(i)
+                || match &ed.inputs[i] {
+                    Some(text) => PValue::parse(text, &ed.fields[i].0.decl_type) != PValue::Null,
+                    None => ed.fields[i].1 != PValue::Null,
+                }
         })
     }
 
@@ -5159,7 +5167,7 @@ impl App {
         if !skip_required_check {
             if let Overlay::Edit(ed) = &self.overlay {
                 for (i, req) in ed.required.iter().enumerate() {
-                    if !req {
+                    if !req || ed.read_only(i) {
                         continue;
                     }
                     let is_null = match &ed.inputs[i] {
@@ -5179,7 +5187,7 @@ impl App {
         // PICTURE masks: an entered value must fit its mask.
         if let Overlay::Edit(ed) = &self.overlay {
             for (i, mask) in ed.masks.iter().enumerate() {
-                if mask.is_empty() {
+                if mask.is_empty() || ed.read_only(i) {
                     continue;
                 }
                 if let Some(text) = &ed.inputs[i] {
@@ -5204,7 +5212,7 @@ impl App {
                     .iter()
                     .enumerate()
                     // Computed columns are shown, never written.
-                    .filter(|(i, _)| !matches!(ed.computed.get(*i), Some(Some(_))))
+                    .filter(|(i, _)| !ed.read_only(*i))
                     .filter_map(|(i, (col, _))| {
                         ed.inputs[i]
                             .as_ref()
@@ -5235,8 +5243,10 @@ impl App {
                 self.pane_cache.clear();
                 self.invalidate_health();
                 let mut reload_error = None;
-                if inserting {
-                    reload_error = self.flip_to_inserted(new_rowid).err();
+                let generated = matches!(&self.overlay, Overlay::Edit(ed)
+                    if ed.fields.iter().any(|(c, _)| c.generated));
+                if inserting || generated {
+                    reload_error = self.reload_saved_record(new_rowid).err();
                 } else {
                     // Re-fetch the live window async (stale rows stay
                     // until swap); a parked edit builds on arrival.
@@ -5342,6 +5352,9 @@ impl App {
         if let Overlay::Edit(ed) = &mut self.overlay {
             for (name, v) in &values {
                 if let Some(i) = ed.fields.iter().position(|(c, _)| &c.name == name) {
+                    if ed.read_only(i) {
+                        continue;
+                    }
                     let current = match &ed.inputs[i] {
                         Some(t) => PValue::parse(t, &ed.fields[i].0.decl_type),
                         None => ed.fields[i].1.clone(),
@@ -5846,7 +5859,7 @@ impl App {
     fn open_memo_editor(&mut self) {
         let computed = matches!(
             &self.overlay,
-            Overlay::Edit(ed) if matches!(ed.computed.get(ed.cursor), Some(Some(_)))
+            Overlay::Edit(ed) if ed.read_only(ed.cursor)
         );
         if computed {
             return self.say("computed field — read-only");
@@ -6147,6 +6160,70 @@ mod tests {
         let g = a.grid.as_ref().unwrap();
         assert!(matches!(g.source, GridSource::Query { .. }));
         assert_eq!(g.row(0).unwrap()[0], PValue::Int(500));
+    }
+
+    #[test]
+    fn generated_columns_stay_aligned_readonly_and_refresh_after_save() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(prefix TEXT GENERATED ALWAYS AS (substr(name,1,1)) STORED,
+            id INTEGER PRIMARY KEY, size INTEGER GENERATED ALWAYS AS (length(name)) VIRTUAL,
+            name TEXT, shout TEXT GENERATED ALWAYS AS (upper(name)) STORED);
+            INSERT INTO t(id, name) VALUES(1,'Alice')",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        let g = a.grid.as_ref().unwrap();
+        assert_eq!(g.columns, ["prefix", "id", "size", "name", "shout"]);
+        assert_eq!(g.columns.len(), g.row(0).unwrap().len());
+        a.apply(Command::OpenEdit);
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
+        assert_eq!(
+            ed.fields.iter().find(|(c, _)| c.name == "name").unwrap().1,
+            PValue::Text("Alice".into())
+        );
+        // A generated field cannot become a one-line or memo editor.
+        a.apply(Command::EditBegin);
+        a.apply(Command::EditMemo);
+        assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.editing.is_none()));
+        a.apply(Command::EditMove(2)); // skip prefix, size; land on name
+        a.apply(Command::EditBegin);
+        for c in "Beatrice".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        a.sync();
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
+        for (name, expected) in [
+            ("prefix", PValue::Text("B".into())),
+            ("size", PValue::Int(8)),
+            ("shout", PValue::Text("BEATRICE".into())),
+        ] {
+            assert_eq!(
+                ed.fields.iter().find(|(c, _)| c.name == name).unwrap().1,
+                expected
+            );
+        }
+        assert_eq!(
+            a.db.query("SELECT name FROM t").unwrap().rows[0][0],
+            PValue::Text("Beatrice".into())
+        );
+        a.apply(Command::Back);
+        a.apply(Command::OpenTableEditor);
+        assert!(
+            !matches!(a.overlay, Overlay::Create(_)),
+            "designer must not drop generation expressions"
+        );
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, error)| *error && m.contains("generated")));
     }
 
     #[test]

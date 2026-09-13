@@ -62,6 +62,8 @@ Add, rename, or drop columns, change types and constraints, even
 rename the table; F2 applies it as ALTERs (or a rebuild when
 SQLite can't ALTER in place), showing the exact changes first.
 D twice drops the whole table — the same confirm as row delete.
+Tables with generated columns need SQL for structure changes;
+the designer refuses changes that would lose their expressions.
 
 In the grid:
 
@@ -75,13 +77,14 @@ In the grid:
     is replaced). Enter commits — which also SAVES the record and
     moves to the next field.
     F10/Ctrl-S save and close. Empty input means NULL. A ¶ marks
-    the primary key; a * marks a required field.
+    the primary key; a * marks a required field. A ƒ marks a computed
+    or generated field: it is displayed but cannot be edited.
   · F3 opens the current field in a full-screen NOTE editor — for a
     long comment, memo, or notes field. Enter starts a new line; F6
     folds the text back into the field (the form saves it), Esc
     cancels. It is the same editor that writes Lua scripts.
   · Tab moves to the next field (committing anything typed);
-    Shift-Tab moves back.
+    Shift-Tab moves back. Both skip computed and generated fields.
   · Declared FOREIGN KEYS become child panes under the form —
     open a customer and their orders are right there, refreshed
     live as you page. F4/F5/F6 opens a pane as a filtered BROWSE
@@ -103,8 +106,10 @@ If a crafted form exists for the table (see Forms), EDIT uses it:
 your field order, your labels, your required rules, and — if you
 painted one — your screen layout.
 
-Views and query results open read-only; phosphor tells you so in
-the title bar rather than letting a save fail later.
+Views, query results, and tables without an unambiguous row identity
+open read-only. This includes WITHOUT ROWID tables, virtual tables,
+and tables that declare all three rowid aliases (rowid, _rowid_, oid).
+Ordinary tables can declare one or two aliases and still be edited.
 ```
 
 ## The dot prompt

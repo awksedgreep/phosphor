@@ -219,8 +219,8 @@ impl DbLink for RemoteDb {
 
     fn columns(&self, table: &str) -> DbResult<Vec<ColumnInfo>> {
         let out = self.one(
-            &format!("PRAGMA table_info({})", Self::quote(table)),
-            vec![],
+            crate::db::COLUMN_INFO_SQL,
+            vec![encode(&PValue::Text(table.to_owned()))],
         )?;
         Ok(out
             .rows
@@ -236,6 +236,7 @@ impl DbLink for RemoteDb {
                 },
                 notnull: matches!(&r[3], PValue::Int(n) if *n != 0),
                 pk: matches!(&r[5], PValue::Int(n) if *n != 0),
+                generated: matches!(&r[6], PValue::Int(n) if *n >= 2),
                 dflt_value: match &r[4] {
                     PValue::Text(t) => Some(t.clone()),
                     _ => None,

@@ -363,6 +363,11 @@ impl TableDraft {
         schema: &EditorSchema,
         index_sql: &[String],
     ) -> DbResult<Vec<String>> {
+        if schema.columns.iter().any(|c| c.generated) {
+            return Err(
+                "table has generated columns; use SQL to preserve their expressions".into(),
+            );
+        }
         let orig_table = schema.table.as_str();
         let renamed_table = !self.table.eq_ignore_ascii_case(orig_table);
 
@@ -644,6 +649,7 @@ mod editor_tests {
             name: name.to_owned(),
             decl_type: decl.to_owned(),
             pk,
+            generated: false,
             notnull,
             dflt_value: None,
         }

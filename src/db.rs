@@ -183,11 +183,18 @@ pub struct ColumnInfo {
     pub decl_type: String,
     pub notnull: bool,
     pub pk: bool,
+    /// SQLite computes this column (VIRTUAL or STORED); never write it.
+    pub generated: bool,
     /// Raw SQL text of the DEFAULT expression (e.g. `0`, `'abc'`),
     /// as stored by pragma table_info — None when the column has no
     /// default. Used by the TABLE EDITOR to round-trip constraints.
     pub dflt_value: Option<String>,
 }
+
+/// Match SELECT * order, including generated columns but excluding
+/// hidden virtual-table arguments.
+pub(crate) const COLUMN_INFO_SQL: &str =
+    "SELECT * FROM pragma_table_xinfo(?1) WHERE hidden != 1 ORDER BY cid";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page {
@@ -706,15 +713,16 @@ impl DbLink for EmbeddedDb {
     fn columns(&self, table: &str) -> DbResult<Vec<ColumnInfo>> {
         let mut stmt = self
             .conn
-            .prepare_cached(&format!("PRAGMA table_info({})", Self::quote(table)))
+            .prepare_cached(COLUMN_INFO_SQL)
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map([table], |r| {
                 Ok(ColumnInfo {
                     name: r.get(1)?,
                     decl_type: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                     notnull: r.get::<_, i64>(3)? != 0,
                     pk: r.get::<_, i64>(5)? != 0,
+                    generated: r.get::<_, i64>(6)? >= 2,
                     dflt_value: r.get(4)?,
                 })
             })
