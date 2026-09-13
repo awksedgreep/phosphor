@@ -214,8 +214,11 @@ pub trait DbLink: Send {
     fn tables(&self) -> DbResult<Vec<TableInfo>>;
     fn columns(&self, table: &str) -> DbResult<Vec<ColumnInfo>>;
     fn count(&self, table: &str) -> DbResult<i64>;
-    /// True when the table has usable rowids (EDIT is possible).
-    fn has_rowid(&self, table: &str) -> bool;
+    /// An unshadowed SQLite rowid alias; None means BROWSE is read-only.
+    fn rowid_column(&self, table: &str) -> DbResult<Option<String>>;
+    fn has_rowid(&self, table: &str) -> bool {
+        self.rowid_column(table).ok().flatten().is_some()
+    }
     fn page(&self, table: &str, offset: i64, limit: i64) -> DbResult<Page>;
     /// A window PLUS the table total. Default is page()+count() (two
     /// round-trips); backends collapse it into one query with
@@ -310,6 +313,45 @@ fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Only ordinary rowid tables have the identity guarantees EDIT needs.
+/// In particular, a real column named rowid does not establish identity
+/// on a view or a WITHOUT ROWID table. Include hidden/generated names
+/// when checking which aliases are shadowed.
+pub(crate) fn resolve_rowid_column(db: &dyn DbLink, table: &str) -> DbResult<Option<String>> {
+    let physical = db.query(&format!(
+        "SELECT 1 FROM pragma_table_list WHERE schema = 'main' AND name = {} COLLATE NOCASE \
+         AND type = 'table' AND wr = 0",
+        sql_str(table)
+    ))?;
+    if physical.rows.is_empty() {
+        return Ok(None);
+    }
+    let columns = db.query(&format!(
+        "SELECT name FROM pragma_table_xinfo({})",
+        sql_str(table)
+    ))?;
+    Ok(["rowid", "_rowid_", "oid"].into_iter().find(|alias| {
+        !columns.rows.iter().any(|r| matches!(r.first(), Some(PValue::Text(name)) if name.eq_ignore_ascii_case(alias)))
+    }).map(str::to_owned))
+}
+
+/// Guard the identity in the write statement itself: if another
+/// connection shadows our cached alias, the write must affect no rows.
+/// Qualifying the identifier also disables SQLite's quoted-string fallback.
+pub(crate) fn rowid_predicate(table: &str, alias: &str, parameter: &str) -> String {
+    format!(
+        "{}.{} = {parameter} AND NOT EXISTS \
+         (SELECT 1 FROM pragma_table_xinfo({}) WHERE name = {} COLLATE NOCASE) \
+         AND EXISTS (SELECT 1 FROM pragma_table_list WHERE schema = 'main' \
+         AND name = {} COLLATE NOCASE AND type = 'table' AND wr = 0)",
+        EmbeddedDb::quote(table),
+        EmbeddedDb::quote(alias),
+        sql_str(table),
+        sql_str(alias),
+        sql_str(table)
+    )
+}
+
 pub struct EmbeddedDb {
     conn: Connection,
     name: String,
@@ -317,7 +359,7 @@ pub struct EmbeddedDb {
     // thread (worker.rs), which needs Send. They are never contended —
     // one thread owns the backend — so lock().unwrap() never blocks
     // and poisoning would require a panic inside a HashMap op.
-    rowid_cache: Mutex<HashMap<String, bool>>,
+    rowid_cache: Mutex<HashMap<String, Option<String>>>,
     anchors: Mutex<HashMap<String, AnchorIndex>>,
 }
 
@@ -469,6 +511,40 @@ impl EmbeddedDb {
         format!("\"{}\"", ident.replace('"', "\"\""))
     }
 
+    /// A failed cardinality check must roll back trigger side effects
+    /// too. SAVEPOINT works inside a caller-owned transaction.
+    fn write_one(
+        &self,
+        verb: &str,
+        write: impl FnOnce() -> rusqlite::Result<usize>,
+    ) -> DbResult<()> {
+        self.conn
+            .execute_batch("SAVEPOINT phosphor_row_write")
+            .map_err(|e| e.to_string())?;
+        let result = write().map_err(|e| e.to_string()).and_then(|n| {
+            if n == 1 {
+                self.conn
+                    .execute_batch("RELEASE phosphor_row_write")
+                    .map_err(|e| e.to_string())
+            } else {
+                Err(format!(
+                    "expected to {verb} 1 row, affected {n}; refresh the table"
+                ))
+            }
+        });
+        self.anchors.lock().unwrap().clear();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => match self
+                .conn
+                .execute_batch("ROLLBACK TO phosphor_row_write; RELEASE phosphor_row_write")
+            {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(format!("{error}; rollback: {rollback}")),
+            },
+        }
+    }
+
     fn collect_rows(
         stmt: &mut rusqlite::Statement<'_>,
         params: &[&dyn rusqlite::ToSql],
@@ -536,7 +612,12 @@ impl EmbeddedDb {
         let mut stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT rowid, * FROM {q} WHERE rowid >= ?1 ORDER BY rowid LIMIT ?2"
+                "SELECT {q}.{id}, * FROM {q} WHERE {q}.{id} >= ?1 ORDER BY {q}.{id} LIMIT ?2",
+                id = Self::quote(
+                    &self
+                        .rowid_column(table)?
+                        .ok_or("no unambiguous row identity")?
+                )
             ))
             .map_err(|e| e.to_string())?;
         let (all, _) =
@@ -568,7 +649,12 @@ impl EmbeddedDb {
         let mut stmt = self
             .conn
             .prepare_cached(&format!(
-                "SELECT rowid, * FROM {q} ORDER BY rowid LIMIT ?1 OFFSET ?2"
+                "SELECT {q}.{id}, * FROM {q} ORDER BY {q}.{id} LIMIT ?1 OFFSET ?2",
+                id = Self::quote(
+                    &self
+                        .rowid_column(table)?
+                        .ok_or("no unambiguous row identity")?
+                )
             ))
             .map_err(|e| e.to_string())?;
         let (mut rows, _) =
@@ -646,36 +732,17 @@ impl DbLink for EmbeddedDb {
             .map_err(|e| e.to_string())
     }
 
-    fn has_rowid(&self, table: &str) -> bool {
-        if let Some(&known) = self.rowid_cache.lock().unwrap().get(table) {
-            return known;
+    fn rowid_column(&self, table: &str) -> DbResult<Option<String>> {
+        if let Some(known) = self.rowid_cache.lock().unwrap().get(table) {
+            return Ok(known.clone());
         }
-        let res = self
-            .conn
-            .prepare_cached(&format!("SELECT rowid FROM {} LIMIT 0", Self::quote(table)));
-        match res {
-            Ok(_) => {
-                self.rowid_cache
-                    .lock()
-                    .unwrap()
-                    .insert(table.to_owned(), true);
-                true
-            }
-            Err(e) => {
-                let msg = e.to_string().to_ascii_lowercase();
-                // Definitive: WITHOUT ROWID / view has no rowid. Cache the
-                // negative. Anything else (locked, busy, auth, etc.) is
-                // transient — don't poison the cache.
-                let definitive = msg.contains("no such column") || msg.contains("has no column");
-                if definitive {
-                    self.rowid_cache
-                        .lock()
-                        .unwrap()
-                        .insert(table.to_owned(), false);
-                }
-                false
-            }
-        }
+        // Errors are transient; only cache a successfully inspected schema.
+        let alias = resolve_rowid_column(self, table)?;
+        self.rowid_cache
+            .lock()
+            .unwrap()
+            .insert(table.to_owned(), alias.clone());
+        Ok(alias)
     }
 
     fn page(&self, table: &str, offset: i64, limit: i64) -> DbResult<Page> {
@@ -713,9 +780,11 @@ impl DbLink for EmbeddedDb {
             Ok((page, total))
         };
         let q = Self::quote(table);
-        let with_rowid = self.has_rowid(table);
-        let select = if with_rowid {
-            format!("SELECT rowid, *, count(*) OVER () AS _total FROM {q}")
+        let alias = self.rowid_column(table)?;
+        let with_rowid = alias.is_some();
+        let select = if let Some(alias) = alias {
+            let id = Self::quote(&alias);
+            format!("SELECT {q}.{id}, *, count(*) OVER () AS _total FROM {q} ORDER BY {q}.{id}")
         } else {
             format!("SELECT *, count(*) OVER () AS _total FROM {q}")
         };
@@ -803,16 +872,19 @@ impl DbLink for EmbeddedDb {
         if changes.is_empty() {
             return Ok(());
         }
+        let alias = self
+            .rowid_column(table)?
+            .ok_or("no unambiguous row identity; editing is read-only")?;
         let sets: Vec<String> = changes
             .iter()
             .enumerate()
             .map(|(i, (col, _))| format!("{} = ?{}", Self::quote(col), i + 1))
             .collect();
         let sql = format!(
-            "UPDATE {} SET {} WHERE rowid = ?{}",
+            "UPDATE {} SET {} WHERE {}",
             Self::quote(table),
             sets.join(", "),
-            changes.len() + 1
+            rowid_predicate(table, &alias, &format!("?{}", changes.len() + 1))
         );
         let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
         for (i, (_, v)) in changes.iter().enumerate() {
@@ -821,15 +893,7 @@ impl DbLink for EmbeddedDb {
         }
         stmt.raw_bind_parameter(changes.len() + 1, rowid)
             .map_err(|e| e.to_string())?;
-        let n = stmt.raw_execute().map_err(|e| e.to_string())?;
-        if n == 1 {
-            // Whole index, not just this table: FK cascades and
-            // triggers can move positions in OTHER tables too.
-            self.anchors.lock().unwrap().clear();
-            Ok(())
-        } else {
-            Err(format!("expected to update 1 row, updated {n}"))
-        }
+        self.write_one("update", || stmt.raw_execute())
     }
 
     fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64> {
@@ -857,20 +921,19 @@ impl DbLink for EmbeddedDb {
     }
 
     fn delete_row(&self, table: &str, rowid: i64) -> DbResult<()> {
-        let n = self
-            .conn
-            .execute(
-                &format!("DELETE FROM {} WHERE rowid = ?1", Self::quote(table)),
+        let alias = self
+            .rowid_column(table)?
+            .ok_or("no unambiguous row identity; deleting is read-only")?;
+        self.write_one("delete", || {
+            self.conn.execute(
+                &format!(
+                    "DELETE FROM {} WHERE {}",
+                    Self::quote(table),
+                    rowid_predicate(table, &alias, "?1")
+                ),
                 [rowid],
             )
-            .map_err(|e| e.to_string())?;
-        if n == 1 {
-            // Deletes (and their cascades/triggers) can shift any table.
-            self.anchors.lock().unwrap().clear();
-            Ok(())
-        } else {
-            Err(format!("expected to delete 1 row, deleted {n}"))
-        }
+        })
     }
 
     fn health(&self) -> Option<String> {
@@ -986,6 +1049,92 @@ mod tests {
         .unwrap();
         let q = db.query("SELECT name FROM people ORDER BY id").unwrap();
         assert_eq!(q.rows[0][0], PValue::Text("ada lovelace".into()));
+    }
+
+    #[test]
+    fn shadowed_rowid_aliases_never_target_another_record() {
+        for declarations in ["rowid INTEGER", "RoWiD INTEGER, _RoWiD_ INTEGER"] {
+            let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+            db.execute(&format!(
+                "CREATE TABLE t({declarations}, name TEXT, PRIMARY KEY(name));
+                INSERT INTO t(name, rowid) VALUES ('Alice',7), ('Bob',7)"
+            ))
+            .unwrap();
+            let (page, total) = db.open_window("t", 0, 10).unwrap();
+            assert_eq!(total, 2);
+            assert_eq!(page.rowids, Some(vec![1, 2]));
+            assert_eq!(db.page("t", 0, 1).unwrap().rowids, Some(vec![1]));
+            assert_eq!(db.page("t", 1, 1).unwrap().rowids, Some(vec![2]));
+            db.update_row("t", 1, &[("name".into(), PValue::Text("Alicia".into()))])
+                .unwrap();
+            db.delete_row("t", 2).unwrap();
+            assert_eq!(
+                db.query("SELECT name, rowid FROM t").unwrap().rows,
+                vec![vec![PValue::Text("Alicia".into()), PValue::Int(7)]]
+            );
+        }
+    }
+
+    #[test]
+    fn cached_rowid_cannot_become_a_multirow_write_after_schema_change() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(name TEXT); INSERT INTO t VALUES('Alice'),('Bob')")
+            .unwrap();
+        assert_eq!(db.page("t", 0, 10).unwrap().rowids, Some(vec![1, 2]));
+        // Bypass application cache invalidation, as external DDL does.
+        db.conn
+            .execute_batch("ALTER TABLE t ADD COLUMN rowid INTEGER DEFAULT 1")
+            .unwrap();
+        assert!(db
+            .update_row("t", 1, &[("name".into(), PValue::Text("wrong".into()))])
+            .is_err());
+        assert!(db.delete_row("t", 1).is_err());
+        assert_eq!(
+            db.query("SELECT name FROM t ORDER BY name").unwrap().rows,
+            vec![
+                vec![PValue::Text("Alice".into())],
+                vec![PValue::Text("Bob".into())]
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_row_write_rolls_back_trigger_effects_inside_existing_transaction() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(name TEXT); INSERT INTO t VALUES('Alice'); CREATE TABLE audit(message TEXT);
+            CREATE TRIGGER ignore_update BEFORE UPDATE ON t BEGIN INSERT INTO audit VALUES('side effect'); SELECT RAISE(IGNORE); END;
+            CREATE TRIGGER ignore_delete BEFORE DELETE ON t BEGIN INSERT INTO audit VALUES('side effect'); SELECT RAISE(IGNORE); END;
+            BEGIN; INSERT INTO audit VALUES('caller')").unwrap();
+        assert!(db
+            .update_row("t", 1, &[("name".into(), PValue::Text("wrong".into()))])
+            .is_err());
+        assert!(db.delete_row("t", 1).is_err());
+        assert_eq!(db.count("audit").unwrap(), 1);
+        assert_eq!(db.count("t").unwrap(), 1);
+        db.execute("ROLLBACK").unwrap();
+        assert_eq!(db.count("audit").unwrap(), 0);
+    }
+
+    #[test]
+    fn ambiguous_or_missing_row_identity_is_readonly() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE shadowed(rowid INTEGER, _rowid_ INTEGER, oid INTEGER, name TEXT);
+            INSERT INTO shadowed VALUES(7,7,7,'Alice'),(7,7,7,'Bob');
+            CREATE TABLE keyed(rowid INTEGER, name TEXT, PRIMARY KEY(rowid,name)) WITHOUT ROWID;
+            INSERT INTO keyed VALUES(7,'Alice'),(7,'Bob');
+            CREATE VIEW v AS SELECT * FROM shadowed",
+        )
+        .unwrap();
+        for table in ["shadowed", "keyed", "v"] {
+            assert!(!db.has_rowid(table), "{table} has no safe row identity");
+            assert!(db.page(table, 0, 10).unwrap().rowids.is_none());
+            assert!(db
+                .update_row(table, 7, &[("name".into(), PValue::Text("wrong".into()))])
+                .is_err());
+            assert!(db.delete_row(table, 7).is_err());
+            assert_eq!(db.count(table).unwrap(), 2);
+        }
     }
 
     #[test]

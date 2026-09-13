@@ -35,6 +35,7 @@ pub enum DbResponse {
     Columns(DbResult<Vec<ColumnInfo>>),
     Count(DbResult<i64>),
     HasRowid(bool),
+    RowidColumn(DbResult<Option<String>>),
     Page(DbResult<Page>),
     Window(DbResult<(Page, i64)>),
     Query(DbResult<QueryResult>),
@@ -296,6 +297,16 @@ impl DbLink for DbHandle {
         match self.call(Box::new(move |db| DbResponse::HasRowid(db.has_rowid(&t)))) {
             DbResponse::HasRowid(b) => b,
             _ => false,
+        }
+    }
+
+    fn rowid_column(&self, table: &str) -> DbResult<Option<String>> {
+        let t = table.to_owned();
+        match self.call(Box::new(move |db| {
+            DbResponse::RowidColumn(db.rowid_column(&t))
+        })) {
+            DbResponse::RowidColumn(r) => r,
+            _ => Err("database worker did not return row identity".into()),
         }
     }
 

@@ -23,7 +23,7 @@ pub struct RemoteDb {
     pipeline_url: String,
     display: String,
     auth: Option<String>,
-    rowid_cache: Mutex<HashMap<String, bool>>,
+    rowid_cache: Mutex<HashMap<String, Option<String>>>,
 }
 
 struct StmtOut {
@@ -255,41 +255,26 @@ impl DbLink for RemoteDb {
         }
     }
 
-    fn has_rowid(&self, table: &str) -> bool {
-        if let Some(&known) = self.rowid_cache.lock().unwrap().get(table) {
-            return known;
+    fn rowid_column(&self, table: &str) -> DbResult<Option<String>> {
+        if let Some(known) = self.rowid_cache.lock().unwrap().get(table) {
+            return Ok(known.clone());
         }
-        match self.one(
-            &format!("SELECT rowid FROM {} LIMIT 0", Self::quote(table)),
-            vec![],
-        ) {
-            Ok(_) => {
-                self.rowid_cache
-                    .lock()
-                    .unwrap()
-                    .insert(table.to_owned(), true);
-                true
-            }
-            Err(e) => {
-                let lower = e.to_ascii_lowercase();
-                let definitive =
-                    lower.contains("no such column") || lower.contains("has no column");
-                if definitive {
-                    self.rowid_cache
-                        .lock()
-                        .unwrap()
-                        .insert(table.to_owned(), false);
-                }
-                false
-            }
-        }
+        let alias = crate::db::resolve_rowid_column(self, table)?;
+        self.rowid_cache
+            .lock()
+            .unwrap()
+            .insert(table.to_owned(), alias.clone());
+        Ok(alias)
     }
 
     fn page(&self, table: &str, offset: i64, limit: i64) -> DbResult<Page> {
         let q = Self::quote(table);
-        if self.has_rowid(table) {
+        if let Some(alias) = self.rowid_column(table)? {
+            let id = Self::quote(&alias);
             let out = self.one(
-                &format!("SELECT rowid, * FROM {q} LIMIT {limit} OFFSET {offset}"),
+                &format!(
+                    "SELECT {q}.{id}, * FROM {q} ORDER BY {q}.{id} LIMIT {limit} OFFSET {offset}"
+                ),
                 vec![],
             )?;
             let mut rows = out.rows;
@@ -324,9 +309,11 @@ impl DbLink for RemoteDb {
             Ok((page, total))
         };
         let q = Self::quote(table);
-        let with_rowid = self.has_rowid(table);
-        let select = if with_rowid {
-            format!("SELECT rowid, *, count(*) OVER () AS _total FROM {q}")
+        let alias = self.rowid_column(table)?;
+        let with_rowid = alias.is_some();
+        let select = if let Some(alias) = alias {
+            let id = Self::quote(&alias);
+            format!("SELECT {q}.{id}, *, count(*) OVER () AS _total FROM {q} ORDER BY {q}.{id}")
         } else {
             format!("SELECT *, count(*) OVER () AS _total FROM {q}")
         };
@@ -398,16 +385,19 @@ impl DbLink for RemoteDb {
         if changes.is_empty() {
             return Ok(());
         }
+        let alias = self
+            .rowid_column(table)?
+            .ok_or("no unambiguous row identity; editing is read-only")?;
         let sets: Vec<String> = changes
             .iter()
             .enumerate()
             .map(|(i, (col, _))| format!("{} = ?{}", Self::quote(col), i + 1))
             .collect();
         let sql = format!(
-            "UPDATE {} SET {} WHERE rowid = ?{}",
+            "UPDATE {} SET {} WHERE {}",
             Self::quote(table),
             sets.join(", "),
-            changes.len() + 1
+            crate::db::rowid_predicate(table, &alias, &format!("?{}", changes.len() + 1))
         );
         let mut args: Vec<Json> = changes.iter().map(|(_, v)| encode(v)).collect();
         args.push(encode(&PValue::Int(rowid)));
@@ -442,8 +432,15 @@ impl DbLink for RemoteDb {
     }
 
     fn delete_row(&self, table: &str, rowid: i64) -> DbResult<()> {
+        let alias = self
+            .rowid_column(table)?
+            .ok_or("no unambiguous row identity; deleting is read-only")?;
         let out = self.one(
-            &format!("DELETE FROM {} WHERE rowid = ?1", Self::quote(table)),
+            &format!(
+                "DELETE FROM {} WHERE {}",
+                Self::quote(table),
+                crate::db::rowid_predicate(table, &alias, "?1")
+            ),
             vec![encode(&PValue::Int(rowid))],
         )?;
         if out.affected == 1 {

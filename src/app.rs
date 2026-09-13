@@ -3898,11 +3898,18 @@ impl App {
         let want_key = key_sql.to_owned();
         match self.db.submit(Box::new(move |db| {
             let where_clause = format!("\"{}\" = {}", child_col.replace('"', "\"\""), key_sql);
-            let order = if db.has_rowid(&child) {
-                " ORDER BY rowid"
-            } else {
-                ""
-            };
+            let order = db
+                .rowid_column(&child)
+                .ok()
+                .flatten()
+                .map(|alias| {
+                    format!(
+                        " ORDER BY {}.{}",
+                        Self::quote_ident(&child),
+                        Self::quote_ident(&alias)
+                    )
+                })
+                .unwrap_or_default();
             let q = db.query(&format!(
                 "SELECT * FROM \"{}\" WHERE {}{} LIMIT {}",
                 child.replace('"', "\"\""),
@@ -4307,7 +4314,7 @@ impl App {
                 ..
             }) => {
                 if !*editable {
-                    return self.say("this table has no rowid; BROWSE is read-only here");
+                    return self.say("no unambiguous row identity; BROWSE is read-only here");
                 }
             }
             Some(_) => return self.say("query results are read-only (Esc to go back)"),
@@ -4800,19 +4807,23 @@ impl App {
             .enumerate()
             .filter_map(|(i, c)| c.as_ref().map(|_| i))
             .collect();
-        if idxs.is_empty() || rowid == 0 {
+        if idxs.is_empty() {
             return;
         }
         let select: Vec<String> = idxs
             .iter()
             .map(|&i| format!("({})", computed[i].as_deref().unwrap_or("NULL")))
             .collect();
-        let sql = format!(
-            "SELECT {} FROM {} WHERE rowid = {rowid}",
-            select.join(", "),
-            Self::quote_ident(table)
-        );
-        match self.db.query(&sql) {
+        let result = self.db.rowid_column(table).and_then(|alias| {
+            let alias = alias.ok_or("no unambiguous row identity")?;
+            self.db.query(&format!(
+                "SELECT {} FROM {} WHERE {}",
+                select.join(", "),
+                Self::quote_ident(table),
+                crate::db::rowid_predicate(table, &alias, &rowid.to_string())
+            ))
+        });
+        match result {
             Ok(q) => {
                 if let Some(row) = q.rows.first() {
                     for (j, &i) in idxs.iter().enumerate() {
@@ -4839,7 +4850,7 @@ impl App {
             return self.say("insert needs a table BROWSE (query results are read-only)");
         };
         if !editable {
-            return self.say("this table has no rowid; cannot insert here");
+            return self.say("no unambiguous row identity; cannot insert from this form");
         }
         let name = name.clone();
         let cols = match self.cached_columns(&name) {
@@ -4895,7 +4906,7 @@ impl App {
             return self.say("delete needs a table BROWSE");
         };
         if !editable {
-            return self.say("this table has no rowid; cannot delete here");
+            return self.say("no unambiguous row identity; cannot delete from this grid");
         }
         let idx = (cur_row - cache_start) as usize;
         let Some(rowid) = rowids.as_ref().and_then(|r| r.get(idx)).copied() else {
@@ -6126,6 +6137,43 @@ mod tests {
         let g = a.grid.as_ref().unwrap();
         assert!(matches!(g.source, GridSource::Query { .. }));
         assert_eq!(g.row(0).unwrap()[0], PValue::Int(500));
+    }
+
+    #[test]
+    fn edit_and_delete_use_identity_separate_from_a_user_rowid_column() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(rowid INTEGER, name TEXT); INSERT INTO t VALUES(7,'Alice'),(7,'Bob')",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        for c in "Alicia".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditSave);
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::None), "{:?}", a.status);
+        assert_eq!(
+            a.db.query("SELECT name FROM t ORDER BY _rowid_")
+                .unwrap()
+                .rows,
+            vec![
+                vec![PValue::Text("Alicia".into())],
+                vec![PValue::Text("Bob".into())]
+            ]
+        );
+        a.apply(Command::DeleteRow);
+        a.apply(Command::DeleteRow);
+        a.sync();
+        assert_eq!(
+            a.db.query("SELECT name FROM t").unwrap().rows,
+            vec![vec![PValue::Text("Bob".into())]]
+        );
     }
 
     #[test]
