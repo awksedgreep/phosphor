@@ -68,6 +68,12 @@ pub enum ScriptTarget {
         item_id: i64,
         label: String,
     },
+    /// A memo/note: a long text field opened full-screen from EDIT. The
+    /// `field` index points into the stashed EditState.
+    Memo {
+        field: usize,
+        label: String,
+    },
 }
 
 /// A full-screen text buffer for one script.
@@ -99,13 +105,14 @@ impl ScriptState {
         self.lines.join("\n")
     }
 
-    /// The box title: what this script is bound to.
+    /// The box title: what this editor is bound to.
     pub fn title(&self) -> String {
         match &self.target {
             ScriptTarget::Form { table, event } => format!(" SCRIPT · {table} · {event}"),
             ScriptTarget::MenuItem { app, label, .. } => {
                 format!(" SCRIPT · {app} · {label}")
             }
+            ScriptTarget::Memo { label, .. } => format!(" NOTE · {label}"),
         }
     }
 
@@ -364,6 +371,8 @@ pub enum Command {
     EditBackspace,
     EditCommitField,
     EditSave,
+    /// F3 in EDIT/NEW: open the current field in the full-screen note editor.
+    EditMemo,
     PromptChar(char),
     PromptBackspace,
     PromptMove(i64),
@@ -576,6 +585,9 @@ pub struct App {
     menu_launched: bool,
     /// The app whose designer launched the script editor; Esc returns.
     script_return_app: Option<String>,
+    /// The EDIT form parked while a note/Memo editor is open; F6 restores
+    /// it with the text folded into the field, Esc restores it untouched.
+    memo_return: Option<EditState>,
     /// Select-all semantics for prefilled single-line editors: the
     /// first typed char REPLACES the prefill; Backspace edits it.
     editor_fresh: bool,
@@ -657,6 +669,7 @@ impl App {
             show_internals: false,
             menu_launched: false,
             script_return_app: None,
+            memo_return: None,
             editor_fresh: false,
             last_edit_page: None,
             page_streak: 0,
@@ -1215,6 +1228,7 @@ impl App {
                 // "type, F10" must work without an Enter in between
                 // (field report: F10 appeared dead mid-edit).
                 (Some(_), F(10)) => Command::EditSave,
+                (Some(_), F(3)) => Command::EditMemo,
                 (Some(_), Char('s')) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     Command::EditSave
                 }
@@ -1239,6 +1253,7 @@ impl App {
                 (None, F(5)) => Command::EditOpenLink(1),
                 (None, F(6)) => Command::EditOpenLink(2),
                 (None, F(7)) => Command::EditPick,
+                (None, F(3)) => Command::EditMemo,
                 (None, Esc) => Command::Back,
                 // The form is LIVE, 1988-style: land on a field and
                 // just type — no Enter required to begin.
@@ -1852,6 +1867,17 @@ impl App {
                 }
             }
             Command::EditBegin => {
+                // A value already carrying newlines can't be edited in a
+                // one-line buffer: Enter opens the note editor instead.
+                let multiline = matches!(&self.overlay, Overlay::Edit(ed)
+                    if ed
+                        .inputs
+                        .get(ed.cursor)
+                        .and_then(|t| t.as_deref())
+                        .is_some_and(|t| t.contains('\n')));
+                if multiline {
+                    return self.open_memo_editor();
+                }
                 if let Overlay::Edit(ed) = &mut self.overlay {
                     if matches!(ed.computed.get(ed.cursor), Some(Some(_))) {
                         self.say("computed field — read-only");
@@ -1868,6 +1894,7 @@ impl App {
                     self.editor_fresh = true;
                 }
             }
+            Command::EditMemo => self.open_memo_editor(),
             Command::EditChar(c) => {
                 let fresh = std::mem::take(&mut self.editor_fresh);
                 if let Overlay::Edit(ed) = &mut self.overlay {
@@ -5760,9 +5787,52 @@ impl App {
         ));
     }
 
+    /// Open the current EDIT field in the full-screen note editor (F3).
+    /// The same editor that edits Lua scripts, now used as a dBASE memo.
+    fn open_memo_editor(&mut self) {
+        let computed = matches!(
+            &self.overlay,
+            Overlay::Edit(ed) if matches!(ed.computed.get(ed.cursor), Some(Some(_)))
+        );
+        if computed {
+            return self.say("computed field — read-only");
+        }
+        self.fold_editing_buffer();
+        let (field, label, current) = {
+            let Overlay::Edit(ed) = &self.overlay else {
+                return;
+            };
+            let i = ed.cursor;
+            let current = ed.inputs[i]
+                .clone()
+                .unwrap_or_else(|| pvalue_to_input(&ed.fields[i].1));
+            let label = ed
+                .labels
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| ed.fields[i].0.name.clone());
+            (i, label, current)
+        };
+        let Overlay::Edit(ed) = std::mem::replace(&mut self.overlay, Overlay::None) else {
+            return;
+        };
+        self.memo_return = Some(ed);
+        let mut st = ScriptState::new(ScriptTarget::Memo { field, label }, &current);
+        // A note opens with the caret at the end: you came here to keep
+        // writing, not to retype the first word.
+        st.row = st.lines.len().saturating_sub(1);
+        st.col = st.lines[st.row].chars().count();
+        self.overlay = Overlay::ScriptEditor(st);
+    }
+
     /// Leave the editor; when it was opened from the Applications
-    /// Generator, go back there instead of the bare browser.
+    /// Generator, go back there instead of the bare browser. A note
+    /// editor always returns to the EDIT form it was launched from.
     fn close_script_editor(&mut self) {
+        if let Some(ed) = self.memo_return.take() {
+            self.overlay = Overlay::Edit(ed);
+            return;
+        }
         match self.script_return_app.take() {
             Some(app) => self.open_apps(Some(app)),
             None => self.overlay = Overlay::None,
@@ -5830,11 +5900,25 @@ impl App {
     }
 
     fn script_save(&mut self) {
-        let Overlay::ScriptEditor(st) = &self.overlay else {
-            return;
+        let (text, target) = match &self.overlay {
+            Overlay::ScriptEditor(st) => (st.text(), st.target.clone()),
+            _ => return,
         };
-        let text = st.text();
-        let (result, note): (crate::db::DbResult<()>, String) = match &st.target {
+        // A note: fold the text back into the parked EDIT form and stop
+        // there — the record is written by the form's own F10, not here.
+        if let ScriptTarget::Memo { field, label } = target {
+            let Some(mut ed) = self.memo_return.take() else {
+                return;
+            };
+            let original = pvalue_to_input(&ed.fields[field].1);
+            let current = ed.inputs[field].clone().unwrap_or(original);
+            if text != current {
+                ed.inputs[field] = Some(text);
+            }
+            self.overlay = Overlay::Edit(ed);
+            return self.say(format!("note saved to {label:?}"));
+        }
+        let (result, note): (crate::db::DbResult<()>, String) = match &target {
             ScriptTarget::Form { table, event } => {
                 let r = if text.trim().is_empty() {
                     crate::script::clear_script(self.db.link(), table, event)
@@ -5851,6 +5935,7 @@ impl App {
                 crate::appsgen::set_item_ref(self.db.link(), *item_id, &text),
                 format!("saved {app} · {label}"),
             ),
+            ScriptTarget::Memo { .. } => unreachable!("handled above"),
         };
         match result {
             Ok(()) => {
@@ -6263,6 +6348,92 @@ mod tests {
         assert!(matches!(a.overlay, Overlay::None));
         let src = crate::script::get_script(a.db.link(), "t", "OnValidate").unwrap();
         assert_eq!(src, "say(\"hi\")\nreturn 1");
+    }
+
+    /// F3 in EDIT opens the current field in the note editor; F6 folds
+    /// the multi-line text back into the field, and the form's own save
+    /// writes it to the row with the newline intact.
+    #[test]
+    fn memo_editor_round_trips_a_note_field() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, note TEXT);
+             INSERT INTO notes(note) VALUES ('first');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // id -> note
+        a.apply(Command::EditMemo);
+        assert!(
+            matches!(&a.overlay, Overlay::ScriptEditor(st)
+                if matches!(st.target, ScriptTarget::Memo { .. })),
+            "F3 opens the note editor"
+        );
+        // Opens at the end of "first", so typing appends.
+        for c in " draft".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::ScriptNewline);
+        for c in "second line".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::ScriptSave);
+        assert!(matches!(a.overlay, Overlay::Edit(_)), "returns to the form");
+        match &a.overlay {
+            Overlay::Edit(ed) => {
+                assert_eq!(
+                    ed.inputs[1].as_deref(),
+                    Some("first draft\nsecond line"),
+                    "newline folded into the field"
+                );
+            }
+            _ => unreachable!(),
+        }
+        // Enter on a value that carries newlines reopens the note editor
+        // instead of a one-line buffer.
+        a.apply(Command::EditBegin);
+        assert!(
+            matches!(&a.overlay, Overlay::ScriptEditor(st)
+                if matches!(st.target, ScriptTarget::Memo { .. })),
+            "Enter routes multi-line values to the note editor"
+        );
+        a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::Edit(_)));
+        a.apply(Command::EditSave);
+        a.sync();
+        let q = a.db.query("SELECT note FROM notes").unwrap();
+        assert_eq!(
+            q.rows[0][0],
+            PValue::Text("first draft\nsecond line".into())
+        );
+    }
+
+    /// Esc in the note editor cancels: the field keeps its old value.
+    #[test]
+    fn memo_editor_cancel_discards_edits() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, note TEXT);
+             INSERT INTO notes(note) VALUES ('keep');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditMemo);
+        for c in " throwaway".chars() {
+            a.apply(Command::ScriptChar(c));
+        }
+        a.apply(Command::Back); // Esc
+        match &a.overlay {
+            Overlay::Edit(ed) => assert_eq!(ed.inputs[1], None, "note field untouched"),
+            _ => unreachable!("back to the form"),
+        }
     }
 
     /// #12: the editor edits a menu item's script (multi-line), returns

@@ -75,6 +75,10 @@ In the grid:
     moves to the next field.
     F10/Ctrl-S save and close. Empty input means NULL. A ¶ marks
     the primary key; a * marks a required field.
+  · F3 opens the current field in a full-screen NOTE editor — for a
+    long comment, memo, or notes field. Enter starts a new line; F6
+    folds the text back into the field (the form saves it), Esc
+    cancels. It is the same editor that writes Lua scripts.
   · Tab moves to the next field (committing anything typed);
     Shift-Tab moves back.
   · Declared FOREIGN KEYS become child panes under the form —
@@ -444,8 +448,9 @@ BROWSE grid
 EDIT / NEW record
   ↑↓/Tab field · PgUp/PgDn (or ←→) previous/next record
   Enter edit value · Enter again commit + SAVE + next field
-  F7 pick a foreign-key value · F4/F5/F6 child panes
-  F10 / Ctrl-S save and close · Esc cancel value, then close
+  F3 full-screen note editor · F7 pick a foreign-key value
+  F4/F5/F6 child panes · F10 / Ctrl-S save and close
+  Esc cancel value, then close
 
 Designers
   form: Space show · n add · x del · r required · m mask · c computed

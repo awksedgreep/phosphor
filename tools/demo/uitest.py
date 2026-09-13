@@ -231,6 +231,23 @@ def reels():
     r.key("x", 0.7).expect("row deleted")
     out.append(r)
 
+    # ── B2 · the note editor: F3 opens a long field full-screen ─────
+    r = Reel("memo", "the note editor: F3 edits a long TEXT field full-screen")
+    r.key("n", 0.5).key(ENTER, 0.7).expect("BROWSE notes")
+    r.key(ENTER, 0.7).expect("EDIT notes")
+    r.key(TAB, 0.3).key(TAB, 0.3)                     # id -> customer_id -> note
+    r.key(F3, 0.7).expect("NOTE ·")                   # the full-screen editor
+    r.type(" - follow up")                            # caret opens at the end
+    r.key(ENTER, 0.4)
+    r.type("next week")
+    r.key(F6, 0.6).expect("note saved to")            # fold back into the field
+    r.key(F10, 0.8).expect("saved")                   # the form writes the row
+    r.key(ENTER, 0.8).expect("EDIT notes")            # reopen: the newline shows
+    r.key(TAB, 0.3).key(TAB, 0.3)
+    r.expect("follow up␤next week")
+    r.key(ESC, 0.4).key(ESC, 0.4)
+    out.append(r)
+
     # ── C · the dot prompt: SQL, errors, completion, themes ──────────
     r = Reel("prompt", "the dot prompt: SQL · errors · completion · themes")
     r.key(".", 0.3).type("select count(*) as customers_n from customers")

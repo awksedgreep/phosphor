@@ -61,6 +61,12 @@
   a database-with-apps should land. When an app is present and no
   preference is set, the status line points at `A` so the menu isn't a
   secret.
+- **Note editor**: `F3` in EDIT/NEW opens the current field in the same
+  full-screen editor that writes Lua scripts — for long comments, memos,
+  and notes. Enter starts a new line; F6 folds the text back into the
+  field (the form's own F10 writes the row); Esc cancels. The one-line
+  field shows folded newlines as `␤`, and Enter on such a value reopens
+  the note editor. New `memo` UI reel (20 asserted reels).
 
 - **Read-only kiosk + app version** (#21): `--app --readonly` refuses
   every write centrally; `_phosphor_apps.version` migrates in place and

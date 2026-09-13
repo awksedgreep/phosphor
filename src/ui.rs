@@ -8,7 +8,7 @@ use ratatui::Frame;
 
 use std::borrow::Cow;
 
-use crate::app::{App, DetailState, Focus, Grid, GridSource, Overlay};
+use crate::app::{App, DetailState, Focus, Grid, GridSource, Overlay, ScriptTarget};
 use crate::db::{DbLink, PValue};
 
 pub fn draw(f: &mut Frame, app: &mut App) -> bool {
@@ -1342,7 +1342,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
                 (true, Some(buf)) => Span::styled(format!("{buf}▏"), th.cursor()),
                 _ => {
                     let (text, edited) = match &ed.inputs[i] {
-                        Some(t) => (t.clone(), true),
+                        Some(t) => (note_display(t), true),
                         None => (ed.fields[i].1.render(), false),
                     };
                     Span::styled(
@@ -1424,7 +1424,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
             Span::styled(format!("{buf}▏"), th.cursor())
         } else {
             let (text, edited) = match &ed.inputs[i] {
-                Some(t) => (t.clone(), true),
+                Some(t) => (note_display(t), true),
                 None => (original.render(), false),
             };
             let style = if selected {
@@ -1497,6 +1497,12 @@ fn draw_picker(f: &mut Frame, app: &App, ed: &crate::app::EditState) {
 
 /// The multi-line Lua editor: line numbers, an inverse caret, dirty
 /// marker, and a hint footer. Full screen so long scripts breathe.
+/// A note's newlines show as ␤ in the one-line EDIT field; the full
+/// note editor (F3) is where they are real.
+fn note_display(text: &str) -> String {
+    text.replace('\n', "␤")
+}
+
 fn draw_script_editor(f: &mut Frame, app: &App) {
     let th = app.theme;
     let Overlay::ScriptEditor(st) = &app.overlay else {
@@ -1508,15 +1514,17 @@ fn draw_script_editor(f: &mut Frame, app: &App) {
     });
     f.render_widget(Clear, area);
     let dirty = if st.dirty { " *" } else { "" };
+    let hint = if matches!(&st.target, ScriptTarget::Memo { .. }) {
+        " type · Enter newline · Tab indent · F6 keep · Esc cancel "
+    } else {
+        " type · Enter newline · Tab indent · F6 save · Esc close "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(th.bright())
         .style(th.base())
         .title(Span::styled(format!("{}{dirty} ", st.title()), th.bright()))
-        .title_bottom(Line::styled(
-            " type · Enter newline · Tab indent · F6 save · Esc close ",
-            th.dim(),
-        ));
+        .title_bottom(Line::styled(hint, th.dim()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 

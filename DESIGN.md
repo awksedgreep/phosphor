@@ -38,7 +38,7 @@ affiliation or compatibility is implied or intended.)
 | Applications Generator (`.app`) | Menu designer: named menus of actions (open form, run query/report, run SQL, submenu) | the "craft your own CRM" feature |
 | `SET RELATION` | Master-detail linked browses driven by foreign keys (declared or ad-hoc) | orders under the selected customer, live |
 | Catalogs (`.cat`) | An "app" = named collection of tables/forms/queries/reports/menus | one db can hold several apps |
-| Memo fields (`.dbt`) | TEXT columns with a full-screen editor pop-over | plus JSON columns with a tree editor |
+| Memo fields (`.dbt`) | TEXT columns with a full-screen editor pop-over | shipped: `F3` in EDIT opens the note editor, newlines preserved; a JSON tree editor is still future |
 | Indexes (`.ndx`/`.mdx`) | Real SQL indexes + an index advisor fed by `dbhealth` | "this browse full-scans; create index?" |
 | `PROTECT` (users/passwords) | Delegated to deployment: file permissions (embedded) or sqld auth (network) | phosphor is not an auth system |
 | Function keys, status bar | F1 help, F2 data, F10 menu, Esc backs out, status bar with db/latency/health dot | keyboard-first, mouse tolerated |
@@ -173,7 +173,7 @@ Three layers, one philosophy — the artifact proves itself:
 1. **Bus tests** (`cargo test`): the command bus means every user
    action is a `Command` value, so tests PLAY the app — navigation,
    editing, designers, app mode — without a terminal.
-2. **The UI sweep** (`python3 tools/demo/uitest.py`): nineteen
+2. **The UI sweep** (`python3 tools/demo/uitest.py`): twenty
    scripted pty reels covering every screen, asserted against a
    reconstructed SCREEN (a small terminal emulator in the harness —
    stream-grepping is blind to cell-diff rendering). Each reel reseeds

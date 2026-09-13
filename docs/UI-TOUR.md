@@ -15,6 +15,7 @@ python3 tools/demo/uitest.py --render   # assert everything, then render
 | ![nav](demo/ui/nav.gif) | first-letter seek, the internals toggle, browse motion (g/G, Home/End), read-only views |
 | ![columns](demo/ui/columns.gif) | column widths (`+`/`-`) and frozen columns (`f`) |
 | ![crud](demo/ui/crud.gif) | the painted card, editing a field, required-field refusal, insert, find, double-x delete |
+| ![memo](demo/ui/memo.gif) | the note editor (`F3`): a long `TEXT` field full-screen, `F6` folds real newlines back into the form |
 | ![prompt](demo/ui/prompt.gif) | SQL in the grid, error handling, Tab completion, all four themes |
 | ![qbe](demo/ui/qbe.gif) | Query By Example: filters, live (wrapping) SQL, run, save, replay by name |
 | ![qbeextras](demo/ui/qbeextras.gif) | QBE teaches the rest: `J` cycles FK joins, `g` adds GROUP BY |

@@ -85,7 +85,8 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   (`+`/`-`, `f`), **split view** (`v`; `H` stacks) that puts a related
   table beside the master — cursor-linked, mouse-clickable, remembered —
   **EDIT** record form on Enter (PICTURE-style ¶ pk / * not-null markers,
-  typed parsing), `a`dd and `x`-twice-delete rows, `find <text>` + `n` to
+  typed parsing, and a full-screen **note editor** — `F3` — for long
+  comments/memos), `a`dd and `x`-twice-delete rows, `find <text>` + `n` to
   seek, the **TABLE EDITOR** (`E`: add/drop columns, rename, `D`-twice
   drop the table), a live **dot prompt** (`.`) running real SQL with
   history, Tab completion, and Ctrl-A/E/U/W line editing, **CSV
