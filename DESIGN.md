@@ -28,9 +28,9 @@ affiliation or compatibility is implied or intended.)
 |---|---|---|
 | The dot prompt | SQL + app-command REPL with history & completion | the identity feature; always one keystroke away |
 | Control Center / ASSIST | The home screen: panels for Data, Queries, Forms, Reports, Apps, Admin | the ASCII mock in the README |
-| BROWSE | Grid view/edit of any table or query, virtualized for millions of rows | column resize, freeze, seek-as-you-type |
+| BROWSE | Grid view/edit of any table or query, virtualized for millions of rows | column resize, freeze, seek-as-you-type, and a live TABLE EDITOR for the schema (`ALTER`) |
 | EDIT | Single-record form view, auto-generated when no painted form exists | one key flips BROWSE ↔ EDIT |
-| CREATE SCREEN (`.scr`/`.fmt`) | Full-screen form painter: fields, labels, pickers, checkboxes, validation rules, field order | stored in the db (see "Apps live in the database") |
+| CREATE SCREEN (`.scr`/`.fmt`) | Full-screen form painter: fields, labels, pickers, computed read-only fields, validation rules, field order | stored in the db (see "Apps live in the database") |
 | `@ SAY/GET` + PICTURE clauses | Field masks & validation (`999-99-9999`, ranges, required, lookup-into-table) | declarative, in the form definition |
 | CREATE REPORT (`.frm`) | Banded report writer: page/group headers & footers, detail band, computed totals; output to screen pager, text file, or printer | groups from `GROUP BY`-able expressions |
 | CREATE LABEL (`.lbl`) | Label writer (Avery presets and custom geometry) | yes, really — it's 30 lines of layout math and people still print labels |
@@ -42,7 +42,7 @@ affiliation or compatibility is implied or intended.)
 | Indexes (`.ndx`/`.mdx`) | Real SQL indexes + an index advisor fed by `dbhealth` | "this browse full-scans; create index?" |
 | `PROTECT` (users/passwords) | Delegated to deployment: file permissions (embedded) or sqld auth (network) | phosphor is not an auth system |
 | Function keys, status bar | F1 help, F2 data, F10 menu, Esc backs out, status bar with db/latency/health dot | keyboard-first, mouse tolerated |
-| `SET` commands | A `set` command namespace at the dot prompt (`set theme amber`) | persisted per-user |
+| `SET` commands | A `set` command namespace at the dot prompt (`set theme amber`, `set shimmer on`, `set boot menu`) | persisted per-user |
 | dBASE language (`DO WHILE`, `.prg`) | **Not revived in v1.** SQL + the menu/action layer covers the 90% case | a Lua scripting hook landed after v1 (slice 1: `script` menu actions) |
 
 Deliberate omissions: the dBASE-style language interpreter (see above),
@@ -75,14 +75,17 @@ All designer output is stored in `_phosphor_*` tables inside the target
 database (namespaced, created on first save, ignorable by other tools):
 
 ```sql
-_phosphor_apps    (id, name, description, menu_root)
-_phosphor_menus   (id, app_id, title, position)
-_phosphor_items   (id, menu_id, label, action_kind, action_ref, hotkey, seq)
-_phosphor_forms   (id, name, table_ref, layout_json, version)
-_phosphor_queries (id, name, qbe_json, sql_text, version)
-_phosphor_reports (id, name, source_ref, bands_json, version)
+_phosphor_apps    (id, name UNIQUE, description, version)
+_phosphor_items   (id, app_id, label, action_kind, action_ref, hotkey, seq)
+_phosphor_forms   (id, table_ref UNIQUE, layout_json, version)
+_phosphor_queries (id, name UNIQUE, table_ref, qbe_json, sql_text, version)
+_phosphor_reports (id, name UNIQUE, title, source_sql, group_by, version)
+_phosphor_scripts (id, table_ref, event, source, UNIQUE(table_ref, event))
 _phosphor_prefs   (user, key, value)
 ```
+
+The live DDL lives in `src/store.rs` (the source of truth if this list
+ever drifts again).
 
 `layout_json`/`bands_json` are versioned documents; the schema is the
 contract and migrations are explicit. Everything a user builds is
@@ -170,11 +173,12 @@ Three layers, one philosophy — the artifact proves itself:
 1. **Bus tests** (`cargo test`): the command bus means every user
    action is a `Command` value, so tests PLAY the app — navigation,
    editing, designers, app mode — without a terminal.
-2. **The UI sweep** (`python3 tools/demo/uitest.py`): nine scripted
-   pty reels covering every screen, asserted against a reconstructed
-   SCREEN (a small terminal emulator in the harness — stream-grepping
-   is blind to cell-diff rendering). Each reel reseeds its database;
-   add `--render` and a green run regenerates `docs/demo/ui/*.gif`.
+2. **The UI sweep** (`python3 tools/demo/uitest.py`): nineteen
+   scripted pty reels covering every screen, asserted against a
+   reconstructed SCREEN (a small terminal emulator in the harness —
+   stream-grepping is blind to cell-diff rendering). Each reel reseeds
+   its database; add `--render` and a green run regenerates
+   `docs/demo/ui/*.gif`.
 3. **The GIFs are the docs**: demo footage only ever comes from a
    passing run, so [UI-TOUR.md](docs/UI-TOUR.md) carries an implicit
    warranty — what you see is what the tests proved. Frame extraction

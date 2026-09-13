@@ -289,7 +289,9 @@ bright first letter of an item to run it instantly.
 
 To ship it:   phosphor --app yourfile.db
 The menu comes up first, and Esc from the top level always returns
-to it — the database IS the application. Since menus, forms, and
+to it — the database IS the application. To make that the default
+for this database,  set boot menu  at the dot prompt (see Command
+line). Since menus, forms, and
 reports live in _phosphor tables inside the file, copying the file
 deploys the app, and libSQL replication deploys it everywhere.",
     },
@@ -404,7 +406,34 @@ Environment variables:
 
 Everything you build is stored in the database itself, so it works
 identically over both connections — craft a form on your laptop
-against the file, and your team sees it over sqld tomorrow.",
+against the file, and your team sees it over sqld tomorrow.
+
+Startup flags (--app, --readonly, --manual) are in Command line.",
+    },
+    HelpTopic {
+        key: "cli",
+        title: "Command line",
+        body: "\
+Everything the UI does has a startup flag for the shell:
+
+  phosphor [options] [file|url]
+
+  phosphor crm.db              open the file (embedded)
+  phosphor http://host:8880    connect to sqld (remote)
+  phosphor --app crm.db        boot into the Applications menu
+  phosphor --app Billing crm.db   …the app named Billing
+  phosphor --app --readonly crm.db   kiosk: browse, never write
+  phosphor --manual            print this manual as Markdown
+  phosphor --help              usage;  --version  the build
+
+With no argument phosphor opens an in-memory database — a
+scratchpad for trying SQL.
+
+The startup destination is a remembered preference:  set boot
+menu  opens the app menu on launch,  set boot browser  the table
+list (the default). A database that carries an app but no
+preference shows a hint pointing at A, so the menu is never a
+secret.",
     },
     HelpTopic {
         key: "keys",

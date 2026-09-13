@@ -40,6 +40,12 @@ The tables appear in the sidebar as you create them. *(While you're
 here: if you loaded the extension, `CREATE VIRTUAL TABLE dbhealth USING
 dbhealth` gives the database a pulse — the ● in the status bar.)*
 
+Designs change. Stand on a table and press **`E`** for the TABLE
+EDITOR: add, rename, or drop columns, change types, even rename the
+table; **`F2`** applies it as `ALTER`s (or a rebuild when SQLite can't
+ALTER in place), showing the exact changes first. `D` twice drops the
+whole table. *(Watch it: [tableeditor.gif](demo/ui/tableeditor.gif))*
+
 ## 2 · Put some customers in it
 
 `Esc` to the sidebar, then type `c` — first-letter seek jumps to
@@ -125,7 +131,8 @@ On `orders` (seek with `o`), press **`R`**:
 | `↓↓`, then `Space` until it says `region` | group bands + subtotals per region |
 | `F2` | preview: page header, ▌ bands, totals (ids are never summed) |
 | `w` | writes `report_orders.txt` for printing/mailing |
-| `Esc`, `F6` | saved by name |
+| `p` | sends it to a printer (`lp`, or `$PHOSPHOR_PRINT`) |
+| `Esc`, `F6` | saved by name (F6 asks, so you can rename it) |
 
 Labels too, if you mail things: `L` on customers — three-across, done.
 *(Watch it: [reports.gif](demo/ui/reports.gif))*

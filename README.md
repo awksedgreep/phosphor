@@ -76,20 +76,26 @@ cargo run -- path/to/any.db            # embedded: any SQLite/libSQL file
 cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
 # PHOSPHOR_TOKEN=...                     for authenticated servers (Turso-style)
 # PHOSPHOR_EXT=.../libtimeless_ext.so    embedded telemetry + dbhealth
+# cargo run -- --manual > docs/MANUAL.md   the F1 manual, as Markdown
+# cargo run -- --help  /  --version        usage and build info
 ```
 
 - **Browse** — schema sidebar (tables ▪, views ◇), virtualized **BROWSE**
-  grid that pages through millions of rows, **split view** (`v`) that
-  puts a related table beside the master — cursor-linked, mouse-clickable,
-  remembered — **EDIT** record form on Enter
-  (PICTURE-style ¶ pk / * not-null markers, typed parsing), `a`dd and
-  `x`-twice-delete rows, `find <text>` + `n` to seek, a live **dot
-  prompt** (`.`) running real SQL with history, Tab completion, and
-  Ctrl-A/E/U/W line editing, **CSV import/export**
-  (`import <table> <path>` / `export <table|SELECT> <path>`), four themes
-  (`set theme green|amber|paper|blue`), F1 help, query latency in the
-  status bar. **F1 anywhere** opens context-sensitive help written in
-  English — the topic for the screen you are on, ←→ to wander the manual.
+  grid that pages through millions of rows, resizable/freezable columns
+  (`+`/`-`, `f`), **split view** (`v`; `H` stacks) that puts a related
+  table beside the master — cursor-linked, mouse-clickable, remembered —
+  **EDIT** record form on Enter (PICTURE-style ¶ pk / * not-null markers,
+  typed parsing), `a`dd and `x`-twice-delete rows, `find <text>` + `n` to
+  seek, the **TABLE EDITOR** (`E`: add/drop columns, rename, `D`-twice
+  drop the table), a live **dot prompt** (`.`) running real SQL with
+  history, Tab completion, and Ctrl-A/E/U/W line editing, **CSV
+  import/export** (`import <table> <path>` / `export <table|SELECT>
+  <path>`), **printing** (`p`), four themes
+  (`set theme green|amber|paper|blue`), CRT shimmer (`set shimmer on`),
+  a remembered startup destination (`set boot menu|browser`), F1 help,
+  and query latency in the status bar. **F1 anywhere** opens
+  context-sensitive help written in English — the topic for the screen
+  you are on, ←→ to wander the manual.
 - **Network** — the same UI over Hrana HTTP to self-hosted
   [sqld](https://github.com/tursodatabase/libsql): one `DbLink` trait,
   two backends, chosen by the argument. Multi-user, no lock files —
@@ -103,12 +109,14 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   foreign-key columns missing an index (with the exact `CREATE INDEX`)
   and a VACUUM nudge when the file is bloated.
 - **The builders** — `Q`uery By Example (fill the grid, watch the SQL it
-  writes, F2 runs, F6 saves), `R`eports (banded: page headers, group
-  bands with subtotals, automatic totals on numeric columns, grand
-  totals; preview in a pager, `w` writes the file, `p` prints via
-  `lp`/`$PHOSPHOR_PRINT`), `L`abels
-  (three-across, zero config), and `F`orms — reorder, relabel, hide,
-  and require fields, then press **F2 for the FORM PAINTER**: place
+  writes; `J` cycles FK joins, `g` adds `GROUP BY`; F2 runs, F6 saves),
+  `R`eports (banded: page headers, group bands with subtotals, automatic
+  totals on numeric columns, grand totals; group by any expression;
+  preview in a pager, `w` writes the file, `p` prints via
+  `lp`/`$PHOSPHOR_PRINT`), `L`abels (three-across, zero config), and
+  `F`orms — reorder, relabel, hide, and require fields, add `PICTURE`
+  masks (`m`) and computed read-only fields (`c`), press `F7` on a
+  foreign key to pick a value, then **F2 for the FORM PAINTER**: place
   fields anywhere on a canvas, add title texts, draw boxes
   (`CREATE SCREEN`, reborn) — EDIT and NEW render your painted screen
   from then on.
@@ -125,8 +133,9 @@ cargo run -- http://localhost:8880     # remote: self-hosted sqld over HTTP
   phosphor --app --readonly crm.db    # kiosk: browsable, no writes
   ```
 
-  Copy the file, you copied the app. Replicate it with libSQL, you
-  deployed it.
+  Prefer to land in the menu without the flag? `set boot menu` remembers
+  it for that database. Copy the file, you copied the app. Replicate it
+  with libSQL, you deployed it.
 
   Need logic the declarative layer can't express? Bind a sandboxed **Lua
   lifecycle script** — `script customers OnValidate ...`, or edit it

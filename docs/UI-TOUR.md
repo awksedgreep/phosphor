@@ -23,7 +23,7 @@ python3 tools/demo/uitest.py --render   # assert everything, then render
 | ![pickers](demo/ui/pickers.gif) | PICTURE masks and the `F7` foreign-key value picker |
 | ![apps](demo/ui/apps.gif) | the Applications Generator: add/label/target, live menu, hotkeys, delete, rename the app (`r`) |
 | ![create](demo/ui/create.gif) | the TABLE DESIGNER: fields as rows, the CREATE TABLE writing itself, F2 → empty BROWSE → first record |
-| ![tableeditor](demo/ui/tableeditor.gif) | the TABLE EDITOR (`E`): add a column with ALTER, and drop a table with the two-press confirm |
+| ![tableeditor](demo/ui/tableeditor.gif) | the TABLE EDITOR (`E`): add and drop columns with ALTER, then drop a table with the two-press confirm |
 | ![paging](demo/ui/paging.gif) | record paging: hold PgDn and fly through 500 records in the form; edits save mid-flight |
 | ![relations](demo/ui/relations.gif) | foreign keys → SET RELATION: declare an FK in the designer (F10), open a parent record, and the child pane follows as you page; F4 opens it as a filtered BROWSE; `v` splits and `H` stacks |
 | ![scripting](demo/ui/scripting.gif) | Lua scripting: an `OnChange` lifecycle script rewrites a field on save; a `script` menu item authored in the full-screen editor runs by hotkey |
