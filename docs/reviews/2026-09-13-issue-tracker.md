@@ -26,4 +26,4 @@ Tracking issue: [47](https://github.com/awksedgreep/phosphor/issues/47). The [or
 | 20 | [#45 — P2: Saved assets are difficult to discover and wire into an application](https://github.com/awksedgreep/phosphor/issues/45) |
 | 21 | [#46 — P2: The main loop adds roughly a quarter-second to fast query results](https://github.com/awksedgreep/phosphor/issues/46) |
 
-First implementation batch: #26, #29, and #38.
+First implementation batch: #26, #29, and #38. See [changes, validation, and remaining scope](2026-09-13-first-fixes.md).
