@@ -2872,7 +2872,7 @@ impl App {
                 if let Some(i) = st.field_idx() {
                     if let Some(f) = st.draft.fields.get(i) {
                         st.slot = crate::creator::EditSlot::Default;
-                        st.editing = Some(f.default.clone());
+                        st.editing = Some(f.default.text().to_owned());
                     }
                 }
             }
@@ -3116,7 +3116,7 @@ impl App {
                         }
                         (Some(i), EditSlot::Default) => {
                             if let Some(f) = st.draft.fields.get_mut(i) {
-                                f.default = buf;
+                                f.default.edit(buf);
                             }
                         }
                         (Some(i), EditSlot::Refs) => {
@@ -8425,6 +8425,61 @@ mod tests {
             a.db.query("SELECT count(*) FROM t WHERE b IN ('once','twice')")
                 .unwrap();
         assert_eq!(q.rows[0][0], PValue::Int(1), "no duplicate insert");
+    }
+
+    #[test]
+    fn table_editor_preserves_untouched_defaults_and_accepts_changes() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, state TEXT DEFAULT 'new')")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenTableEditor);
+        // F7 opens the existing SQL default. Enter without typing must
+        // preserve it, including its interpretation as a SQL literal.
+        for code in [KeyCode::F(7), KeyCode::Enter, KeyCode::F(2)] {
+            let command = a.map_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+            a.apply(command);
+        }
+        assert!(matches!(a.overlay, Overlay::Create(_)));
+        assert!(a
+            .status
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("no structural changes"));
+        assert_eq!(
+            a.db.columns("t").unwrap()[1].dflt_value.as_deref(),
+            Some("'new'")
+        );
+
+        // Changing the default retains the designer's plain-text input
+        // rules; clearing it removes the DEFAULT clause altogether.
+        for input in [Some("ready"), None] {
+            a.apply(Command::DesignerEditAlt);
+            if let Some(input) = input {
+                for c in input.chars() {
+                    a.apply(Command::DesignerChar(c));
+                }
+            } else {
+                for _ in "'ready'".chars() {
+                    a.apply(Command::DesignerBackspace);
+                }
+            }
+            a.apply(Command::DesignerCommit);
+            a.apply(Command::DesignerRun);
+            a.sync();
+            assert!(matches!(a.overlay, Overlay::None), "{:?}", a.status);
+            a.db.execute("INSERT INTO t DEFAULT VALUES").unwrap();
+            let rows =
+                a.db.query("SELECT state FROM t ORDER BY id DESC LIMIT 1")
+                    .unwrap()
+                    .rows;
+            assert_eq!(
+                rows[0][0],
+                input.map_or(PValue::Null, |s| PValue::Text(s.into()))
+            );
+            a.apply(Command::OpenTableEditor);
+        }
     }
 
     #[test]
