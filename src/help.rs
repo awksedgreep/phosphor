@@ -423,6 +423,19 @@ Everything you build is stored in the database itself, so it works
 identically over both connections — craft a form on your laptop
 against the file, and your team sees it over sqld tomorrow.
 
+Remote transactions stay on one server connection until COMMIT
+or ROLLBACK. CSV imports own a transaction and roll back failed
+rows, malformed CSV, or a failed commit. They refuse to join a
+transaction you already opened. Remote SQL batches stop at the first
+error; a failed batch that opened its own transaction rolls it
+back. Quoted semicolons, comments, and trigger bodies are kept
+intact. Saved labels and scripts preserve quotes and line breaks.
+
+If the server ends a transaction, further writes are skipped.
+If a connection failure leaves the outcome unknown, reopen the
+database and check the result before retrying. The client does
+not reconnect and replay writes automatically.
+
 Startup flags (--app, --readonly, --manual) are in Command line.",
     },
     HelpTopic {

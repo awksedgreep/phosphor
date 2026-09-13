@@ -18,6 +18,7 @@ mod qbe;
 mod remote;
 mod report;
 mod script;
+mod sql;
 mod store;
 #[cfg(test)]
 mod test_support;

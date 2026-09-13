@@ -627,6 +627,16 @@ def reels():
     r.type("ROLLBACK").key(ENTER, 0.5).expect("ok, 0 row(s) affected")
     out.append(r)
 
+    r = Reel("sqltext", "Quoted semicolons, trigger bodies, and failed transaction batches")
+    r.key(".").type("CREATE TABLE punct(id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE fired(note TEXT)").key(ENTER, 0.5)
+    r.type("CREATE TRIGGER punct_added AFTER INSERT ON punct BEGIN INSERT INTO fired VALUES('first;'); INSERT INTO fired VALUES('second;'); END").key(ENTER, 0.5).expect("ok")
+    r.type("INSERT INTO punct VALUES(1,'Ada; O''Brien')").key(ENTER, 0.5)
+    r.type("SELECT name FROM punct").key(ENTER, 0.6).expect("Ada; O'Brien")
+    r.key(".").type("BEGIN; INSERT INTO punct VALUES(2,'temporary'); INSERT INTO punct VALUES(1,'duplicate'); COMMIT").key(ENTER, 0.6).expect("UNIQUE")
+    r.type("ROLLBACK").key(ENTER, 0.5)
+    r.type("SELECT name FROM punct ORDER BY id").key(ENTER, 0.6).expect("1 row(s)").expect("Ada; O'Brien").expect_absent("temporary")
+    out.append(r)
+
     return out
 
 

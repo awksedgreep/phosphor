@@ -4,7 +4,7 @@
 //! Wire facts (verified against sqld 0.24.x in the timeless-libsql
 //! docs work): integers are JSON *strings* to preserve 64-bit
 //! precision; blobs are base64; each pipeline without a baton lands on
-//! a fresh pooled connection; end pipelines with a close request.
+//! a fresh pooled connection. Keep the baton while a transaction is open.
 //!
 //! PHOSPHOR_TOKEN adds `Authorization: Bearer …` — the only difference
 //! between self-hosted sqld and Turso-hosted URLs.
@@ -25,6 +25,21 @@ pub struct RemoteDb {
     auth: Option<String>,
     readonly: bool,
     rowid_cache: Mutex<HashMap<String, Option<String>>>,
+    stream: Mutex<StreamState>,
+}
+
+#[derive(Default)]
+struct StreamState {
+    active: Option<Stream>,
+    // A lost response may hide a COMMIT or a rotated baton. Never reconnect
+    // and continue an import on a different connection after that failure.
+    lost: bool,
+}
+
+#[derive(Clone)]
+struct Stream {
+    baton: String,
+    url: String,
 }
 
 struct StmtOut {
@@ -55,6 +70,7 @@ impl RemoteDb {
                 .filter(|t| !t.is_empty())
                 .map(|t| format!("Bearer {t}")),
             rowid_cache: Mutex::new(HashMap::new()),
+            stream: Mutex::new(StreamState::default()),
         };
         // Fail at open, not at first keystroke.
         db.pipeline(&[("SELECT 1", vec![])])?;
@@ -62,56 +78,164 @@ impl RemoteDb {
     }
 
     fn pipeline(&self, stmts: &[(&str, Vec<Json>)]) -> DbResult<Vec<StmtOut>> {
-        // SQLite parses every read-only request as a SELECT subquery.
-        // CTE writes, PRAGMAs, ATTACH and DDL cannot appear in that position.
-        // sqld also rejects multiple statements in an execute request, so
-        // closing the parentheses cannot escape into a SQL script.
-        let mut requests: Vec<Json> = stmts
-            .iter()
-            .map(|(sql, args)| {
-                let sql = if self.readonly {
-                    format!("SELECT * FROM (\n{}\n)", sql.trim().trim_end_matches(';'))
-                } else {
-                    (*sql).to_owned()
-                };
-                json!({"type": "execute", "stmt": {"sql": sql, "args": args}})
-            })
-            .collect();
-        requests.push(json!({"type": "close"}));
-
-        let body = self.send(requests)?;
-        let results = body["results"]
-            .as_array()
-            .ok_or("sqld response missing results[]")?;
-        let mut out = Vec::new();
-        for r in results {
-            match r["type"].as_str() {
-                Some("ok") => {
-                    let resp = &r["response"];
-                    if resp["type"] == "execute" {
-                        out.push(decode_result(&resp["result"])?);
-                    }
-                }
-                Some("error") => {
-                    let error = remote_error(&r["error"]);
-                    return Err(if self.readonly {
-                        format!("read-only query: {error}")
-                    } else {
-                        error
-                    });
-                }
-                _ => return Err("sqld result with unknown type".into()),
-            }
-        }
-        Ok(out)
+        self.run_statements(
+            stmts,
+            stmts
+                .iter()
+                .any(|(sql, _)| crate::sql::changes_transaction(sql)),
+        )
     }
 
+    fn run_statements(
+        &self,
+        stmts: &[(&str, Vec<Json>)],
+        may_change_transaction: bool,
+    ) -> DbResult<Vec<StmtOut>> {
+        let mut state = self.stream.lock().unwrap();
+        if state.lost {
+            return Err("remote transaction outcome is unknown; reopen the database and check before retrying".into());
+        }
+        let previous = state.active.clone();
+        let track = previous.is_some() || may_change_transaction;
+        let mut steps = Vec::new();
+        if previous.is_none() && !self.readonly {
+            steps.push(json!({"stmt": {"sql": "PRAGMA foreign_keys=ON"}}));
+        }
+        let prefix = steps.len();
+        for (sql, args) in stmts {
+            // The server parses read-only requests as SELECT subqueries and
+            // rejects multiple statements, preventing escapes into a script.
+            let sql = if self.readonly {
+                format!("SELECT * FROM (\n{}\n)", sql.trim().trim_end_matches(';'))
+            } else {
+                (*sql).to_owned()
+            };
+            let mut step = json!({"stmt": {"sql": sql, "args": args}});
+            if !steps.is_empty() {
+                step["condition"] = json!({"type": "ok", "step": steps.len()-1});
+            } else if previous.is_some() {
+                // A server timeout can roll back a transaction while leaving
+                // its stream alive. Skip writes if ownership was lost.
+                step["condition"] = json!({"type": "not", "cond": {"type": "is_autocommit"}});
+            }
+            steps.push(step);
+        }
+        let requests = vec![
+            json!({"type": "batch", "batch": {"steps": steps}}),
+            if track {
+                json!({"type": "get_autocommit"})
+            } else {
+                json!({"type": "close"})
+            },
+        ];
+        let url = previous
+            .as_ref()
+            .map_or(self.pipeline_url.as_str(), |s| &s.url);
+        let body = match self.send_to(url, previous.as_ref().map(|s| s.baton.as_str()), requests) {
+            Ok(body) => body,
+            Err(e) => {
+                state.lost = track;
+                return Err(if track {
+                    format!("{e}; transaction outcome unknown; reopen and check before retrying")
+                } else {
+                    e
+                });
+            }
+        };
+        let result = decode_batch(&body["results"][0], steps.len());
+        if track {
+            let continuation = (|| {
+                let baton = body["baton"]
+                    .as_str()
+                    .ok_or("sqld closed the transaction stream")?
+                    .to_owned();
+                let url = match body["base_url"].as_str() {
+                    Some(base) if base.starts_with("http://") || base.starts_with("https://") => {
+                        format!("{}/v3/pipeline", base.trim_end_matches('/'))
+                    }
+                    Some(_) => return Err("sqld returned an invalid stream URL"),
+                    None => url.to_owned(),
+                };
+                let status = &body["results"][1];
+                if status["type"] != "ok" || status["response"]["type"] != "get_autocommit" {
+                    return Err("sqld did not report transaction state");
+                }
+                let autocommit = status["response"]["is_autocommit"]
+                    .as_bool()
+                    .ok_or("sqld omitted transaction state")?;
+                Ok((Stream { baton, url }, autocommit))
+            })();
+            let (stream, autocommit) = match continuation {
+                Ok(value) => value,
+                Err(e) => {
+                    state.lost = true;
+                    return Err(format!(
+                        "{e}; reopen the database and check before retrying"
+                    ));
+                }
+            };
+            if autocommit {
+                // COMMIT/ROLLBACK is already acknowledged. A close failure
+                // must not turn a completed write into a retryable error.
+                self.close_stream(&stream);
+                state.active = None;
+            } else if previous.is_none() && result.is_err() {
+                // This failed script started its own transaction. Conditional
+                // steps skipped COMMIT; closing the stream rolls it back.
+                let rollback = self.send_to(
+                    &stream.url,
+                    Some(&stream.baton),
+                    vec![
+                        json!({"type": "execute", "stmt": {"sql": "ROLLBACK"}}),
+                        json!({"type": "close"}),
+                    ],
+                );
+                state.active = None;
+                if !rollback
+                    .as_ref()
+                    .is_ok_and(|body| body["results"][0]["type"] == "ok")
+                {
+                    state.lost = true;
+                    return Err(format!(
+                        "{}; rollback could not be confirmed; reopen and check the database",
+                        result.err().unwrap()
+                    ));
+                }
+            } else {
+                state.active = Some(stream);
+            }
+        }
+        result
+            .map(|out| out.into_iter().skip(prefix).collect())
+            .map_err(|e| {
+                if self.readonly {
+                    format!("read-only query: {e}")
+                } else {
+                    e
+                }
+            })
+    }
+
+    // Dedicated schema batches own a complete transaction and must never
+    // run beside an interactive transaction on another connection.
     fn send(&self, requests: Vec<Json>) -> DbResult<Json> {
-        let mut req = self.agent.post(&self.pipeline_url);
+        let mut state = self.stream.lock().unwrap();
+        if state.lost {
+            return Err("remote transaction outcome unknown; reopen and check the database".into());
+        }
+        if state.active.is_some() {
+            return Err("finish the current transaction before editing the table".into());
+        }
+        self.send_to(&self.pipeline_url, None, requests)
+            .inspect_err(|_| state.lost = true)
+    }
+
+    fn send_to(&self, url: &str, baton: Option<&str>, requests: Vec<Json>) -> DbResult<Json> {
+        let mut req = self.agent.post(url);
         if let Some(a) = &self.auth {
             req = req.set("Authorization", a);
         }
-        req.send_json(json!({"requests": requests}))
+        req.send_json(json!({"baton": baton, "requests": requests}))
             .map_err(|e| match e {
                 ureq::Error::Status(code, resp) => format!(
                     "sqld HTTP {code}: {}",
@@ -121,6 +245,14 @@ impl RemoteDb {
             })?
             .into_json()
             .map_err(|e| format!("sqld response was not JSON: {e}"))
+    }
+
+    fn close_stream(&self, stream: &Stream) {
+        let mut req = self.agent.post(&stream.url).timeout(Duration::from_secs(1));
+        if let Some(a) = &self.auth {
+            req = req.set("Authorization", a);
+        }
+        let _ = req.send_json(json!({"baton": stream.baton, "requests": [{"type": "close"}]}));
     }
 
     fn one(&self, sql: &str, args: Vec<Json>) -> DbResult<StmtOut> {
@@ -135,6 +267,47 @@ impl RemoteDb {
     fn str_lit(s: &str) -> String {
         format!("'{}'", s.replace('\'', "''"))
     }
+}
+
+impl Drop for RemoteDb {
+    fn drop(&mut self) {
+        let stream = self
+            .stream
+            .get_mut()
+            .ok()
+            .and_then(|state| state.active.take());
+        if let Some(stream) = stream {
+            self.close_stream(&stream);
+        }
+    }
+}
+
+fn decode_batch(response: &Json, expected: usize) -> DbResult<Vec<StmtOut>> {
+    if response["type"] == "error" {
+        return Err(remote_error(&response["error"]));
+    }
+    if response["response"]["type"] != "batch" {
+        return Err("sqld did not return the statement batch".into());
+    }
+    let result = &response["response"]["result"];
+    let rows = result["step_results"]
+        .as_array()
+        .ok_or("missing statement results")?;
+    let errors = result["step_errors"]
+        .as_array()
+        .ok_or("missing statement errors")?;
+    if rows.len() != expected || errors.len() != expected {
+        return Err("incomplete statement response".into());
+    }
+    for error in errors {
+        if !error.is_null() {
+            return Err(remote_error(error));
+        }
+    }
+    if rows.iter().any(Json::is_null) {
+        return Err("transaction ended on the server; statements were skipped".into());
+    }
+    rows.iter().map(decode_result).collect()
 }
 
 fn remote_error(error: &Json) -> String {
@@ -467,18 +640,12 @@ impl DbLink for RemoteDb {
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)> {
         self.require_writable()?;
         let start = Instant::now();
-        // Hrana takes one statement per execute request; split batches
-        // naively on ';' (string literals with ';' will mis-split — the
-        // dot prompt's multi-statement case is DDL, where that's rare).
-        let stmts: Vec<&str> = sql
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
+        let stmts = crate::sql::split(sql)?;
         if stmts.is_empty() {
             return Ok((0, start.elapsed()));
         }
         let calls: Vec<(&str, Vec<Json>)> = stmts.iter().map(|s| (*s, Vec::new())).collect();
+        self.rowid_cache.lock().unwrap().clear();
         let outs = self.pipeline(&calls)?;
         let n = if outs.len() == 1 {
             outs[0].affected
@@ -488,6 +655,14 @@ impl DbLink for RemoteDb {
         // Any statement may have changed schema/rowid-ness.
         self.rowid_cache.lock().unwrap().clear();
         Ok((n, start.elapsed()))
+    }
+
+    fn execute_params(&self, sql: &str, params: &[PValue]) -> DbResult<(i64, Duration)> {
+        self.require_writable()?;
+        let start = Instant::now();
+        self.rowid_cache.lock().unwrap().clear();
+        let out = self.one(sql, params.iter().map(encode).collect())?;
+        Ok((out.affected, start.elapsed()))
     }
 
     fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
@@ -684,6 +859,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_transactions_and_saved_scripts_round_trip() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let db = RemoteDb::open(&server.url).unwrap();
+        crate::test_support::assert_transaction_and_script_workflows(&db);
+    }
+
+    #[test]
+    fn expired_transaction_skips_new_writes() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let db = RemoteDb::open(&server.url).unwrap();
+        db.execute("CREATE TABLE t(id INTEGER)").unwrap();
+        db.begin_transaction().unwrap();
+        db.insert_row("t", &[("id".into(), PValue::Int(1))])
+            .unwrap();
+        server
+            .expire_next
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let error = db
+            .insert_row("t", &[("id".into(), PValue::Int(2))])
+            .unwrap_err();
+        assert!(error.contains("transaction ended"), "{error}");
+        assert_eq!(db.count("t").unwrap(), 0);
+    }
+
+    #[test]
+    fn lost_transaction_response_never_reconnects_and_continues_writing() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let db = RemoteDb::open(&server.url).unwrap();
+        db.execute("CREATE TABLE t(id INTEGER)").unwrap();
+        db.begin_transaction().unwrap();
+        server
+            .drop_next
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(db
+            .insert_row("t", &[("id".into(), PValue::Int(1))])
+            .is_err());
+        let count = server.executed.lock().unwrap().len();
+        assert!(db
+            .insert_row("t", &[("id".into(), PValue::Int(2))])
+            .unwrap_err()
+            .contains("unknown"));
+        assert!(db.commit_transaction().is_err());
+        assert_eq!(
+            server.executed.lock().unwrap().len(),
+            count,
+            "no automatic reconnect or replay"
+        );
+    }
+
+    #[test]
+    fn dropping_remote_connection_rolls_back_open_transaction() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let db = RemoteDb::open(&server.url).unwrap();
+        db.execute("CREATE TABLE t(id INTEGER)").unwrap();
+        db.begin_transaction().unwrap();
+        db.insert_row("t", &[("id".into(), PValue::Int(1))])
+            .unwrap();
+        drop(db);
+        let db = RemoteDb::open(&server.url).unwrap();
+        assert_eq!(db.count("t").unwrap(), 0);
+    }
+
+    #[test]
+    fn lost_commit_response_reports_uncertainty_without_replaying() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let db = RemoteDb::open(&server.url).unwrap();
+        db.execute("CREATE TABLE t(id INTEGER)").unwrap();
+        db.begin_transaction().unwrap();
+        db.insert_row("t", &[("id".into(), PValue::Int(1))])
+            .unwrap();
+        server
+            .drop_next
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(db.commit_transaction().unwrap_err().contains("unknown"));
+        assert!(db.execute("INSERT INTO t VALUES(2)").is_err());
+        assert_eq!(
+            server
+                .db
+                .connect()
+                .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn remote_schema_changes_preserve_constraints_and_roll_back_failures() {
         let server = crate::test_support::HranaFixture::new(false);
         server
@@ -792,44 +1053,25 @@ mod tests {
         assert_eq!(decode(&j).unwrap(), PValue::Blob(vec![0, 1, 2]));
     }
 
-    /// Real end-to-end against a spawned sqld, if one is installed
-    /// (~/.cargo/bin/sqld). Skips silently otherwise so `cargo test`
-    /// works on any machine.
+    /// Real end-to-end against PHOSPHOR_SQLD_BIN or ~/.cargo/bin/sqld.
+    /// Optional locally; tools/test_sqld.py supplies a verified release in CI.
     #[test]
     fn against_real_sqld_when_available() {
         let home = std::env::var("HOME").unwrap_or_default();
-        let sqld = format!("{home}/.cargo/bin/sqld");
+        let sqld = std::env::var("PHOSPHOR_SQLD_BIN")
+            .unwrap_or_else(|_| format!("{home}/.cargo/bin/sqld"));
         if !std::path::Path::new(&sqld).exists() {
             eprintln!("skipping: sqld not installed");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("phosphor-sqld-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut child = std::process::Command::new(&sqld)
-            .current_dir(&dir)
-            .args([
-                "--db-path",
-                "t.sqld",
-                "--http-listen-addr",
-                "127.0.0.1:8871",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-
-        let url = "http://127.0.0.1:8871";
-        let mut db = None;
-        for _ in 0..50 {
-            std::thread::sleep(Duration::from_millis(100));
-            if let Ok(d) = RemoteDb::open(url) {
-                db = Some(d);
-                break;
-            }
-        }
-        let db = db.expect("sqld did not come up");
+        let server = crate::test_support::SqldFixture::new(&sqld);
+        let url = server.url.as_str();
+        let db = RemoteDb::open(url).unwrap();
 
         let run = || -> DbResult<()> {
+            crate::test_support::assert_transaction_and_script_workflows(&db);
+            db.execute(crate::test_support::SCHEMA_SQL)?;
+            crate::test_support::assert_native_schema_safety(&db);
             db.execute(
                 "CREATE TABLE IF NOT EXISTS crew(id INTEGER PRIMARY KEY, name TEXT); \
                  DELETE FROM crew",
@@ -849,12 +1091,14 @@ mod tests {
             assert_eq!(q.rows[0][0], PValue::Text("ada lovelace".into()));
             let tables = db.tables()?;
             assert!(tables.iter().any(|t| t.name == "crew"));
+            let readonly = RemoteDb::open_with_mode(url, true)?;
+            assert_eq!(readonly.count("crew")?, 2);
+            assert!(readonly
+                .query("DELETE FROM crew RETURNING * -- limit")
+                .is_err());
+            assert_eq!(readonly.count("crew")?, 2);
             Ok(())
         };
-        let result = run();
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
-        result.unwrap();
+        run().unwrap();
     }
 }

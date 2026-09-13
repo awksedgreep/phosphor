@@ -19,9 +19,11 @@ jobs:
       - name: fmt
         run: cargo fmt --check
       - name: tests
-        # The sqld and timeless-extension integration tests detect their
-        # dependencies and skip gracefully on bare runners.
+        # Optional integrations detect installed dependencies. The next step
+        # supplies real sqld; the timeless extension is not installed here.
         run: cargo test
+      - name: real sqld transactions and saved scripts
+        run: python3 tools/test_sqld.py
       - name: manual is generated, not stale
         # docs/MANUAL.md must match `phosphor --manual` (issue #24).
         run: |

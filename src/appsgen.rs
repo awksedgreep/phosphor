@@ -4,7 +4,7 @@
 //! Definitions are rows in `_phosphor_apps` / `_phosphor_items`;
 //! hotkeys are the first letter of each label, dBASE-style.
 
-use crate::db::{DbLink, DbResult};
+use crate::db::{DbLink, DbResult, PValue};
 use crate::store;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -138,24 +138,20 @@ pub fn add_item(db: &dyn DbLink, app: &str, label: &str) -> DbResult<()> {
 }
 
 pub fn update_item(db: &dyn DbLink, item: &AppItem) -> DbResult<()> {
-    db.execute(&format!(
-        "UPDATE _phosphor_items SET label = {}, action_kind = {}, action_ref = {}, seq = {} \
-         WHERE id = {}",
-        store::q(&item.label),
-        store::q(item.kind.as_str()),
-        store::q(&item.action_ref),
-        item.seq,
-        item.id
-    ))
+    db.execute_params(
+        "UPDATE _phosphor_items SET label = ?1, action_kind = ?2, action_ref = ?3, seq = ?4 WHERE id = ?5",
+        &[PValue::Text(item.label.clone()), PValue::Text(item.kind.as_str().into()),
+          PValue::Text(item.action_ref.clone()), PValue::Int(item.seq), PValue::Int(item.id)],
+    )
     .map(|_| ())
 }
 
 /// Replace one item's target (used by the multi-line script editor).
 pub fn set_item_ref(db: &dyn DbLink, item_id: i64, action_ref: &str) -> DbResult<()> {
-    db.execute(&format!(
-        "UPDATE _phosphor_items SET action_ref = {} WHERE id = {item_id}",
-        store::q(action_ref)
-    ))
+    db.execute_params(
+        "UPDATE _phosphor_items SET action_ref = ?1 WHERE id = ?2",
+        &[PValue::Text(action_ref.into()), PValue::Int(item_id)],
+    )
     .map(|_| ())
 }
 

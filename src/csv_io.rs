@@ -80,7 +80,7 @@ pub fn import_csv(db: &dyn DbLink, table: &str, path: &str) -> DbResult<String> 
 
     // Own this transaction: a failed BEGIN must never let the import
     // join, commit, or roll back an existing caller's work.
-    db.execute("BEGIN")
+    db.begin_transaction()
         .map_err(|e| format!("import: begin: {e}"))?;
     let result = (|| {
         let mut inserted: i64 = 0;
@@ -96,13 +96,13 @@ pub fn import_csv(db: &dyn DbLink, table: &str, path: &str) -> DbResult<String> 
                 .map_err(|e| format!("import: row {}: {e}", inserted + 1))?;
             inserted += 1;
         }
-        db.execute("COMMIT")
+        db.commit_transaction()
             .map_err(|e| format!("import: commit: {e}"))?;
         Ok(format!("imported {inserted} row(s) into {table:?}"))
     })();
     match result {
         Ok(message) => Ok(message),
-        Err(error) => match db.execute("ROLLBACK") {
+        Err(error) => match db.rollback_transaction() {
             Ok(_) => Err(error),
             Err(rollback) => Err(format!("{error}; rollback: {rollback}")),
         },

@@ -6116,6 +6116,46 @@ mod tests {
     use super::*;
     use crate::db::EmbeddedDb;
 
+    #[test]
+    fn remote_import_error_is_visible_and_worker_transaction_rolls_back() {
+        let server = crate::test_support::HranaFixture::new(false);
+        server
+            .db
+            .connect()
+            .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        let db = crate::remote::RemoteDb::open(&server.url).unwrap();
+        let mut a = App::new(Box::new(db), None);
+        let csv = crate::test_support::TestDb::new();
+        std::fs::write(csv.path(), "id,name\n1,Ada\n1,Grace\n").unwrap();
+        a.prompt.input = format!("import t {}", csv.path());
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(
+            a.status
+                .as_ref()
+                .is_some_and(|(m, error)| *error && m.contains("row 2")),
+            "{:?}",
+            a.status
+        );
+        assert_eq!(a.db.count("t").unwrap(), 0);
+        std::fs::write(csv.path(), "id,name\n1,Ada; Grace\n").unwrap();
+        a.prompt.input = format!("import t {}", csv.path());
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(
+            a.status
+                .as_ref()
+                .is_some_and(|(m, error)| !*error && m.contains("imported 1")),
+            "{:?}",
+            a.status
+        );
+        assert_eq!(
+            a.db.query("SELECT name FROM t").unwrap().rows[0][0],
+            PValue::Text("Ada; Grace".into())
+        );
+    }
+
     fn app() -> App {
         let (db, _) = EmbeddedDb::open(":memory:").unwrap();
         db.execute(

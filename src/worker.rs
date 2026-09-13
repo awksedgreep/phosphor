@@ -350,6 +350,15 @@ impl DbLink for DbHandle {
         .map(|(_, elapsed)| elapsed)
     }
 
+    fn execute_params(&self, sql: &str, params: &[PValue]) -> DbResult<(i64, Duration)> {
+        let sql = sql.to_owned();
+        let params = params.to_owned();
+        self.call(Box::new(move |db| {
+            DbResponse::Execute(db.execute_params(&sql, &params))
+        }))
+        .execute()
+    }
+
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)> {
         let s = sql.to_owned();
         self.call(Box::new(move |db| DbResponse::Execute(db.execute(&s))))

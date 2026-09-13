@@ -136,6 +136,216 @@ pub fn assert_native_schema_safety(db: &dyn crate::db::DbLink) {
 
 pub struct TestDb(std::path::PathBuf);
 
+pub struct SqldFixture {
+    child: std::process::Child,
+    dir: std::path::PathBuf,
+    pub url: String,
+}
+
+impl SqldFixture {
+    pub fn new(bin: &str) -> Self {
+        let dir = TestDb::new().0.with_extension("sqld");
+        std::fs::create_dir(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let log = std::fs::File::create(dir.join("server.log")).unwrap();
+        let child = std::process::Command::new(bin)
+            .current_dir(&dir)
+            .args(["--db-path", "test.sqld", "--http-listen-addr", &address])
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let mut fixture = Self {
+            child,
+            dir,
+            url: format!("http://{address}"),
+        };
+        for _ in 0..50 {
+            assert!(
+                fixture.child.try_wait().unwrap().is_none(),
+                "sqld exited: {}",
+                std::fs::read_to_string(fixture.dir.join("server.log")).unwrap()
+            );
+            if crate::remote::RemoteDb::open(&fixture.url).is_ok() {
+                return fixture;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!(
+            "sqld did not start: {}",
+            std::fs::read_to_string(fixture.dir.join("server.log")).unwrap()
+        );
+    }
+}
+
+impl Drop for SqldFixture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+pub fn assert_transaction_and_script_workflows(db: &dyn crate::db::DbLink) {
+    use crate::db::PValue;
+    db.execute("CREATE TABLE remote_text(id INTEGER PRIMARY KEY, name TEXT UNIQUE); CREATE TABLE remote_log(note TEXT)").unwrap();
+    db.execute("INSERT INTO remote_text VALUES(1, 'Ada; O''Brien; 雨'); -- trailing ;")
+        .unwrap();
+    assert_eq!(
+        db.query("SELECT name FROM remote_text").unwrap().rows[0][0],
+        PValue::Text("Ada; O'Brien; 雨".into())
+    );
+    db.execute(
+        "CREATE TRIGGER remote_insert AFTER INSERT ON remote_text BEGIN
+        INSERT INTO remote_log VALUES ('first;');
+        INSERT INTO remote_log VALUES (CASE WHEN new.id>0 THEN 'second;' ELSE 'no;' END);
+        END; INSERT INTO remote_text VALUES(2, 'Grace; Hopper')",
+    )
+    .unwrap();
+    assert_eq!(db.count("remote_log").unwrap(), 2);
+    db.execute("DELETE FROM remote_text; DELETE FROM remote_log")
+        .unwrap();
+
+    let file = TestDb::new();
+    for (contents, marker) in [
+        ("id,name\n1,Ada\n1,Grace\n", "row 2"),
+        ("id,name\n1,Ada\n2\n", "csv record"),
+    ] {
+        std::fs::write(file.path(), contents).unwrap();
+        let error = crate::csv_io::import_csv(db, "remote_text", file.path()).unwrap_err();
+        assert!(error.contains(marker), "{error}");
+        assert_eq!(db.count("remote_text").unwrap(), 0);
+        assert_eq!(
+            db.count("remote_log").unwrap(),
+            0,
+            "trigger side effects rolled back"
+        );
+    }
+    db.execute("CREATE TABLE remote_parent(id INTEGER PRIMARY KEY);
+        CREATE TABLE remote_child(id INTEGER REFERENCES remote_parent(id) DEFERRABLE INITIALLY DEFERRED)").unwrap();
+    std::fs::write(file.path(), "id\n9\n").unwrap();
+    let error = crate::csv_io::import_csv(db, "remote_child", file.path()).unwrap_err();
+    assert!(error.contains("commit"), "{error}");
+    assert_eq!(db.count("remote_child").unwrap(), 0);
+    std::fs::write(file.path(), "id,name\n2,Grace\n").unwrap();
+    db.begin_transaction().unwrap();
+    db.execute("INSERT INTO remote_text VALUES(1,'pending')")
+        .unwrap();
+    let error = crate::csv_io::import_csv(db, "remote_text", file.path()).unwrap_err();
+    assert!(error.contains("begin"), "{error}");
+    assert_eq!(
+        db.count("remote_text").unwrap(),
+        1,
+        "caller's work retained"
+    );
+    assert!(db
+        .apply_schema_changes(&["ALTER TABLE remote_text ADD COLUMN extra TEXT".into()])
+        .is_err());
+    db.rollback_transaction().unwrap();
+    assert_eq!(db.count("remote_text").unwrap(), 0);
+    assert!(db.execute("BEGIN; INSERT INTO remote_text VALUES(1,'a'); INSERT INTO remote_text VALUES(1,'b'); COMMIT").is_err());
+    // Embedded execute_batch leaves a failed caller script open for explicit
+    // recovery; RemoteDb closes the transaction it created in that batch.
+    let _ = db.rollback_transaction();
+    assert_eq!(db.count("remote_text").unwrap(), 0);
+    assert!(db
+        .execute("INSERT INTO missing_table VALUES(1); INSERT INTO remote_text VALUES(1,'bad')")
+        .is_err());
+    assert_eq!(
+        db.count("remote_text").unwrap(),
+        0,
+        "later statements skipped"
+    );
+    assert!(crate::csv_io::import_csv(db, "remote_text", file.path())
+        .unwrap()
+        .contains("imported 1"));
+    assert_eq!(db.count("remote_text").unwrap(), 1);
+
+    db.begin_transaction().unwrap();
+    db.execute("INSERT INTO remote_text VALUES(3,'transaction; row')")
+        .unwrap();
+    assert_eq!(db.count("remote_text").unwrap(), 2);
+    db.commit_transaction().unwrap();
+    assert_eq!(db.count("remote_text").unwrap(), 2);
+
+    // Releasing an inner savepoint must retain the outer transaction's stream.
+    db.execute("SAVEPOINT outer_scope").unwrap();
+    db.execute("INSERT INTO remote_text VALUES(4,'outer')")
+        .unwrap();
+    db.execute("SAVEPOINT inner_scope; INSERT INTO remote_text VALUES(5,'inner'); ROLLBACK TO inner_scope; RELEASE inner_scope")
+        .unwrap();
+    assert_eq!(db.count("remote_text").unwrap(), 3);
+    db.execute("ROLLBACK TO outer_scope; RELEASE outer_scope")
+        .unwrap();
+    assert_eq!(db.count("remote_text").unwrap(), 2);
+
+    let text = "O'Brien; 雨\nsecond line; -- literal comment";
+    let source = "local greeting = \"hello; O'Brien\";\nmessage(greeting); -- saved; script\n";
+    let mut form =
+        crate::forms::FormSpec::from_columns("remote_text", db.columns("remote_text").unwrap());
+    form.fields[1].label = text.into();
+    form.save(db).unwrap();
+    assert_eq!(
+        crate::forms::FormSpec::load(db, "remote_text")
+            .unwrap()
+            .fields[1]
+            .label,
+        text
+    );
+    crate::script::set_script(db, "remote_text", "on_load", source).unwrap();
+    assert_eq!(
+        crate::script::get_script(db, "remote_text", "on_load").unwrap(),
+        source
+    );
+    crate::appsgen::add_item(db, "Remote; app", text).unwrap();
+    let mut item = crate::appsgen::items(db, "Remote; app").remove(0);
+    item.kind = crate::appsgen::ActionKind::Script;
+    item.action_ref = source.into();
+    crate::appsgen::update_item(db, &item).unwrap();
+    crate::appsgen::set_item_ref(db, item.id, source).unwrap();
+    assert_eq!(
+        crate::appsgen::items(db, "Remote; app")[0].action_ref,
+        source
+    );
+    assert_eq!(crate::appsgen::items(db, "Remote; app")[0].label, text);
+    crate::store::pref_set(db, "theme;test", text);
+    assert_eq!(crate::store::pref_get(db, "theme;test").unwrap(), text);
+    // Quotes, semicolons and NULs are values, never SQL text.
+    db.execute_params(
+        "UPDATE remote_text SET name=?1 WHERE id=?2",
+        &[PValue::Text("bound;\0text".into()), PValue::Int(2)],
+    )
+    .unwrap();
+    assert_eq!(
+        db.query("SELECT name FROM remote_text WHERE id=2")
+            .unwrap()
+            .rows[0][0],
+        PValue::Text("bound;\0text".into())
+    );
+
+    db.apply_schema_changes(&["ALTER TABLE remote_text RENAME COLUMN name TO label".into()])
+        .unwrap();
+    let schema = db
+        .query("SELECT sql FROM sqlite_schema WHERE name='remote_text'")
+        .unwrap()
+        .rows;
+    assert!(db
+        .apply_schema_changes(&[
+            "ALTER TABLE remote_text RENAME TO discarded".into(),
+            "ALTER TABLE discarded DROP COLUMN id".into()
+        ])
+        .is_err());
+    assert_eq!(
+        db.query("SELECT sql FROM sqlite_schema WHERE name='remote_text'")
+            .unwrap()
+            .rows,
+        schema
+    );
+    assert_eq!(db.count("remote_text").unwrap(), 2);
+}
+
 impl TestDb {
     pub fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -164,6 +374,8 @@ pub struct HranaFixture {
     pub db: TestDb,
     pub url: String,
     pub executed: Arc<Mutex<Vec<String>>>,
+    pub expire_next: Arc<AtomicBool>,
+    pub drop_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -179,7 +391,13 @@ impl HranaFixture {
         let done = stop.clone();
         let executed = Arc::new(Mutex::new(Vec::new()));
         let log = executed.clone();
+        let expire_next = Arc::new(AtomicBool::new(false));
+        let expire = expire_next.clone();
+        let drop_next = Arc::new(AtomicBool::new(false));
+        let lose = drop_next.clone();
         let thread = std::thread::spawn(move || {
+            let mut streams = std::collections::HashMap::<String, Connection>::new();
+            let mut serial = 0;
             for socket in listener.incoming() {
                 let mut socket = socket.unwrap();
                 if done.load(Ordering::Relaxed) {
@@ -205,15 +423,37 @@ impl HranaFixture {
                 let mut bytes = vec![0; length];
                 reader.read_exact(&mut bytes).unwrap();
                 let body: Value = serde_json::from_slice(&bytes).unwrap();
-                // Each pipeline is a fresh connection, like the production
-                // client without a baton. No accidental transaction sharing.
-                let conn = Connection::open(&path).unwrap();
-                conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+                let connection = if let Some(baton) = body["baton"].as_str() {
+                    streams.remove(baton)
+                } else {
+                    let conn = Connection::open(&path).unwrap();
+                    conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+                    Some(conn)
+                };
+                let mut connection = connection;
+                if expire.swap(false, Ordering::Relaxed) {
+                    if let Some(conn) = &connection {
+                        if !conn.is_autocommit() {
+                            conn.execute_batch("ROLLBACK").unwrap();
+                        }
+                    }
+                }
                 let mut results = Vec::new();
                 for req in body["requests"].as_array().unwrap() {
+                    if req["type"] == "close" {
+                        connection.take();
+                        results.push(json!({"type":"ok", "response":{"type":"close"}}));
+                        continue;
+                    }
+                    let Some(conn) = &connection else {
+                        results.push(json!({"type":"error", "error":{"message":"invalid baton"}}));
+                        continue;
+                    };
                     let response = match req["type"].as_str().unwrap() {
-                        "close" => json!({"type": "close"}),
-                        "execute" => match execute(&conn, &req["stmt"], &log, reject_reads) {
+                        "get_autocommit" => {
+                            json!({"type":"get_autocommit", "is_autocommit":conn.is_autocommit()})
+                        }
+                        "execute" => match execute(conn, &req["stmt"], &log, reject_reads) {
                             Ok(result) => json!({"type": "execute", "result": result}),
                             Err(error) => {
                                 results.push(json!({"type": "error", "error": {"message": error}}));
@@ -229,7 +469,7 @@ impl HranaFixture {
                                     errors.push(Value::Null);
                                     continue;
                                 }
-                                match execute(&conn, &step["stmt"], &log, reject_reads) {
+                                match execute(conn, &step["stmt"], &log, reject_reads) {
                                     Ok(row) => {
                                         rows.push(row);
                                         errors.push(Value::Null);
@@ -246,7 +486,16 @@ impl HranaFixture {
                     };
                     results.push(json!({"type": "ok", "response": response}));
                 }
-                let body = json!({"results": results}).to_string();
+                serial += 1;
+                let baton = connection.map(|conn| {
+                    let baton = format!("stream-{serial}");
+                    streams.insert(baton.clone(), conn);
+                    baton
+                });
+                if lose.swap(false, Ordering::Relaxed) {
+                    continue;
+                }
+                let body = json!({"baton":baton, "base_url":null, "results": results}).to_string();
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
@@ -254,6 +503,8 @@ impl HranaFixture {
             db,
             url,
             executed,
+            expire_next,
+            drop_next,
             stop,
             thread: Some(thread),
         }

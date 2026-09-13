@@ -42,15 +42,15 @@ pub fn pref_set(db: &dyn DbLink, key: &str, value: &str) {
     if db.readonly() {
         return; // UI preferences still apply for this session.
     }
-    ensure(db).ok(); // first pref write creates the table
-    let k = q(key);
-    let v = q(value);
+    // First preference write creates the table.
+    ensure(db).ok();
     // Custom conflict target: UNIQUE(user, key), which the generic
     // upsert helper (single-column key) can't express.
-    let _ = db.execute(&format!(
-        "INSERT INTO _phosphor_prefs(user, key, value) VALUES ('me', {k}, {v}) \
-         ON CONFLICT(user, key) DO UPDATE SET value = {v}"
-    ));
+    let _ = db.execute_params(
+        "INSERT INTO _phosphor_prefs(user, key, value) VALUES ('me', ?1, ?2) \
+         ON CONFLICT(user, key) DO UPDATE SET value = excluded.value",
+        &[PValue::Text(key.into()), PValue::Text(value.into())],
+    );
 }
 
 pub fn pref_get(db: &dyn DbLink, key: &str) -> Option<String> {
@@ -94,23 +94,28 @@ pub fn upsert(
 ) -> DbResult<()> {
     ensure(db)?;
     let mut names: Vec<&str> = Vec::with_capacity(cols.len() + 1);
-    let mut vals: Vec<String> = Vec::with_capacity(cols.len() + 1);
+    let mut vals: Vec<PValue> = Vec::with_capacity(cols.len() + 1);
     names.push(key_col);
-    vals.push(q(key));
+    vals.push(PValue::Text(key.into()));
     let mut sets: Vec<String> = Vec::with_capacity(cols.len());
     for (c, v) in cols {
-        let escaped = q(v);
         names.push(c);
-        sets.push(format!("{c} = {escaped}"));
-        vals.push(escaped);
+        sets.push(format!("{c} = excluded.{c}"));
+        vals.push(PValue::Text(v.clone()));
     }
-    db.execute(&format!(
-        "INSERT INTO {table} ({}) VALUES ({}) \
+    db.execute_params(
+        &format!(
+            "INSERT INTO {table} ({}) VALUES ({}) \
          ON CONFLICT({key_col}) DO UPDATE SET {}",
-        names.join(", "),
-        vals.join(", "),
-        sets.join(", ")
-    ))
+            names.join(", "),
+            (1..=vals.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            sets.join(", ")
+        ),
+        &vals,
+    )
     .map(|_| ())
 }
 

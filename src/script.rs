@@ -86,23 +86,23 @@ pub fn get_script(db: &dyn DbLink, table: &str, event: &str) -> Option<String> {
 /// Bind (or replace) a script for (table, event).
 pub fn set_script(db: &dyn DbLink, table: &str, event: &str, source: &str) -> DbResult<()> {
     store::ensure(db)?;
-    db.execute(&format!(
-        "INSERT INTO _phosphor_scripts(table_ref, event, source) VALUES ({}, {}, {}) \
-         ON CONFLICT(table_ref, event) DO UPDATE SET source = {}",
-        store::q(table),
-        store::q(event),
-        store::q(source),
-        store::q(source)
-    ))
+    db.execute_params(
+        "INSERT INTO _phosphor_scripts(table_ref, event, source) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(table_ref, event) DO UPDATE SET source = excluded.source",
+        &[
+            PValue::Text(table.into()),
+            PValue::Text(event.into()),
+            PValue::Text(source.into()),
+        ],
+    )
     .map(|_| ())
 }
 
 pub fn clear_script(db: &dyn DbLink, table: &str, event: &str) -> DbResult<()> {
-    db.execute(&format!(
-        "DELETE FROM _phosphor_scripts WHERE table_ref = {} AND event = {}",
-        store::q(table),
-        store::q(event)
-    ))
+    db.execute_params(
+        "DELETE FROM _phosphor_scripts WHERE table_ref = ?1 AND event = ?2",
+        &[PValue::Text(table.into()), PValue::Text(event.into())],
+    )
     .map(|_| ())
 }
 

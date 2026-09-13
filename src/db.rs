@@ -250,6 +250,17 @@ pub trait DbLink: Send {
     fn apply_schema_changes(&self, statements: &[String]) -> DbResult<Duration>;
     /// Non-SELECT statement; returns affected-row count (-1 if unknown).
     fn execute(&self, sql: &str) -> DbResult<(i64, Duration)>;
+    fn execute_params(&self, sql: &str, params: &[PValue]) -> DbResult<(i64, Duration)>;
+    /// Own a transaction, refusing to join an existing caller's work.
+    fn begin_transaction(&self) -> DbResult<()> {
+        self.execute("BEGIN").map(|_| ())
+    }
+    fn commit_transaction(&self) -> DbResult<()> {
+        self.execute("COMMIT").map(|_| ())
+    }
+    fn rollback_transaction(&self) -> DbResult<()> {
+        self.execute("ROLLBACK").map(|_| ())
+    }
     fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()>;
     /// INSERT with the provided columns (omitted ones take DB defaults);
     /// returns the new rowid.
@@ -1036,6 +1047,26 @@ impl DbLink for EmbeddedDb {
         }
     }
 
+    fn execute_params(&self, sql: &str, params: &[PValue]) -> DbResult<(i64, Duration)> {
+        self.require_writable()?;
+        self.rowid_cache.lock().unwrap().clear();
+        self.anchors.lock().unwrap().clear();
+        let start = Instant::now();
+        let before = self.conn.total_changes();
+        let count = self
+            .conn
+            .execute(sql, rusqlite::params_from_iter(params))
+            .map_err(|e| e.to_string())?;
+        Ok((
+            if self.conn.total_changes() == before {
+                0
+            } else {
+                count as i64
+            },
+            start.elapsed(),
+        ))
+    }
+
     fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
         self.require_writable()?;
         if changes.is_empty() {
@@ -1178,6 +1209,12 @@ impl DbLink for EmbeddedDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_transactions_and_saved_scripts_round_trip() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        crate::test_support::assert_transaction_and_script_workflows(&db);
+    }
 
     #[test]
     fn native_schema_changes_preserve_constraints_and_roll_back_failures() {
