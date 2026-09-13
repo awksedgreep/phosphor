@@ -4339,70 +4339,89 @@ impl App {
         self.build_edit_for(abs); // re-parks itself if still uncovered
     }
 
-    /// Synchronous flip onto the tail record after an INSERT:
-    /// positions the cursor, fetches the tail window blocking, installs
-    /// it, and builds the form — all before returning, so a second save
-    /// cannot insert twins. Rare path (explicit save keypress); bulk
-    /// flight stays async.
-    fn flip_to_tail(&mut self, last: i64, new_rowid: i64) {
+    /// Reload by the identity returned from INSERT, never by position.
+    /// Fetch the row, its position, and total in one statement so another
+    /// insert between requests cannot substitute a different record.
+    fn flip_to_inserted(&mut self, new_rowid: i64) -> Result<(), String> {
+        let Overlay::Edit(ed) = &mut self.overlay else {
+            return Err("inserted record has no open form".into());
+        };
+        // The write already succeeded. Even if reloading fails, another
+        // Enter must update this identity instead of inserting a twin.
+        ed.inserting = false;
+        ed.rowid = new_rowid;
+        for (i, input) in ed.inputs.iter_mut().enumerate() {
+            if let Some(text) = input.take() {
+                ed.fields[i].1 = PValue::parse(&text, &ed.fields[i].0.decl_type);
+            }
+        }
+        let name = ed.table.clone();
+        self.pending_page = None;
+        self.pending_edit = None;
+        self.pending.retain(|_, op| {
+            !matches!(op,
+            PendingOp::Refill { name: table, .. } | PendingOp::Page { table, .. } if table == &name)
+        });
+        let alias = self
+            .db
+            .rowid_column(&name)?
+            .ok_or("inserted record has no usable identity")?;
+        let q = Self::quote_ident(&name);
+        let id = Self::quote_ident(&alias);
+        let mut result = self.db.query(&format!(
+            "SELECT *, (SELECT count(*) FROM {q} WHERE {q}.{id} < {new_rowid}), \
+             (SELECT count(*) FROM {q}) FROM {q} WHERE {}",
+            crate::db::rowid_predicate(&name, &alias, &new_rowid.to_string())
+        ))?;
+        let mut row = result
+            .rows
+            .pop()
+            .ok_or("inserted record no longer exists; refresh the table")?;
+        let (Some(PValue::Int(total)), Some(PValue::Int(position))) = (row.pop(), row.pop()) else {
+            return Err("could not locate the inserted record in BROWSE".into());
+        };
+        // Keep neighboring rows ready for immediate paging/deletion.
+        // A concurrent insert may shift positions before this fetch, so
+        // locate our identity again rather than trusting the old offset.
         let visible = self.visible_rows.max(1);
-        let name = match &self.grid {
-            Some(g) => match &g.source {
-                GridSource::Table { name, .. } => name.clone(),
-                _ => return,
-            },
-            None => return,
+        let row_off = (position - visible + 1).max(0);
+        let start = (row_off - OVERSCAN).max(0);
+        let limit = (row_off + visible + OVERSCAN).min(total) - start;
+        let context = self
+            .db
+            .page(&name, start, limit.max(1))
+            .ok()
+            .and_then(|page| {
+                let at = page
+                    .rowids
+                    .as_ref()?
+                    .iter()
+                    .position(|id| *id == new_rowid)?;
+                Some((page, at as i64 + start))
+            });
+        let Some(g) = &mut self.grid else {
+            return Err("inserted record has no BROWSE".into());
         };
-        if let Some(g) = &mut self.grid {
-            g.cur_row = last.clamp(0, g.total.saturating_sub(1).max(0));
-            if g.cur_row < g.row_off {
-                g.row_off = g.cur_row;
-            }
-            if g.cur_row >= g.row_off + visible {
-                g.row_off = g.cur_row - visible + 1;
-            }
+        if !matches!(&g.source, GridSource::Table { name: current, .. } if current == &name) {
+            return Err("BROWSE moved to another table".into());
         }
-        let (want_start, limit) = match &self.grid {
-            Some(g) => {
-                let s = (g.row_off - OVERSCAN).max(0);
-                (s, (g.row_off + visible + OVERSCAN).min(g.total) - s)
-            }
-            None => return,
-        };
-        match self.db.page(&name, want_start, limit.max(1)) {
-            Ok(page) => {
-                if let Some(g) = &mut self.grid {
-                    g.cache = page.rows;
-                    g.rowids = page.rowids;
-                    g.cache_start = want_start;
-                    g.grow_widths();
-                }
-                // Void in-flight windows: their data predates the insert.
-                self.pending_page = None;
-            }
-            Err(e) => {
-                // No twin window on ANY path: demote the form from
-                // INSERT to UPDATE against the new rowid, so further
-                // Enters edit the inserted record instead of inserting
-                // twins while the fetch is broken.
-                self.pending_page = None;
-                if let Overlay::Edit(ed) = &mut self.overlay {
-                    ed.inserting = false;
-                    ed.rowid = new_rowid;
-                }
-                return self.err(e);
-            }
+        g.total = total;
+        g.cur_row = position;
+        g.cache_start = position;
+        g.cache = vec![row];
+        g.rowids = Some(vec![new_rowid]);
+        g.row_off = row_off;
+        if let Some((page, at)) = context {
+            g.cur_row = at;
+            g.total = g.total.max(at + 1);
+            g.cache_start = start;
+            g.cache = page.rows;
+            g.rowids = page.rowids;
         }
-        let abs = self.grid.as_ref().map(|g| g.cur_row).unwrap_or(0);
-        self.build_edit_for(abs);
-        // If the form build couldn't complete (fetch/columns failure),
-        // still demote — same no-twins contract.
-        if let Overlay::Edit(ed) = &mut self.overlay {
-            if ed.inserting {
-                ed.inserting = false;
-                ed.rowid = new_rowid;
-            }
-        }
+        let position = g.cur_row;
+        g.grow_widths();
+        self.build_edit_for(position);
+        Ok(())
     }
 
     /// Build (or rebuild) the EDIT overlay for the record at absolute
@@ -5215,23 +5234,9 @@ impl App {
                 // The write may have changed child counts/previews and health.
                 self.pane_cache.clear();
                 self.invalidate_health();
+                let mut reload_error = None;
                 if inserting {
-                    // Total changed: full refresh, then flip the open
-                    // form onto the newly inserted record so further
-                    // Enters UPDATE it instead of inserting twins.
-                    // Synchronous tail fetch (NOT parked): a second
-                    // save before arrival would otherwise insert twins
-                    // — the flip must land on the new record NOW.
-                    self.refresh_grid_keep_position();
-                    let last = self.grid.as_ref().map(|g| g.total - 1).unwrap_or(0);
-                    let cursor = match &self.overlay {
-                        Overlay::Edit(ed) => ed.cursor,
-                        _ => 0,
-                    };
-                    self.flip_to_tail(last.max(0), new_rowid);
-                    if let Overlay::Edit(ed) = &mut self.overlay {
-                        ed.cursor = cursor.min(ed.fields.len().saturating_sub(1));
-                    }
+                    reload_error = self.flip_to_inserted(new_rowid).err();
                 } else {
                     // Re-fetch the live window async (stale rows stay
                     // until swap); a parked edit builds on arrival.
@@ -5255,10 +5260,15 @@ impl App {
                     Ok(notes) if !notes.is_empty() => {
                         self.say(format!("{msg} · {}", notes.join(" · ")))
                     }
-                    Ok(_) => self.say(msg),
+                    Ok(_) => self.say(&msg),
                     Err(e) => self.err(format!("{msg} · OnSave: {e}")),
                 }
-                true
+                if let Some(error) = reload_error {
+                    self.err(format!("{msg}; {error}"));
+                    false
+                } else {
+                    true
+                }
             }
             Err(e) => {
                 self.err(e);
@@ -8593,6 +8603,93 @@ mod tests {
         };
         assert_eq!(ed.cursor, 0, "advanced (wrapped) to the next field");
         assert!(!ed.dirty(), "record is clean after the Enter-save");
+    }
+
+    #[test]
+    fn insert_keeps_the_returned_identity_instead_of_the_last_record() {
+        for id in [-5, 0, 50] {
+            let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+            db.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
+                INSERT INTO t VALUES(1,'first'),(100,'last');
+                CREATE TRIGGER additional_row AFTER INSERT ON t WHEN new.id < 100
+                BEGIN INSERT INTO t VALUES(200,'trigger'); END;",
+            )
+            .unwrap();
+            let mut a = App::new(Box::new(db), None);
+            a.apply(Command::OpenSelected);
+            a.sync();
+            a.apply(Command::OpenInsert);
+            a.apply(Command::EditBegin);
+            for c in id.to_string().chars() {
+                a.apply(Command::EditChar(c));
+            }
+            a.apply(Command::EditCommitField);
+            a.sync();
+            let Overlay::Edit(ed) = &a.overlay else {
+                panic!("{:?}", a.status)
+            };
+            assert!(!ed.inserting);
+            assert_eq!(ed.rowid, id);
+            assert_eq!(ed.fields[0].1, PValue::Int(id));
+            a.apply(Command::EditBegin);
+            for c in "inserted".chars() {
+                a.apply(Command::EditChar(c));
+            }
+            a.apply(Command::EditCommitField);
+            a.sync();
+            assert_eq!(
+                a.db.query(&format!("SELECT name FROM t WHERE id = {id}"))
+                    .unwrap()
+                    .rows[0][0],
+                PValue::Text("inserted".into())
+            );
+            assert_eq!(
+                a.db.query("SELECT name FROM t WHERE id >= 100 ORDER BY id")
+                    .unwrap()
+                    .rows,
+                vec![
+                    vec![PValue::Text("last".into())],
+                    vec![PValue::Text("trigger".into())]
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn insert_removed_by_trigger_does_not_open_or_modify_another_record() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT); INSERT INTO t VALUES(100,'existing');
+            CREATE TRIGGER remove_new AFTER INSERT ON t BEGIN DELETE FROM t WHERE id = new.id; END;").unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenInsert);
+        a.apply(Command::EditBegin);
+        for c in "50".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        a.sync();
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!()
+        };
+        assert!(!ed.inserting);
+        assert_eq!(ed.rowid, 50);
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(message, error)| *error && message.contains("no longer exists")));
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        for c in "wrong".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditSave);
+        assert_eq!(
+            a.db.query("SELECT id, name FROM t").unwrap().rows,
+            vec![vec![PValue::Int(100), PValue::Text("existing".into())]]
+        );
     }
 
     #[test]
