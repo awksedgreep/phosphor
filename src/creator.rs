@@ -56,13 +56,55 @@ impl FType {
 }
 
 #[derive(Debug, Clone)]
+pub enum FieldDefault {
+    /// Text entered in the designer, with its convenient literal rules.
+    Input(String),
+    /// An expression from SQLite's schema, already encoded as SQL.
+    Sql(String),
+}
+
+impl From<&str> for FieldDefault {
+    fn from(input: &str) -> Self {
+        Self::Input(input.to_owned())
+    }
+}
+
+impl FieldDefault {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Input(text) | Self::Sql(text) => text,
+        }
+    }
+
+    /// Committing an untouched editor must retain the SQL provenance.
+    pub fn edit(&mut self, text: String) {
+        if text != self.text() {
+            *self = Self::Input(text);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text().trim().is_empty()
+    }
+
+    fn sql(&self) -> String {
+        match self {
+            // table_info removes the outer parentheses from expressions
+            // such as (1 + 2). Restore them for a valid DEFAULT clause.
+            Self::Sql(sql) => format!("({sql})"),
+            Self::Input(text) => default_sql(text),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FieldDef {
     pub name: String,
     pub ftype: FType,
     pub pk: bool,
     pub notnull: bool,
     pub unique: bool,
-    pub default: String,
+    pub default: FieldDefault,
     /// Raw REFERENCES target: "customers" or "customers(id)". A bare
     /// table name points at that table's PRIMARY KEY (SQLite rules).
     pub references: String,
@@ -76,7 +118,7 @@ impl FieldDef {
             pk: false,
             notnull: false,
             unique: false,
-            default: String::new(),
+            default: "".into(),
             references: String::new(),
         }
     }
@@ -85,10 +127,13 @@ impl FieldDef {
 /// The SQL-expr text of a field's DEFAULT, exactly as the schema
 /// stores it (pragma dflt_value shape) — for round-trip comparison.
 fn raw_default_of(f: &FieldDef) -> String {
-    if f.default.trim().is_empty() {
+    if f.default.is_empty() {
         String::new()
     } else {
-        default_sql(&f.default)
+        match &f.default {
+            FieldDefault::Sql(sql) => sql.clone(),
+            FieldDefault::Input(text) => default_sql(text),
+        }
     }
 }
 
@@ -197,7 +242,7 @@ impl TableDraft {
                 f.pk = c.pk;
                 f.notnull = c.notnull;
                 if let Some(d) = &c.dflt_value {
-                    f.default = d.clone();
+                    f.default = FieldDefault::Sql(d.clone());
                 }
                 if let Some((_, to_table, to_col)) = schema
                     .fks
@@ -244,8 +289,8 @@ impl TableDraft {
             if f.unique && !f.pk {
                 c.push_str(" UNIQUE");
             }
-            if !f.default.trim().is_empty() {
-                c.push_str(&format!(" DEFAULT {}", default_sql(&f.default)));
+            if !f.default.is_empty() {
+                c.push_str(&format!(" DEFAULT {}", f.default.sql()));
             }
             if !f.references.trim().is_empty() {
                 c.push_str(&format!(
@@ -404,7 +449,7 @@ impl TableDraft {
                         "adding {} as UNIQUE needs a table rebuild — add it plain, then UNIQUE-index it", f.name
                     ));
                 }
-                if f.notnull && f.default.trim().is_empty() {
+                if f.notnull && f.default.is_empty() {
                     return Err(format!(
                         "adding NOT NULL {} needs a DEFAULT for the existing rows",
                         f.name
@@ -414,8 +459,8 @@ impl TableDraft {
                 if f.notnull {
                     c.push_str(" NOT NULL");
                 }
-                if !f.default.trim().is_empty() {
-                    c.push_str(&format!(" DEFAULT {}", default_sql(&f.default)));
+                if !f.default.is_empty() {
+                    c.push_str(&format!(" DEFAULT {}", f.default.sql()));
                 }
                 if !f.references.trim().is_empty() {
                     c.push_str(&format!(
@@ -469,10 +514,10 @@ impl TableDraft {
                         })
                         .or_else(|| {
                             // Added columns get their DEFAULT (or NULL).
-                            let d = if f.default.trim().is_empty() {
+                            let d = if f.default.is_empty() {
                                 "NULL".to_owned()
                             } else {
-                                default_sql(&f.default)
+                                f.default.sql()
                             };
                             Some((quote_ident(&f.name).to_string(), d))
                         })
@@ -690,6 +735,64 @@ mod editor_tests {
         };
         let d = TableDraft::from_live(&sch);
         assert!(d.apply_script(&sch, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn editor_round_trips_quoted_and_expression_defaults_without_changes() {
+        let (db, _) = crate::db::EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,
+                state TEXT DEFAULT 'new', empty TEXT DEFAULT '',
+                owner TEXT DEFAULT 'O''Brien', n INTEGER DEFAULT 12,
+                amount REAL DEFAULT -1.5, flag INTEGER DEFAULT TRUE,
+                missing TEXT DEFAULT NULL, stamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                calculated INTEGER DEFAULT (1 + 2),
+                normalized TEXT DEFAULT (lower('ABC')), payload BLOB DEFAULT X'00ff')",
+        )
+        .unwrap();
+        let sch = schema(db.columns("t").unwrap());
+        let d = TableDraft::from_live(&sch);
+        let changes = d.apply_script(&sch, &[]).unwrap();
+        assert!(
+            changes.is_empty(),
+            "untouched defaults changed: {changes:?}"
+        );
+    }
+
+    #[test]
+    fn editor_rebuild_keeps_default_values_for_future_inserts() {
+        use crate::db::PValue;
+        let (db, _) = crate::db::EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,
+                state TEXT DEFAULT 'new', empty TEXT DEFAULT '',
+                owner TEXT DEFAULT 'O''Brien', calculated INTEGER DEFAULT (1 + 2),
+                normalized TEXT DEFAULT (lower('ABC')), payload BLOB DEFAULT X'00ff',
+                n INTEGER DEFAULT 4);
+             INSERT INTO t DEFAULT VALUES",
+        )
+        .unwrap();
+        let sch = schema(db.columns("t").unwrap());
+        let mut d = TableDraft::from_live(&sch);
+        d.fields.last_mut().unwrap().ftype = FType::Real;
+        db.execute(&d.apply_script(&sch, &[]).unwrap().join(";\n"))
+            .unwrap();
+        db.execute("INSERT INTO t DEFAULT VALUES").unwrap();
+        let rows = db
+            .query("SELECT state, empty, owner, calculated, normalized, payload FROM t ORDER BY id")
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 2);
+        let expected = vec![
+            PValue::Text("new".into()),
+            PValue::Text(String::new()),
+            PValue::Text("O'Brien".into()),
+            PValue::Int(3),
+            PValue::Text("abc".into()),
+            PValue::Blob(vec![0, 255]),
+        ];
+        assert_eq!(rows[0], expected);
+        assert_eq!(rows[1], expected);
     }
 
     /// Renaming the table and dropping/adding columns in one edit must

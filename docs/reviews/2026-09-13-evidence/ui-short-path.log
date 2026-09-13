@@ -1,0 +1,48 @@
+wrote /tmp/pr-08oxdhbv/casts/nav.cast (33 events, 7.8s)
+[FAIL] nav: navigation: seek · internals · browse · read-only
+       not on screen at t=6.85: '(read-only)'
+wrote /tmp/pr-08oxdhbv/casts/crud.cast (62 events, 11.5s)
+[PASS] crud: edit · insert · required · delete · find
+wrote /tmp/pr-08oxdhbv/casts/memo.cast (55 events, 9.6s)
+[PASS] memo: the note editor: F3 edits a long TEXT field full-screen
+wrote /tmp/pr-08oxdhbv/casts/prompt.cast (173 events, 17.0s)
+[PASS] prompt: the dot prompt: SQL · errors · completion · themes
+wrote /tmp/pr-08oxdhbv/casts/qbe.cast (81 events, 12.7s)
+[PASS] qbe: query by example: filters · live SQL · save · run
+wrote /tmp/pr-08oxdhbv/casts/reports.cast (72 events, 12.5s)
+[PASS] reports: banded reports · labels
+wrote /tmp/pr-08oxdhbv/casts/forms.cast (118 events, 21.3s)
+[PASS] forms: form designer · the painter · painted EDIT
+wrote /tmp/pr-08oxdhbv/casts/apps.cast (59 events, 11.7s)
+[PASS] apps: applications generator · live menu · hotkeys
+wrote /tmp/pr-08oxdhbv/casts/create.cast (60 events, 11.9s)
+[PASS] create: the table designer: fields → CREATE TABLE → first record
+wrote /tmp/pr-08oxdhbv/casts/paging.cast (155 events, 13.6s)
+[PASS] paging: record paging: PgDn through 500 records
+wrote /tmp/pr-08oxdhbv/casts/health.cast (38 events, 6.5s)
+[FAIL] health: DBHEALTH live · contextual help
+       not on screen at t=2.05: 'DBHEALTH · dbhealth'
+       not on screen at t=2.05: 'LIVE'
+       not on screen at t=3.05: 'sampled'
+       not on screen at t=3.85: 'THE DBHEALTH CONSOLE'
+       not on screen at t=4.45: 'CONNECTING'
+wrote /tmp/pr-08oxdhbv/casts/relations.cast (292 events, 27.7s)
+[PASS] relations: foreign keys → SET RELATION: child panes on the form
+wrote /tmp/pr-08oxdhbv/casts/scripting.cast (221 events, 23.2s)
+[PASS] scripting: Lua scripting: lifecycle · menu action · editor
+wrote /tmp/pr-08oxdhbv/casts/pickers.cast (46 events, 10.9s)
+[PASS] pickers: PICTURE masks · F7 foreign-key value picker
+wrote /tmp/pr-08oxdhbv/casts/qbeextras.cast (25 events, 5.6s)
+[PASS] qbeextras: QBE: FK joins (J) and GROUP BY (g)
+wrote /tmp/pr-08oxdhbv/casts/data.cast (184 events, 12.0s)
+[PASS] data: CSV import/export · the index/vacuum advisor
+wrote /tmp/pr-08oxdhbv/casts/kiosk.cast (17 events, 4.5s)
+[PASS] kiosk: --app --readonly: browsable, never writable
+wrote /tmp/pr-08oxdhbv/casts/columns.cast (23 events, 5.2s)
+[PASS] columns: resize columns (+/-) and freeze them (f)
+wrote /tmp/pr-08oxdhbv/casts/tableeditor.cast (83 events, 14.1s)
+[PASS] tableeditor: TABLE EDITOR (E): alter columns · drop a table
+wrote /tmp/pr-08oxdhbv/casts/appmode.cast (23 events, 5.9s)
+[PASS] appmode: --app: menu · report · single-Esc home
+
+2 reel(s) failed

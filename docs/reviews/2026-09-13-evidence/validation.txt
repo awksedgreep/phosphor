@@ -1,0 +1,15 @@
+Reviewed commit: ba364aa (working tree initially clean)
+Date: 2026-09-13
+Host: macOS, zsh
+cargo test --all-features: 149 passed, 0 failed. Three optional integration tests returned early because sqld/dbhealth extension were absent.
+cargo clippy --all-targets --all-features -- -D warnings: passed
+cargo fmt --check: passed
+cargo build --release --bin phosphor: passed
+cargo test --release perf_budget -- --nocapture: 2 passed
+Embedded page average: 30.283 microseconds
+Worker round-trip average: 9.186 microseconds
+Live PTY SELECT input-to-visible-header observations: 263.2, 268.8, 252.1, 260.7, 256.6 milliseconds. These include recorder scheduling (about 20 ms resolution).
+20 local diagnostic probes asserted desired behavior and failed on confirmed defects.
+3 remote diagnostic probes failed against a local SQLite-backed Hrana protocol fixture. This is not a real sqld deployment.
+Existing PTY sweep with short path: 18 PASS, 2 FAIL (nav/health depend on absent dbhealth fixture).
+Existing PTY sweep with long path: 2 PASS, 18 FAIL, predominantly hidden status messages.

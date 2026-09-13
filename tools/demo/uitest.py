@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Full-UI test sweep, GIF-pipeline style.
 
-Nine scripted reels cover every screen and navigation path. Each reel
+Scripted reels cover the application's screens and navigation paths. Each reel
 records a real pty session AND carries ordered text assertions checked
 against the captured output (ANSI-stripped) — so regressions fail
 mechanically, and a green run leaves publishable GIFs behind.
@@ -240,6 +240,8 @@ def reels():
     r.type(" - follow up")                            # caret opens at the end
     r.key(ENTER, 0.4)
     r.type("next week")
+    r.key(F1, 0.5).expect("HELP")
+    r.key(ESC, 0.5).expect("NOTE ·").expect("next week")
     r.key(F6, 0.6).expect("note saved to")            # fold back into the field
     r.key(F10, 0.8).expect("saved")                   # the form writes the row
     r.key(ENTER, 0.8).expect("EDIT notes")            # reopen: the newline shows
@@ -451,6 +453,8 @@ def reels():
     r.type('local n = scalar("select count(*) from people")')
     r.key(ENTER, 0.5)
     r.type('say("people: " .. n)')
+    r.key(F1, 0.5).expect("HELP")
+    r.key(ESC, 0.5).expect("SCRIPT · crm · Tally").expect('say("people: " .. n)')
     r.key(F6, 0.9).expect("APPLICATIONS GENERATOR · crm")  # saved, back to designer
     r.key(F2, 0.9).expect("CRM").expect("Tally")
     r.key("t", 1.2).expect("people: 500")
@@ -544,6 +548,36 @@ def reels():
     r.key(ESC, 0.8).expect("hotkey letters")          # ONE Esc → menu
     r.key("c", 0.8).expect("BROWSE customers")
     r.key(ESC, 0.4).key(ESC, 0.6)                     # top-level → menu
+    out.append(r)
+
+    # Help must resume a live draft, including an unfinished name or
+    # filter. Saving/using it afterward proves the buffer survived.
+    r = Reel("helpdraft", "Help preserves table and query drafts while typing")
+    r.key(".").type("create help_draft").key(ENTER, 0.6)
+    r.key(F8).type("lab")
+    r.key(F1, 0.5).expect("HELP")
+    r.key(ESC, 0.5).expect("TABLE DESIGNER · help_draft")
+    r.type("el").key(ENTER).expect('"label" TEXT')
+    r.key(F2, 0.7).expect("BROWSE help_draft")
+    r.key("Q", 0.5).key(DOWN).key(ENTER).type("widget")
+    r.key(F1, 0.5).expect("HELP")
+    r.key(F1, 0.5).expect("QUERY BY EXAMPLE")
+    r.key(ENTER).expect('WHERE "label" = \'widget\'')
+    r.key(F6).type("help_lookup").key(F1, 0.5).expect("HELP")
+    r.key(ESC, 0.5).key(ENTER, 0.6).expect('saved query "help_lookup"')
+    r.key(ESC)
+    out.append(r)
+
+    # Opening F7 and accepting an untouched SQL literal must be a
+    # no-op. A subsequent insert must still receive the original text.
+    r = Reel("defaults", "TABLE EDITOR preserves an unchanged text default")
+    r.key(".").type("CREATE TABLE defaults(id INTEGER PRIMARY KEY, state TEXT DEFAULT 'new')")
+    r.key(ENTER, 0.6).key(ESC).key("d").key(ENTER, 0.6)
+    r.key("E", 0.5).key(F7).key(ENTER).key(F2, 0.6)
+    r.expect("TABLE EDITOR · defaults").expect("no structural changes")
+    r.key(ESC).key(".").type("INSERT INTO defaults DEFAULT VALUES").key(ENTER, 0.6)
+    r.key(".").type("SELECT state FROM defaults").key(ENTER, 0.6)
+    r.expect("1 row(s)").expect("new")
     out.append(r)
 
     return out

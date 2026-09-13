@@ -1,0 +1,91 @@
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/nav.cast (34 events, 7.8s)
+[FAIL] nav: navigation: seek · internals · browse · read-only
+       not on screen at t=4.4: 'internal tables shown'
+       not on screen at t=6.85: '(read-only)'
+       not on screen at t=7.75: 'internal tables hidden'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/crud.cast (62 events, 11.5s)
+[FAIL] crud: edit · insert · required · delete · find
+       not on screen at t=4.621: 'saved 1 field(s)'
+       not on screen at t=6.321: '"Name" is required'
+       not on screen at t=7.679: 'inserted rowid'
+       not on screen at t=10.214: 'found at row'
+       not on screen at t=10.714: 'press x again'
+       not on screen at t=11.414: 'row deleted'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/memo.cast (55 events, 9.6s)
+[FAIL] memo: the note editor: F3 edits a long TEXT field full-screen
+       not on screen at t=6.5: 'note saved to'
+       not on screen at t=7.3: 'saved'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/prompt.cast (172 events, 17.0s)
+[FAIL] prompt: the dot prompt: SQL · errors · completion · themes
+       not on screen at t=3.807: '1 row(s)'
+       not on screen at t=5.407: 'syntax error'
+       not on screen at t=10.2: 'theme: amber'
+       not on screen at t=12.586: 'theme: paper'
+       not on screen at t=14.936: 'theme: blue'
+       not on screen at t=16.921: 'theme: green'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/qbe.cast (80 events, 12.7s)
+[FAIL] qbe: query by example: filters · live SQL · save · run
+       not on screen at t=5.979: '5 row(s)'
+       not on screen at t=10.336: 'saved query "big-spenders"'
+       not on screen at t=12.657: '5 row(s)'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/reports.cast (72 events, 12.5s)
+[FAIL] reports: banded reports · labels
+       not on screen at t=7.979: 'saved report'
+       not on screen at t=10.429: 'wrote report_orders-by-region.txt'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/forms.cast (118 events, 21.3s)
+[FAIL] forms: form designer · the painter · painted EDIT
+       not on screen at t=7.714: 'saved form'
+       not on screen at t=17.907: 'saved painted form'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/apps.cast (58 events, 11.7s)
+[PASS] apps: applications generator · live menu · hotkeys
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/create.cast (61 events, 11.9s)
+[FAIL] create: the table designer: fields → CREATE TABLE → first record
+       not on screen at t=8.214: 'created "gadgets"'
+       not on screen at t=10.279: 'inserted rowid 1'
+       not on screen at t=11.336: 'saved 1 field(s)'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/paging.cast (154 events, 13.7s)
+[FAIL] paging: record paging: PgDn through 500 records
+       not on screen at t=9.981: 'saved 1 field(s)'
+       not on screen at t=13.581: 'found at'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/health.cast (39 events, 6.5s)
+[FAIL] health: DBHEALTH live · contextual help
+       not on screen at t=2.05: 'DBHEALTH · dbhealth'
+       not on screen at t=2.05: 'LIVE'
+       not on screen at t=3.05: 'sampled'
+       not on screen at t=3.85: 'THE DBHEALTH CONSOLE'
+       not on screen at t=4.45: 'CONNECTING'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/relations.cast (293 events, 27.7s)
+[FAIL] relations: foreign keys → SET RELATION: child panes on the form
+       not on screen at t=26.536: 'stacked'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/scripting.cast (221 events, 23.2s)
+[FAIL] scripting: Lua scripting: lifecycle · menu action · editor
+       not on screen at t=22.164: 'people: 500'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/pickers.cast (47 events, 10.9s)
+[FAIL] pickers: PICTURE masks · F7 foreign-key value picker
+       not on screen at t=5.379: 'saved form'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/qbeextras.cast (25 events, 5.6s)
+[FAIL] qbeextras: QBE: FK joins (J) and GROUP BY (g)
+       not on screen at t=4.75: 'row(s)'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/data.cast (305 events, 16.3s)
+[FAIL] data: CSV import/export · the index/vacuum advisor
+       not on screen at t=9.186: 'imported 2 row(s)'
+       not on screen at t=14.236: 'exported 2 row(s)'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/kiosk.cast (16 events, 4.5s)
+[FAIL] kiosk: --app --readonly: browsable, never writable
+       not on screen at t=3.55: 'read-only'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/columns.cast (23 events, 5.2s)
+[FAIL] columns: resize columns (+/-) and freeze them (f)
+       not on screen at t=2.45: 'cells'
+       not on screen at t=3.15: 'cells'
+       not on screen at t=3.65: 'frozen'
+       not on screen at t=4.75: 'unfrozen'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/tableeditor.cast (81 events, 14.0s)
+[FAIL] tableeditor: TABLE EDITOR (E): alter columns · drop a table
+       not on screen at t=5.043: 'applied 1 change'
+       not on screen at t=7.343: 'applied 1 change'
+       not on screen at t=12.793: 'DROP TABLE'
+       not on screen at t=13.593: 'dropped table'
+wrote /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui-casts/appmode.cast (20 events, 5.9s)
+[PASS] appmode: --app: menu · report · single-Esc home
+
+18 reel(s) failed

@@ -1,0 +1,24 @@
+┌ Data ────────────────┐┌ phosphor ────────────────────────────────────────────┐
+│                      ││                                                      │
+│ no tables yet —try t ││  Enter on a table to BROWSE                          │
+│                      ││  .  for the dot prompt                               │
+│                      ││  F1 for help                                         │
+│                      ││  v  splits a related table onto this screen          │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+│                      ││                                                      │
+└──────────────────────┘└──────────────────────────────────────────────────────┘
+ .                                                                              
+ :memory: [embedded]                                                          ○ 

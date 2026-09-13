@@ -178,7 +178,7 @@ fn draw_create(f: &mut Frame, app: &App) {
         };
         let default: Span = match (selected, st.slot, &st.editing) {
             (true, EditSlot::Default, Some(buf)) => editing_span(buf, 13, th),
-            _ => Span::styled(pad(&fld.default, 13), style),
+            _ => Span::styled(pad(fld.default.text(), 13), style),
         };
         let refs: Span = match (selected, st.slot, &st.editing) {
             (true, EditSlot::Refs, Some(buf)) => editing_span(buf, 0, th),
