@@ -103,6 +103,14 @@ In the grid:
   · x deletes the current row — but asks you to press x a second
     time on the same row before anything happens. Any other key
     disarms it.
+  · v opens or cycles related tables beside the master grid; H
+    stacks the panes. Tab changes which pane has focus. Enter,
+    a, and x edit, add, and delete in the focused pane. Related
+    forms page only through that parent's records. New rows inherit
+    the parent link even if the crafted form hides it. A ↳ marks
+    a fixed parent field; use the child's full table to reassign it.
+    F10 returns to the related pane and F5 refreshes its records.
+    Composite parent links require editing from the child table.
   · Type  find something  at the dot prompt to jump to the next row
     containing that text in any column; n repeats the search.
 
@@ -141,7 +149,7 @@ Beyond SQL, the prompt knows a few short commands:
   apps / app        application designer / run an application
   run <name>        run a query saved from QBE
   import <table> <path>   CSV into a table (header row required)
-  export <table|SELECT> <path>  CSV out (table or query)
+  export <table|SELECT> <path>  complete CSV out (table or query)
   script <table> <event> <lua>  bind a form lifecycle script
                     (OnValidate, OnSave, OnChange); no lua clears it
   scripts [table]   list bound lifecycle scripts
@@ -223,6 +231,13 @@ can run it by name.
 
 Labels: press L on a table for mailing labels, three across, every
 visible column on its own line — Avery energy, zero configuration.
+
+Reports, totals, labels, and CSV exports include every selected row.
+The 10,000-row limit applies to interactive SQL results; it does not
+limit final output. A LIMIT written in your source SQL still applies.
+If the source query fails, no partial report or labels are offered.
+CSV and text files replace their destination only after completion;
+a failed query or file write leaves an existing output file intact.
 ```
 
 ## Forms & the painter

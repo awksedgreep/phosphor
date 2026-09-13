@@ -390,6 +390,135 @@ fn decode_result(result: &Json) -> DbResult<StmtOut> {
 }
 
 impl DbLink for RemoteDb {
+    fn stream_query(&self, sql: &str, mut sink: crate::db::RowSink) -> DbResult<usize> {
+        use std::io::BufRead;
+        let sql = crate::sql::select_source(sql)?;
+        let mut state = self.stream.lock().unwrap();
+        if state.lost {
+            return Err("remote transaction outcome unknown; reopen and check the database".into());
+        }
+        let previous = state.active.clone();
+        let pipeline_url = previous
+            .as_ref()
+            .map_or(self.pipeline_url.as_str(), |s| &s.url);
+        let cursor_url = format!("{}/cursor", pipeline_url.trim_end_matches("/pipeline"));
+        let mut step = json!({"stmt": {"sql": sql, "want_rows": true}});
+        if previous.is_some() {
+            step["condition"] = json!({"type": "not", "cond": {"type": "is_autocommit"}});
+        }
+        let mut req = self.agent.post(&cursor_url);
+        if let Some(auth) = &self.auth {
+            req = req.set("Authorization", auth);
+        }
+        let mut continuation = None;
+        let mut complete_response = false;
+        let result = (|| {
+            let response = req
+                .send_json(json!({
+                    "baton": previous.as_ref().map(|s| &s.baton),
+                    "batch": {"steps": [step]}
+                }))
+                .map_err(|e| format!("sqld output request: {e}"))?;
+            let mut reader = std::io::BufReader::new(response.into_reader());
+            let mut line = String::new();
+            reader.read_line(&mut line).map_err(|e| e.to_string())?;
+            let header: Json = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+            if let Some(baton) = header["baton"].as_str() {
+                let url = match header["base_url"].as_str() {
+                    Some(base) if base.starts_with("http://") || base.starts_with("https://") => {
+                        format!("{}/v3/pipeline", base.trim_end_matches('/'))
+                    }
+                    Some(_) => return Err("sqld returned an invalid stream URL".into()),
+                    None => pipeline_url.to_owned(),
+                };
+                continuation = Some(Stream {
+                    baton: baton.to_owned(),
+                    url,
+                });
+            } else if previous.is_some() {
+                return Err("sqld closed the transaction stream during output".into());
+            }
+            let (mut started, mut ended, mut width, mut count) = (false, false, 0, 0);
+            let mut error = None;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                    complete_response = true;
+                    break;
+                }
+                let entry: Json = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+                let event = match entry["type"].as_str() {
+                    Some("step_begin") if !started && entry["step"] == 0 => {
+                        started = true;
+                        let columns = entry["cols"]
+                            .as_array()
+                            .ok_or("missing output columns")?
+                            .iter()
+                            .map(|c| {
+                                c["name"]
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .ok_or_else(|| "missing column name".to_owned())
+                            })
+                            .collect::<DbResult<Vec<_>>>()?;
+                        width = columns.len();
+                        Some(crate::db::QueryEvent::Columns(columns))
+                    }
+                    Some("row") if started && !ended => {
+                        let row = entry["row"]
+                            .as_array()
+                            .ok_or("missing output row")?
+                            .iter()
+                            .map(decode)
+                            .collect::<DbResult<Vec<_>>>()?;
+                        if row.len() != width {
+                            return Err("incomplete output row".into());
+                        }
+                        count += 1;
+                        Some(crate::db::QueryEvent::Row(row))
+                    }
+                    Some("step_end") if started && !ended => {
+                        ended = true;
+                        None
+                    }
+                    Some("step_error" | "error") => {
+                        error.get_or_insert_with(|| remote_error(&entry["error"]));
+                        None
+                    }
+                    // sqld adds replication metadata after the result.
+                    Some("replication_index") => None,
+                    _ => return Err("unexpected sqld output response".into()),
+                };
+                // Drain after a disk/SQL failure so a caller-owned stream can
+                // still be used or rolled back once this response completes.
+                if error.is_none() {
+                    if let Some(event) = event {
+                        error = sink(event).err();
+                    }
+                }
+            }
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if !ended {
+                return Err("output incomplete: server did not finish the SELECT".into());
+            }
+            sink(crate::db::QueryEvent::End)?;
+            Ok(count)
+        })();
+        if previous.is_some() {
+            if let Some(stream) = continuation {
+                state.active = Some(stream);
+            }
+            if !complete_response {
+                state.lost = true;
+            }
+        } else if let Some(stream) = continuation {
+            self.close_stream(&stream);
+        }
+        result
+    }
+
     fn readonly(&self) -> bool {
         self.readonly
     }
@@ -665,10 +794,10 @@ impl DbLink for RemoteDb {
         Ok((out.affected, start.elapsed()))
     }
 
-    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
+    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<i64> {
         self.require_writable()?;
         if changes.is_empty() {
-            return Ok(());
+            return Ok(rowid);
         }
         let alias = self
             .rowid_column(table)?
@@ -679,16 +808,23 @@ impl DbLink for RemoteDb {
             .map(|(i, (col, _))| format!("{} = ?{}", Self::quote(col), i + 1))
             .collect();
         let sql = format!(
-            "UPDATE {} SET {} WHERE {}",
+            "UPDATE {} SET {} WHERE {} RETURNING {}",
             Self::quote(table),
             sets.join(", "),
-            crate::db::rowid_predicate(table, &alias, &format!("?{}", changes.len() + 1))
+            crate::db::rowid_predicate(table, &alias, &format!("?{}", changes.len() + 1)),
+            Self::quote(&alias)
         );
         let mut args: Vec<Json> = changes.iter().map(|(_, v)| encode(v)).collect();
         args.push(encode(&PValue::Int(rowid)));
         let out = self.one(&sql, args)?;
         if out.affected == 1 {
-            Ok(())
+            match out.rows.as_slice() {
+                [row] => match row.as_slice() {
+                    [PValue::Int(id)] => Ok(*id),
+                    _ => Err("updated record has no usable identity".into()),
+                },
+                _ => Err("sqld did not return the updated record identity".into()),
+            }
         } else {
             Err(format!(
                 "expected to update 1 row, updated {}",
@@ -857,6 +993,48 @@ impl DbLink for RemoteDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_complete_outputs_include_rows_beyond_the_preview_cap() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let db = RemoteDb::open(&server.url).unwrap();
+        crate::test_support::assert_complete_output(&db);
+    }
+
+    #[test]
+    fn unfinished_remote_output_does_not_replace_a_completed_file() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let db = RemoteDb::open(&server.url).unwrap();
+        db.execute("CREATE TABLE t(n); INSERT INTO t VALUES(1),(2)")
+            .unwrap();
+        let file = crate::test_support::TestDb::new();
+        std::fs::write(file.path(), "previous output").unwrap();
+        server
+            .truncate_output
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(crate::csv_io::export_csv(&db, "t", file.path())
+            .unwrap_err()
+            .contains("incomplete"));
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "previous output"
+        );
+        db.begin_transaction().unwrap();
+        db.execute("INSERT INTO t VALUES(3)").unwrap();
+        assert_eq!(db.query_complete("SELECT * FROM t").unwrap().rows.len(), 3);
+        assert!(db.query_complete("SELECT * FROM absent").is_err());
+        db.rollback_transaction().unwrap();
+        assert_eq!(db.count("t").unwrap(), 2);
+        let readonly = RemoteDb::open_with_mode(&server.url, true).unwrap();
+        assert_eq!(
+            readonly
+                .query_complete("SELECT * FROM t")
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn remote_transactions_and_saved_scripts_round_trip() {
@@ -1072,6 +1250,7 @@ mod tests {
             crate::test_support::assert_transaction_and_script_workflows(&db);
             db.execute(crate::test_support::SCHEMA_SQL)?;
             crate::test_support::assert_native_schema_safety(&db);
+            crate::test_support::assert_complete_output(&db);
             db.execute(
                 "CREATE TABLE IF NOT EXISTS crew(id INTEGER PRIMARY KEY, name TEXT); \
                  DELETE FROM crew",
@@ -1093,6 +1272,7 @@ mod tests {
             assert!(tables.iter().any(|t| t.name == "crew"));
             let readonly = RemoteDb::open_with_mode(url, true)?;
             assert_eq!(readonly.count("crew")?, 2);
+            assert_eq!(readonly.query_complete("SELECT * FROM crew")?.rows.len(), 2);
             assert!(readonly
                 .query("DELETE FROM crew RETURNING * -- limit")
                 .is_err());
@@ -1100,5 +1280,6 @@ mod tests {
             Ok(())
         };
         run().unwrap();
+        crate::app::assert_related_record_workflow(Box::new(RemoteDb::open(url).unwrap()));
     }
 }

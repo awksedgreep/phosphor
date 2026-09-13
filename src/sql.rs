@@ -43,6 +43,19 @@ fn has_sql(sql: &str) -> bool {
     !without_trivia(sql).is_empty()
 }
 
+/// The server parses this as one SELECT. Preserve the user's own LIMIT and
+/// put the closing parenthesis on a new line after any trailing comment.
+pub fn select_source(sql: &str) -> DbResult<String> {
+    let parts = split(sql)?;
+    if parts.len() != 1 {
+        return Err("output source must contain exactly one SELECT".into());
+    }
+    Ok(format!(
+        "SELECT * FROM (\n{}\n)",
+        parts[0].trim_end_matches(';')
+    ))
+}
+
 pub fn split(sql: &str) -> DbResult<Vec<&str>> {
     if sql.contains('\0') {
         return Err("SQL contains a NUL byte".into());

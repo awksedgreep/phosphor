@@ -13,6 +13,14 @@ use rusqlite::Connection;
 
 pub type DbResult<T> = Result<T, String>;
 
+pub enum QueryEvent {
+    Columns(Vec<String>),
+    Row(Vec<PValue>),
+    End,
+}
+
+pub type RowSink = Box<dyn FnMut(QueryEvent) -> DbResult<()> + Send>;
+
 /// The one value type that crosses every boundary (scripting-ready
 /// rule 3): db rows, form fields, prompt results. Maps 1:1 onto SQLite
 /// types, Hrana JSON, and (someday) Lua values.
@@ -245,6 +253,34 @@ pub trait DbLink: Send {
         Ok((page, total))
     }
     fn query(&self, sql: &str) -> DbResult<QueryResult>;
+    /// Read one complete SELECT without the interactive preview cap.
+    /// End is delivered only after successful completion, including zero rows.
+    fn stream_query(&self, sql: &str, sink: RowSink) -> DbResult<usize>;
+    /// Layouts needing multiple passes retain the complete streamed result.
+    fn query_complete(&self, sql: &str) -> DbResult<QueryResult> {
+        let start = Instant::now();
+        let data = std::sync::Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let output = data.clone();
+        self.stream_query(
+            sql,
+            Box::new(move |event| {
+                let mut data = output.lock().unwrap();
+                match event {
+                    QueryEvent::Columns(columns) => data.0 = columns,
+                    QueryEvent::Row(row) => data.1.push(row),
+                    QueryEvent::End => (),
+                }
+                Ok(())
+            }),
+        )?;
+        let (columns, rows) = std::mem::take(&mut *data.lock().unwrap());
+        Ok(QueryResult {
+            columns,
+            rows,
+            truncated: false,
+            elapsed: start.elapsed(),
+        })
+    }
     /// Native ALTER statements, applied atomically with an FK check before
     /// commit. Failure must leave the original schema and rows intact.
     fn apply_schema_changes(&self, statements: &[String]) -> DbResult<Duration>;
@@ -261,7 +297,8 @@ pub trait DbLink: Send {
     fn rollback_transaction(&self) -> DbResult<()> {
         self.execute("ROLLBACK").map(|_| ())
     }
-    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()>;
+    /// Returns the record's identity after the write, including key changes.
+    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<i64>;
     /// INSERT with the provided columns (omitted ones take DB defaults);
     /// returns the new rowid.
     fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64>;
@@ -930,6 +967,35 @@ impl DbLink for EmbeddedDb {
         }
     }
 
+    fn stream_query(&self, sql: &str, mut sink: RowSink) -> DbResult<usize> {
+        let sql = crate::sql::select_source(sql)?;
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
+        if !stmt.readonly() {
+            return Err("output source must be a read-only SELECT".into());
+        }
+        sink(QueryEvent::Columns(
+            stmt.column_names()
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        ))?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        let mut count = 0;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let values = (0..row.as_ref().column_count())
+                .map(|i| {
+                    row.get_ref(i)
+                        .map(PValue::from_ref)
+                        .map_err(|e| e.to_string())
+                })
+                .collect::<DbResult<Vec<_>>>()?;
+            sink(QueryEvent::Row(values))?;
+            count += 1;
+        }
+        sink(QueryEvent::End)?;
+        Ok(count)
+    }
+
     fn query(&self, sql: &str) -> DbResult<QueryResult> {
         let start = Instant::now();
         // Push the cap into SQLite so the engine can stop early instead
@@ -1067,10 +1133,10 @@ impl DbLink for EmbeddedDb {
         ))
     }
 
-    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
+    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<i64> {
         self.require_writable()?;
         if changes.is_empty() {
-            return Ok(());
+            return Ok(rowid);
         }
         let alias = self
             .rowid_column(table)?
@@ -1081,10 +1147,11 @@ impl DbLink for EmbeddedDb {
             .map(|(i, (col, _))| format!("{} = ?{}", Self::quote(col), i + 1))
             .collect();
         let sql = format!(
-            "UPDATE {} SET {} WHERE {}",
+            "UPDATE {} SET {} WHERE {} RETURNING {}",
             Self::quote(table),
             sets.join(", "),
-            rowid_predicate(table, &alias, &format!("?{}", changes.len() + 1))
+            rowid_predicate(table, &alias, &format!("?{}", changes.len() + 1)),
+            Self::quote(&alias)
         );
         let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| e.to_string())?;
         for (i, (_, v)) in changes.iter().enumerate() {
@@ -1093,7 +1160,17 @@ impl DbLink for EmbeddedDb {
         }
         stmt.raw_bind_parameter(changes.len() + 1, rowid)
             .map_err(|e| e.to_string())?;
-        self.write_one("update", || stmt.raw_execute())
+        let mut identity = None;
+        self.write_one("update", || {
+            let mut rows = stmt.raw_query();
+            let mut count = 0;
+            while let Some(row) = rows.next()? {
+                identity = Some(row.get(0)?);
+                count += 1;
+            }
+            Ok(count)
+        })?;
+        identity.ok_or_else(|| "updated record has no usable identity".into())
     }
 
     fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64> {
@@ -1209,6 +1286,12 @@ impl DbLink for EmbeddedDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_outputs_include_rows_beyond_the_preview_cap() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        crate::test_support::assert_complete_output(&db);
+    }
 
     #[test]
     fn embedded_transactions_and_saved_scripts_round_trip() {

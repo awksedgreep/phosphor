@@ -1064,7 +1064,14 @@ fn draw_detail_panel(f: &mut Frame, app: &App, state: &DetailState, area: Rect) 
         .borders(Borders::ALL)
         .border_style(focus_style(app, Focus::Detail))
         .title(Span::styled(title, focus_style(app, Focus::Detail)))
-        .title_bottom(Line::styled(" Tab master · v close · read-only ", th.dim()));
+        .title_bottom(Line::styled(
+            if app.db.link().readonly() || state.grid.rowids.is_none() {
+                " Tab master · v close · read-only "
+            } else {
+                " Enter edit · a add · x delete · Tab master "
+            },
+            th.dim(),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let visible = inner.height.saturating_sub(1).max(1) as i64; // minus header
@@ -1307,7 +1314,12 @@ fn draw_edit(f: &mut Frame, app: &App) {
                 " EDIT {} · {}/{}{dirty} ",
                 ed.table,
                 ed.row_abs + 1,
-                app.grid.as_ref().map(|g| g.total).unwrap_or(0)
+                if ed.relation.is_some() {
+                    app.detail.as_ref().map(|d| d.grid.total)
+                } else {
+                    app.grid.as_ref().map(|g| g.total)
+                }
+                .unwrap_or(0)
             )
         };
         let block = Block::default()
@@ -1379,7 +1391,12 @@ fn draw_edit(f: &mut Frame, app: &App) {
             " EDIT {} · {}/{}{dirty} ",
             ed.table,
             ed.row_abs + 1,
-            app.grid.as_ref().map(|g| g.total).unwrap_or(0)
+            if ed.relation.is_some() {
+                app.detail.as_ref().map(|d| d.grid.total)
+            } else {
+                app.grid.as_ref().map(|g| g.total)
+            }
+            .unwrap_or(0)
         )
     };
     let block = Block::default()
@@ -1393,7 +1410,9 @@ fn draw_edit(f: &mut Frame, app: &App) {
     let mut lines = Vec::new();
     for (i, (col, original)) in ed.fields.iter().enumerate() {
         // PICTURE-clause energy: ¶ pk, * required, ƒ computed.
-        let marker = if ed.read_only(i) {
+        let marker = if ed.parent_field(i) {
+            "↳"
+        } else if ed.read_only(i) {
             "ƒ"
         } else if col.pk {
             "¶"

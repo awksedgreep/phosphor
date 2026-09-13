@@ -32,15 +32,15 @@ impl ReportSpec {
         }
     }
 
-    fn source_sql(&self) -> String {
+    fn source_sql(&self) -> DbResult<String> {
         let src = self.source.trim();
         let lower = src.to_ascii_lowercase();
         let base = if lower.starts_with("select") || lower.starts_with("with") {
-            format!("({src})")
+            format!("({})", crate::sql::select_source(src)?)
         } else {
             format!("\"{}\"", src.replace('"', "\"\""))
         };
-        match &self.group_by {
+        Ok(match &self.group_by {
             // Group bands need group-sorted rows; the report sorts, the
             // user doesn't have to know. The grouping key rides along as
             // a synthetic column so a full expression — not just a column
@@ -50,7 +50,7 @@ impl ReportSpec {
                 format!("SELECT *, ({expr}) AS {GROUP_ALIAS} FROM {base} ORDER BY {GROUP_ALIAS}")
             }
             None => format!("SELECT * FROM {base}"),
-        }
+        })
     }
 
     pub fn save(&self, db: &dyn DbLink) -> DbResult<()> {
@@ -121,9 +121,8 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
     let crate::db::QueryResult {
         mut columns,
         mut rows,
-        truncated,
         ..
-    } = db.query(&spec.source_sql())?;
+    } = db.query_complete(&spec.source_sql()?)?;
 
     // Split the synthetic grouping column off before layout. `group_vals`
     // is then the band key per row; what remains are the real columns.
@@ -330,9 +329,6 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
     for l in totals_line("TOTAL", &grand, rows.len()) {
         emit(&mut out, l);
     }
-    if truncated {
-        emit(&mut out, "(source truncated at the 10k query cap)".into());
-    }
     Ok(out)
 }
 
@@ -342,7 +338,7 @@ pub fn labels(db: &dyn DbLink, table: &str) -> DbResult<Vec<String>> {
     const ACROSS: usize = 3;
     const LABEL_W: usize = 32;
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-    let q = db.query(&format!("SELECT * FROM {quoted}"))?;
+    let q = db.query_complete(&format!("SELECT * FROM {quoted}"))?;
     let per_label = q.columns.len().max(1) + 1; // + blank separator
     let mut out = Vec::new();
     for chunk in q.rows.chunks(ACROSS) {
@@ -377,7 +373,7 @@ impl PagerState {
     pub fn write_file(&self) -> Result<String, String> {
         use std::io::Write as _;
         let path = format!("{}.txt", self.file_stem);
-        let f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        let (output, f) = crate::output::AtomicOutput::create(std::path::Path::new(&path))?;
         // Stream line-by-line: join() would spike 2x memory on big reports.
         let mut w = std::io::BufWriter::new(f);
         for (i, line) in self.lines.iter().enumerate() {
@@ -387,6 +383,9 @@ impl PagerState {
             w.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
         }
         w.flush().map_err(|e| e.to_string())?;
+        w.get_ref().sync_all().map_err(|e| e.to_string())?;
+        drop(w);
+        output.publish()?;
         Ok(path)
     }
 

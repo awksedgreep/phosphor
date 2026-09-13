@@ -151,8 +151,17 @@ pub struct LinkPane {
     pub key_sql: String,
 }
 
+#[derive(Clone)]
+pub struct RelatedEdit {
+    pub column: String,
+    pub value: PValue,
+    pub key_sql: String,
+}
+
 pub struct EditState {
     pub table: String,
+    /// Fixed parent link for a form opened from the detail pane.
+    pub relation: Option<RelatedEdit>,
     /// true → this is a NEW record (INSERT on save; rowid unused).
     pub inserting: bool,
     /// The painted layout, when the crafted form has 2D coordinates —
@@ -185,6 +194,14 @@ pub struct EditState {
 }
 
 impl EditState {
+    pub fn parent_field(&self, field: usize) -> bool {
+        self.relation.as_ref().is_some_and(|r| {
+            self.fields
+                .get(field)
+                .is_some_and(|(c, _)| c.name.eq_ignore_ascii_case(&r.column))
+        })
+    }
+
     pub fn dirty(&self) -> bool {
         self.inputs.iter().any(Option::is_some)
     }
@@ -192,6 +209,7 @@ impl EditState {
     pub fn read_only(&self, field: usize) -> bool {
         self.fields.get(field).is_some_and(|(c, _)| c.generated)
             || matches!(self.computed.get(field), Some(Some(_)))
+            || self.parent_field(field)
     }
 }
 
@@ -217,7 +235,7 @@ pub enum GridSource {
         truncated: bool,
     },
     /// Split-view detail pane: the child rows of one parent record,
-    /// fetched in full (bounded) — read-only in v1.
+    /// fetched in windows with physical row identities when available.
     Detail {
         parent: String,
         child: String,
@@ -238,7 +256,7 @@ pub struct HitRects {
 
 /// The right-hand pane of a split BROWSE: one child table filtered to
 /// the master cursor's record. SET RELATION, on one screen. The pane's
-/// Grid is read-only (GridSource::Detail); child/col/key live in the
+/// Grid carries child row identities; child/col/key live in the
 /// source — one copy of the truth.
 pub struct DetailState {
     pub grid: Grid,
@@ -539,7 +557,7 @@ enum PendingOp {
     },
     /// Detail-pane rows for a split BROWSE, keyed by the parent key
     /// they were fetched for (stale arrivals drop).
-    Detail { want_key: String },
+    Detail { want_key: String, start: i64 },
 }
 
 pub struct App {
@@ -1026,7 +1044,7 @@ impl App {
                 }
                 Err(e) => self.err(e),
             },
-            (PendingOp::Detail { want_key }, DbResponse::Detail(r)) => match r {
+            (PendingOp::Detail { want_key, start }, DbResponse::Detail(r)) => match r {
                 Ok(d) => {
                     // Latest fetch wins; older arrivals drop.
                     if self.pending_detail.as_ref() != Some(&(tag, want_key.clone())) {
@@ -1056,15 +1074,20 @@ impl App {
                     g.columns = d.columns;
                     g.total = d.total;
                     g.cache = d.rows;
-                    g.cache_start = 0;
-                    g.rowids = None;
+                    g.cache_start = start;
+                    g.rowids = d.rowids;
                     g.cur_row = g.cur_row.clamp(0, g.total.saturating_sub(1).max(0));
                     g.row_off = g.row_off.min(g.cur_row);
                     apply_width_prefs(g, &child_for_prefs, self.db.link());
                     g.compute_widths();
                     self.last_ms = Some(took.as_secs_f64() * 1000.0);
                 }
-                Err(e) => self.err(e),
+                Err(e) => {
+                    if self.pending_detail.as_ref() == Some(&(tag, want_key)) {
+                        self.pending_detail = None;
+                        self.err(e);
+                    }
+                }
             },
             (_, _) => self.err("db worker protocol mismatch"),
         }
@@ -1621,6 +1644,9 @@ impl App {
                 Char('g') => Command::GridTop,
                 Char('G') => Command::GridBottom,
                 Enter => Command::OpenEdit,
+                Char('a') | Insert => Command::OpenInsert,
+                Char('x') | Delete => Command::DeleteRow,
+                F(5) => Command::Refresh,
                 Tab => Command::Focus(Focus::Grid),
                 Char('.') => Command::Focus(Focus::Prompt),
                 Char('+') | Char('=') => Command::ColWidth(2),
@@ -1906,7 +1932,12 @@ impl App {
                 }
                 if let Overlay::Edit(ed) = &mut self.overlay {
                     if ed.read_only(ed.cursor) {
-                        self.say("computed field — read-only");
+                        let message = if ed.parent_field(ed.cursor) {
+                            "parent link is fixed in related forms"
+                        } else {
+                            "computed field — read-only"
+                        };
+                        self.say(message);
                         return;
                     }
                     let current = ed.inputs[ed.cursor].clone().unwrap_or_else(|| {
@@ -2253,6 +2284,12 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        if self.focus == Focus::Detail {
+            return match self.reload_detail_window(None) {
+                Ok(()) => self.say("related records refreshed"),
+                Err(e) => self.err(e),
+            };
+        }
         self.reload_tables();
         // Async refill of the live window (columns/widths stay put);
         // the grid re-seeks when the window arrives.
@@ -3834,6 +3871,16 @@ impl App {
         };
         let idx = g.cur_row.checked_sub(g.cache_start)? as usize;
         let row = g.cache.get(idx)?;
+        let literal = |value: &PValue| match value {
+            PValue::Null => None,
+            PValue::Int(n) => Some(n.to_string()),
+            PValue::Real(n) => Some(n.to_string()),
+            PValue::Text(s) => Some(store::q(s)),
+            PValue::Blob(b) => Some(format!(
+                "X'{}'",
+                b.iter().map(|v| format!("{v:02x}")).collect::<String>()
+            )),
+        };
         // Named FK column first (ASCII-case-insensitive, like the
         // link panes).
         if !parent_col.is_empty() {
@@ -3843,86 +3890,91 @@ impl App {
                 .enumerate()
                 .find(|(_, c)| c.name.eq_ignore_ascii_case(parent_col))
             {
-                return match row.get(i)? {
-                    PValue::Null => None,
-                    PValue::Int(i) => Some(i.to_string()),
-                    PValue::Real(r) => Some(r.to_string()),
-                    v => Some(format!("'{}'", v.render().replace('\'', "''"))),
-                };
+                return literal(row.get(i)?);
             }
         }
-        // pk fallback (an INTEGER PRIMARY KEY *is* the rowid), then rowid.
-        let pk_is_first = self
-            .columns_cache
-            .get(table)
-            .and_then(|cols| cols.first())
-            .is_some_and(|c| c.pk);
-        match (
-            pk_is_first,
-            row.first(),
-            g.rowids.as_ref().and_then(|r| r.get(idx)),
-        ) {
-            (true, Some(PValue::Int(id)), _) => Some(id.to_string()),
-            (_, _, Some(id)) => Some(id.to_string()),
-            _ => None,
+        if let Some(cols) = self.columns_cache.get(table) {
+            let keys = cols
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.pk)
+                .collect::<Vec<_>>();
+            if let [(i, _)] = keys.as_slice() {
+                return literal(row.get(*i)?);
+            }
         }
+        g.rowids.as_ref()?.get(idx).map(ToString::to_string)
     }
 
     /// Submit the detail fetch: filtered count + rows in ONE worker job.
     /// Latest-wins via pending_detail; a stale arrival (master moved on)
     /// is dropped by the finish arm.
     fn submit_detail(&mut self, child: &str, child_col: &str, key_sql: &str) {
+        self.submit_detail_at(child, child_col, key_sql, 0);
+    }
+
+    fn fetch_detail(
+        db: &dyn DbLink,
+        child: &str,
+        child_col: &str,
+        key_sql: &str,
+        start: i64,
+    ) -> Result<crate::worker::DetailData, String> {
+        let table = Self::quote_ident(child);
+        let predicate = format!("{} = {key_sql}", Self::quote_ident(child_col));
+        let alias = db.rowid_column(child)?;
+        let identity = alias
+            .as_ref()
+            .map(|a| format!("{table}.{}", Self::quote_ident(a)));
+        let select = identity
+            .as_ref()
+            .map_or(String::new(), |id| format!("{id}, "));
+        let order = identity
+            .as_ref()
+            .map_or(String::new(), |id| format!(" ORDER BY {id}"));
+        let mut q = db.query(&format!(
+            "SELECT {select}* FROM {table} WHERE {predicate}{order} LIMIT 2001 OFFSET {start}"
+        ))?;
+        let rowids = if identity.is_some() {
+            q.columns.remove(0);
+            Some(
+                q.rows
+                    .iter_mut()
+                    .map(|row| match row.remove(0) {
+                        PValue::Int(id) => Ok(id),
+                        _ => Err("related record has no usable row identity".to_owned()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else {
+            None
+        };
+        let count = db.query(&format!("SELECT count(*) FROM {table} WHERE {predicate}"))?;
+        let total = match count.rows.first().and_then(|r| r.first()) {
+            Some(PValue::Int(total)) => *total,
+            _ => return Err("could not count related records".into()),
+        };
+        Ok(crate::worker::DetailData {
+            columns: q.columns,
+            rows: q.rows,
+            rowids,
+            total,
+        })
+    }
+
+    fn submit_detail_at(&mut self, child: &str, child_col: &str, key_sql: &str, start: i64) {
         let (child, child_col, key_sql) =
             (child.to_owned(), child_col.to_owned(), key_sql.to_owned());
-        let limit = 2001; // bounded fetch; count reports the real total
         let want_key = key_sql.to_owned();
         match self.db.submit(Box::new(move |db| {
-            let where_clause = format!("\"{}\" = {}", child_col.replace('"', "\"\""), key_sql);
-            let order = db
-                .rowid_column(&child)
-                .ok()
-                .flatten()
-                .map(|alias| {
-                    format!(
-                        " ORDER BY {}.{}",
-                        Self::quote_ident(&child),
-                        Self::quote_ident(&alias)
-                    )
-                })
-                .unwrap_or_default();
-            let q = db.query(&format!(
-                "SELECT * FROM \"{}\" WHERE {}{} LIMIT {}",
-                child.replace('"', "\"\""),
-                where_clause,
-                order,
-                limit
-            ));
-            let total = db.query(&format!(
-                "SELECT count(*) FROM \"{}\" WHERE {}",
-                child.replace('"', "\"\""),
-                where_clause
-            ));
-            DbResponse::Detail(match (q, total) {
-                (Ok(q), Ok(t)) => Ok(crate::worker::DetailData {
-                    columns: q.columns,
-                    rows: q.rows,
-                    total: t
-                        .rows
-                        .first()
-                        .and_then(|r| r.first())
-                        .map_or(0, |v| match v {
-                            PValue::Int(n) => *n,
-                            _ => 0,
-                        }),
-                }),
-                (Err(e), _) | (_, Err(e)) => Err(e),
-            })
+            DbResponse::Detail(Self::fetch_detail(db, &child, &child_col, &key_sql, start))
         })) {
             Some(tag) => {
                 self.pending.insert(
                     tag,
                     PendingOp::Detail {
                         want_key: want_key.clone(),
+                        start,
                     },
                 );
                 self.pending_detail = Some((tag, want_key));
@@ -3944,7 +3996,16 @@ impl App {
             _ => return,
         };
         let Some(new_key) = self.master_key_sql(&state.parent_col) else {
-            return; // unkeyed record: pane keeps its last picture
+            self.pending_detail = None;
+            let g = &mut self.detail.as_mut().unwrap().grid;
+            g.cache.clear();
+            g.rowids = None;
+            g.total = 0;
+            g.cur_row = 0;
+            if let GridSource::Detail { key_sql, .. } = &mut g.source {
+                *key_sql = "NULL".into();
+            }
+            return;
         };
         if key_sql == new_key {
             return; // same record, nothing to re-link
@@ -3953,6 +4014,11 @@ impl App {
         if let GridSource::Detail { key_sql, .. } = &mut state.grid.source {
             *key_sql = new_key.clone();
         }
+        // The old parent's rows must not remain actionable during the fetch.
+        state.grid.cache.clear();
+        state.grid.rowids = None;
+        state.grid.total = 0;
+        state.grid.cur_row = 0;
         self.submit_detail(&child, &child_col, &new_key);
     }
 
@@ -3984,6 +4050,23 @@ impl App {
                 break;
             }
             g.col_off += 1;
+        }
+        if g.row(g.cur_row).is_none() {
+            if let GridSource::Detail {
+                child,
+                child_col,
+                key_sql,
+                ..
+            } = &g.source
+            {
+                let (child, column, key, start) = (
+                    child.clone(),
+                    child_col.clone(),
+                    key_sql.clone(),
+                    (g.cur_row - 20).max(0),
+                );
+                self.submit_detail_at(&child, &column, &key, start);
+            }
         }
     }
 
@@ -4288,6 +4371,10 @@ impl App {
     }
 
     fn open_edit(&mut self) {
+        if self.focus == Focus::Detail {
+            let abs = self.detail.as_ref().map_or(0, |d| d.grid.cur_row);
+            return self.build_related_edit_for(abs);
+        }
         match &self.grid {
             Some(Grid {
                 source: GridSource::Table { editable, .. },
@@ -4302,6 +4389,130 @@ impl App {
         }
         let abs = self.grid.as_ref().map(|g| g.cur_row).unwrap_or(0);
         self.build_edit_for(abs);
+    }
+
+    fn detail_context(&self) -> Result<(String, RelatedEdit), String> {
+        if self.pending_detail.is_some() {
+            return Err("related records are loading; try again".into());
+        }
+        let state = self.detail.as_ref().ok_or("no related table is open")?;
+        let GridSource::Detail {
+            parent,
+            child,
+            child_col,
+            key_sql,
+            ..
+        } = &state.grid.source
+        else {
+            return Err("no related table is open".into());
+        };
+        // Reject a stale pane if the selected parent lost its key.
+        if self.master_key_sql(&state.parent_col).as_ref() != Some(key_sql) {
+            return Err("parent relationship changed; reopen the related table".into());
+        }
+        let fks = format!("pragma_foreign_key_list({})", store::q(child));
+        let width = self.db.query(&format!("SELECT count(*) FROM {fks} WHERE id IN (SELECT id FROM {fks} WHERE \"from\" = {} COLLATE NOCASE AND \"table\" = {} COLLATE NOCASE)", store::q(child_col), store::q(parent)))?;
+        if width.rows.first().and_then(|r| r.first()) != Some(&PValue::Int(1)) {
+            return Err(
+                "this parent link needs multiple fields; edit it from the child table".into(),
+            );
+        }
+        let value = self
+            .db
+            .query(&format!("SELECT {key_sql}"))?
+            .rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .ok_or("parent has no relationship key")?;
+        Ok((
+            child.clone(),
+            RelatedEdit {
+                column: child_col.clone(),
+                value,
+                key_sql: key_sql.clone(),
+            },
+        ))
+    }
+
+    fn reload_detail_window(&mut self, target: Option<i64>) -> Result<(), String> {
+        let d = self.detail.as_ref().ok_or("related table is closed")?;
+        let GridSource::Detail {
+            child,
+            child_col,
+            key_sql,
+            ..
+        } = &d.grid.source
+        else {
+            return Err("no related table".into());
+        };
+        let row = target.unwrap_or(d.grid.cur_row).max(0);
+        let mut start = (row - 20).max(0);
+        let mut data = Self::fetch_detail(self.db.link(), child, child_col, key_sql, start)?;
+        let row = row.min(data.total.saturating_sub(1).max(0));
+        if row < start {
+            start = (row - 20).max(0);
+            data = Self::fetch_detail(self.db.link(), child, child_col, key_sql, start)?;
+        }
+        self.pending_detail = None; // supersede any pre-write response
+        let d = self.detail.as_mut().unwrap();
+        let g = &mut d.grid;
+        g.columns = data.columns;
+        g.total = data.total;
+        g.rowids = data.rowids;
+        g.cache = data.rows;
+        g.cache_start = start;
+        g.cur_row = row;
+        g.row_off = (row - d.visible_rows.max(1) + 1).max(0);
+        g.grow_widths();
+        Ok(())
+    }
+
+    fn build_related_edit_for(&mut self, abs: i64) {
+        let (name, relation) = match self.detail_context() {
+            Ok(context) => context,
+            Err(e) => return self.err(e),
+        };
+        if self.detail.as_ref().is_some_and(|d| d.grid.total == 0) {
+            return;
+        }
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.grid.row(abs).is_none())
+        {
+            if let Err(e) = self.reload_detail_window(Some(abs)) {
+                return self.err(e);
+            }
+        }
+        let g = &mut self.detail.as_mut().unwrap().grid;
+        let Some(rowid) = g
+            .rowids
+            .as_ref()
+            .and_then(|ids| ids.get((abs - g.cache_start) as usize))
+            .copied()
+        else {
+            return self.err("no unambiguous row identity; related records are read-only");
+        };
+        g.cur_row = abs;
+        let alias = match self.db.rowid_column(&name) {
+            Ok(Some(alias)) => alias,
+            _ => return self.err("no unambiguous row identity; related records are read-only"),
+        };
+        let sql = format!(
+            "SELECT * FROM {} WHERE {} AND {} = {}",
+            Self::quote_ident(&name),
+            crate::db::rowid_predicate(&name, &alias, &rowid.to_string()),
+            Self::quote_ident(&relation.column),
+            relation.key_sql
+        );
+        match self.db.query(&sql) {
+            Ok(mut result) if result.rows.len() == 1 => {
+                self.build_record_form(name, rowid, result.rows.remove(0), abs, Some(relation))
+            }
+            Ok(_) => self.err("related record changed or was deleted; refresh before editing"),
+            Err(e) => self.err(e),
+        }
     }
 
     /// Build a parked EDIT target once a window install covers it.
@@ -4336,6 +4547,10 @@ impl App {
             }
         }
         let name = ed.table.clone();
+        let relation = ed.relation.clone();
+        if let Some(relation) = relation {
+            return self.reload_related_record(&name, new_rowid, relation);
+        }
         self.pending_page = None;
         self.pending_edit = None;
         self.pending.retain(|_, op| {
@@ -4404,6 +4619,55 @@ impl App {
         Ok(())
     }
 
+    fn reload_related_record(
+        &mut self,
+        name: &str,
+        rowid: i64,
+        relation: RelatedEdit,
+    ) -> Result<(), String> {
+        let alias = self
+            .db
+            .rowid_column(name)?
+            .ok_or("saved record has no usable identity")?;
+        let table = Self::quote_ident(name);
+        let id = format!("{table}.{}", Self::quote_ident(&alias));
+        let filter = format!(
+            "{} = {}",
+            Self::quote_ident(&relation.column),
+            relation.key_sql
+        );
+        let mut result = self.db.query(&format!("SELECT *, (SELECT count(*) FROM {table} WHERE {filter} AND {id} < {rowid}) FROM {table} WHERE {filter} AND {}",
+            crate::db::rowid_predicate(name, &alias, &rowid.to_string())))?;
+        let mut row = result
+            .rows
+            .pop()
+            .ok_or("saved record no longer belongs to this parent; refresh the related table")?;
+        let Some(PValue::Int(position)) = row.pop() else {
+            return Err("could not locate saved related record".into());
+        };
+        self.reload_detail_window(Some(position))?;
+        let d = self.detail.as_mut().unwrap();
+        let g = &mut d.grid;
+        let position = match g
+            .rowids
+            .as_ref()
+            .and_then(|ids| ids.iter().position(|id| *id == rowid))
+        {
+            Some(index) => g.cache_start + index as i64,
+            None => {
+                g.cache = vec![row.clone()];
+                g.rowids = Some(vec![rowid]);
+                g.cache_start = position;
+                position
+            }
+        };
+        g.cur_row = position;
+        g.total = g.total.max(position + 1);
+        g.row_off = (position - d.visible_rows.max(1) + 1).max(0);
+        self.build_record_form(name.to_owned(), rowid, row, position, Some(relation));
+        Ok(())
+    }
+
     /// Build (or rebuild) the EDIT overlay for the record at absolute
     /// grid row `abs` — used by open_edit and by record PAGING.
     /// Async-aware: grid_jump submits a missing window; if its rows
@@ -4428,6 +4692,17 @@ impl App {
         self.pending_edit = None; // rows present: any parked target is served
         let name = name.clone();
         let row: Vec<PValue> = row.clone();
+        self.build_record_form(name, rowid, row, abs, None);
+    }
+
+    fn build_record_form(
+        &mut self,
+        name: String,
+        rowid: i64,
+        row: Vec<PValue>,
+        abs: i64,
+        relation: Option<RelatedEdit>,
+    ) {
         let cols = match self.cached_columns(&name) {
             Ok(c) => c,
             Err(e) => return self.err(e),
@@ -4465,6 +4740,7 @@ impl App {
         };
         self.overlay = Overlay::Edit(EditState {
             table: name,
+            relation,
             inserting: false,
             painted,
             row_abs: abs,
@@ -4521,6 +4797,9 @@ impl App {
     /// is a declared foreign key; list the parent rows and let the user
     /// pick one. Looks up `(parent, key column) -> rows`.
     fn open_picker(&mut self) {
+        if matches!(&self.overlay, Overlay::Edit(ed) if ed.parent_field(ed.cursor)) {
+            return self.say("parent link is fixed in related forms");
+        }
         let (parent, keycol, field) = match &self.overlay {
             Overlay::Edit(ed) => match ed.pickers.get(ed.cursor) {
                 Some(Some((t, k))) => (t.clone(), k.clone(), ed.cursor),
@@ -4719,7 +4998,13 @@ impl App {
         self.last_edit_page = Some(now);
         let step = (1 + self.page_streak as i64 / 6).min(10);
 
-        let total = self.grid.as_ref().map(|g| g.total).unwrap_or(0);
+        let related = matches!(&self.overlay, Overlay::Edit(ed) if ed.relation.is_some());
+        let total = if related {
+            self.detail.as_ref().map(|d| d.grid.total)
+        } else {
+            self.grid.as_ref().map(|g| g.total)
+        }
+        .unwrap_or(0);
         let target = (from + d * step).clamp(0, total.saturating_sub(1).max(0));
         if target == from {
             return self.say(if d < 0 { "first record" } else { "last record" });
@@ -4727,7 +5012,11 @@ impl App {
         if dirty && !self.commit_edit() {
             return; // validation or db error: stay on this record
         }
-        self.build_edit_for(target);
+        if related {
+            self.build_related_edit_for(target);
+        } else {
+            self.build_edit_for(target);
+        }
     }
 
     /// Apply the saved form for `table` (order/labels/hide/required) to
@@ -4845,6 +5134,16 @@ impl App {
     /// 'a' in BROWSE: a blank record form; save INSERTs (crafted forms
     /// and required validation apply exactly as for EDIT).
     fn open_insert(&mut self) {
+        if self.focus == Focus::Detail {
+            let (name, relation) = match self.detail_context() {
+                Ok(context) => context,
+                Err(e) => return self.err(e),
+            };
+            if !self.db.has_rowid(&name) {
+                return self.err("no unambiguous row identity; cannot insert from this form");
+            }
+            return self.open_insert_form(name, Some(relation));
+        }
         let Some(Grid {
             source: GridSource::Table { name, editable },
             ..
@@ -4856,12 +5155,24 @@ impl App {
             return self.say("no unambiguous row identity; cannot insert from this form");
         }
         let name = name.clone();
+        self.open_insert_form(name, None);
+    }
+
+    fn open_insert_form(&mut self, name: String, relation: Option<RelatedEdit>) {
         let cols = match self.cached_columns(&name) {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
         let mut fields: Vec<(ColumnInfo, PValue)> =
             cols.into_iter().map(|c| (c, PValue::Null)).collect();
+        if let Some(relation) = &relation {
+            if let Some((_, value)) = fields
+                .iter_mut()
+                .find(|(c, _)| c.name.eq_ignore_ascii_case(&relation.column))
+            {
+                *value = relation.value.clone();
+            }
+        }
         let mut labels: Vec<String> = fields.iter().map(|(c, _)| c.name.clone()).collect();
         let mut required: Vec<bool> = vec![false; fields.len()];
         let mut masks: Vec<String> = vec![String::new(); fields.len()];
@@ -4878,6 +5189,7 @@ impl App {
         let n = fields.len();
         self.overlay = Overlay::Edit(EditState {
             table: name,
+            relation,
             inserting: true,
             painted,
             links: Vec::new(), // a NEW record has no key to relate on yet
@@ -4898,21 +5210,28 @@ impl App {
 
     /// 'x' in BROWSE: armed double-press delete of the current row.
     fn delete_row(&mut self) {
-        let Some(Grid {
-            source: GridSource::Table { name, editable },
-            cur_row,
-            cache_start,
-            rowids,
-            ..
-        }) = &self.grid
-        else {
-            return self.say("delete needs a table BROWSE");
+        let related = self.focus == Focus::Detail;
+        if related {
+            if let Err(e) = self.detail_context() {
+                return self.err(e);
+            }
+        }
+        let grid = if related {
+            self.detail.as_ref().map(|d| &d.grid)
+        } else {
+            self.grid.as_ref()
+        };
+        let Some(g) = grid else { return };
+        let (name, editable) = match &g.source {
+            GridSource::Table { name, editable } => (name, *editable),
+            GridSource::Detail { child, .. } => (child, g.rowids.is_some()),
+            _ => return self.say("delete needs a table BROWSE"),
         };
         if !editable {
             return self.say("no unambiguous row identity; cannot delete from this grid");
         }
-        let idx = (cur_row - cache_start) as usize;
-        let Some(rowid) = rowids.as_ref().and_then(|r| r.get(idx)).copied() else {
+        let idx = (g.cur_row - g.cache_start) as usize;
+        let Some(rowid) = g.rowids.as_ref().and_then(|r| r.get(idx)).copied() else {
             return;
         };
         let table = name.clone();
@@ -4922,14 +5241,20 @@ impl App {
                 Ok(()) => {
                     self.pane_cache.clear(); // child counts changed
                     self.invalidate_health();
-                    self.refresh_grid_keep_position();
+                    if related {
+                        if let Err(e) = self.reload_detail_window(None) {
+                            return self.err(e);
+                        }
+                    } else {
+                        self.refresh_grid_keep_position();
+                    }
                     self.say("row deleted");
                 }
                 Err(e) => self.err(e),
             }
         } else {
-            self.pending_delete = Some((table, rowid));
-            self.err(format!("press x again to DELETE rowid {rowid}"));
+            self.pending_delete = Some((table.clone(), rowid));
+            self.err(format!("press x again to DELETE {table} rowid {rowid}"));
         }
     }
 
@@ -5184,7 +5509,7 @@ impl App {
         let payload = match &self.overlay {
             Overlay::Edit(ed) if !ed.dirty() && !ed.inserting => None,
             Overlay::Edit(ed) => {
-                let changes: Vec<(String, PValue)> = ed
+                let mut changes: Vec<(String, PValue)> = ed
                     .fields
                     .iter()
                     .enumerate()
@@ -5196,6 +5521,10 @@ impl App {
                             .map(|text| (col.name.clone(), PValue::parse(text, &col.decl_type)))
                     })
                     .collect();
+                // The link survives hidden form fields and lifecycle scripts.
+                if let Some(relation) = ed.relation.as_ref().filter(|_| ed.inserting) {
+                    changes.push((relation.column.clone(), relation.value.clone()));
+                }
                 Some((ed.table.clone(), ed.rowid, changes, ed.inserting))
             }
             _ => return false,
@@ -5212,7 +5541,7 @@ impl App {
         } else {
             self.db
                 .update_row(&table, rowid, &changes)
-                .map(|()| (rowid, format!("saved {n} field(s)")))
+                .map(|id| (id, format!("saved {n} field(s)")))
         };
         match result {
             Ok((new_rowid, msg)) => {
@@ -5222,7 +5551,11 @@ impl App {
                 let mut reload_error = None;
                 let generated = matches!(&self.overlay, Overlay::Edit(ed)
                     if ed.fields.iter().any(|(c, _)| c.generated));
-                if inserting || generated {
+                if inserting
+                    || new_rowid != rowid
+                    || generated
+                    || matches!(&self.overlay, Overlay::Edit(ed) if ed.relation.is_some())
+                {
                     reload_error = self.reload_saved_record(new_rowid).err();
                 } else {
                     // Re-fetch the live window async (stale rows stay
@@ -6112,9 +6445,238 @@ fn strip_quotes(s: &str) -> &str {
 }
 
 #[cfg(test)]
+pub(crate) fn assert_related_record_workflow(db: Box<dyn DbLink>) {
+    db.execute("CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE orders(rowid INTEGER, id INTEGER PRIMARY KEY, product TEXT NOT NULL,
+          customer_id INTEGER REFERENCES customers(id), size INTEGER AS(length(product)));
+        INSERT INTO customers VALUES(1,'Ada'),(2,'Grace');
+        INSERT INTO orders(rowid,id,product,customer_id) VALUES(7,1,'modem',1),(7,4,'coax',1),(7,9,'router',2)").unwrap();
+    let mut a = App::new(db, None);
+    a.open_table("customers");
+    a.sync();
+    a.visible_cols_width = 120;
+    a.apply(Command::ToggleSplit);
+    a.sync();
+    a.apply(Command::Focus(Focus::Detail));
+    a.apply(Command::GridMove { dr: 1, dc: 0 });
+    let press = |a: &mut App, key| {
+        a.apply(a.map_key(KeyEvent::new(key, KeyModifiers::NONE)).unwrap());
+    };
+    press(&mut a, KeyCode::Enter);
+    let Overlay::Edit(ed) = &mut a.overlay else {
+        panic!("child form")
+    };
+    assert_eq!((&*ed.table, ed.rowid, ed.row_abs), ("orders", 4, 1));
+    assert!(ed.parent_field(3) && ed.read_only(3));
+    ed.inputs[2] = Some("updated coax".into());
+    a.apply(Command::EditSave);
+    a.sync();
+    assert!(matches!(a.overlay, Overlay::None));
+    assert_eq!(a.focus, Focus::Detail);
+    assert_eq!(a.grid.as_ref().unwrap().cur_row, 0);
+    assert_eq!(
+        a.detail.as_ref().unwrap().grid.cache[1][2],
+        PValue::Text("updated coax".into())
+    );
+    press(&mut a, KeyCode::Enter);
+    a.apply(Command::EditPage(1));
+    assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.rowid == 4));
+    a.apply(Command::EditPage(-1));
+    assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.rowid == 1));
+    a.apply(Command::EditSave);
+
+    // A hidden parent field still participates in the insert.
+    let mut form = FormSpec::from_columns("orders", a.db.columns("orders").unwrap());
+    form.fields[3].include = false;
+    form.save(a.db.link()).unwrap();
+    a.form_cache.clear();
+    press(&mut a, KeyCode::Char('a'));
+    let Overlay::Edit(ed) = &mut a.overlay else {
+        panic!("new child form")
+    };
+    assert_eq!(ed.table, "orders");
+    assert!(ed.fields.iter().all(|(c, _)| c.name != "customer_id"));
+    ed.inputs[1] = Some("4".into());
+    ed.inputs[2] = Some("new child".into());
+    a.apply(Command::EditSave);
+    assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.inserting));
+    assert!(a
+        .status
+        .as_ref()
+        .is_some_and(|(m, e)| *e && m.contains("UNIQUE")));
+    let Overlay::Edit(ed) = &mut a.overlay else {
+        unreachable!()
+    };
+    ed.inputs[1] = Some("0".into());
+    assert!(a.commit_edit());
+    assert!(
+        matches!(&a.overlay, Overlay::Edit(ed) if !ed.inserting && ed.rowid==0 && ed.row_abs==0)
+    );
+    assert_eq!(
+        a.db.query("SELECT customer_id FROM orders WHERE id=0")
+            .unwrap()
+            .rows[0][0],
+        PValue::Int(1)
+    );
+    a.apply(Command::EditSave);
+    press(&mut a, KeyCode::Char('x'));
+    assert!(a
+        .status
+        .as_ref()
+        .is_some_and(|(m, _)| m.contains("DELETE orders rowid 0")));
+    press(&mut a, KeyCode::Char('x'));
+    assert_eq!(a.db.count("orders").unwrap(), 3);
+    assert_eq!(a.db.count("customers").unwrap(), 2);
+    assert_eq!(
+        a.db.query("SELECT name FROM customers ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec![PValue::Text("Ada".into())],
+            vec![PValue::Text("Grace".into())]
+        ]
+    );
+
+    // A deleted child cannot cause an editor to fall back to the parent.
+    a.db.execute("DELETE FROM orders WHERE id=1").unwrap();
+    press(&mut a, KeyCode::Enter);
+    assert!(matches!(a.overlay, Overlay::None));
+    assert!(a
+        .status
+        .as_ref()
+        .is_some_and(|(m, e)| *e && m.contains("deleted")));
+    press(&mut a, KeyCode::F(5));
+    assert_eq!(a.detail.as_ref().unwrap().grid.total, 1);
+    a.apply(Command::Focus(Focus::Grid));
+    a.apply(Command::GridMove { dr: 1, dc: 0 });
+    a.apply(Command::Focus(Focus::Detail));
+    press(&mut a, KeyCode::Enter);
+    assert!(matches!(a.overlay, Overlay::None));
+    a.sync();
+    press(&mut a, KeyCode::Enter);
+    assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.table=="orders" && ed.rowid==9));
+    let Overlay::Edit(ed) = &mut a.overlay else {
+        unreachable!()
+    };
+    ed.inputs[1] = Some("10".into());
+    assert!(a.commit_edit());
+    assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.rowid==10 && !ed.inserting));
+    let Overlay::Edit(ed) = &mut a.overlay else {
+        unreachable!()
+    };
+    ed.inputs[2] = Some("renumbered router".into());
+    assert!(a.commit_edit());
+    assert_eq!(
+        a.db.query("SELECT id,product,customer_id FROM orders WHERE customer_id=2")
+            .unwrap()
+            .rows,
+        vec![vec![
+            PValue::Int(10),
+            PValue::Text("renumbered router".into()),
+            PValue::Int(2)
+        ]]
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::EmbeddedDb;
+
+    #[test]
+    fn related_record_commands_preserve_the_parent() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        assert_related_record_workflow(Box::new(db));
+    }
+
+    #[test]
+    fn remote_related_record_commands_preserve_the_parent() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let db = crate::remote::RemoteDb::open(&server.url).unwrap();
+        assert_related_record_workflow(Box::new(db));
+    }
+
+    #[test]
+    fn related_forms_page_beyond_the_first_window_and_keep_text_keys() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE parent(name TEXT PRIMARY KEY); INSERT INTO parent VALUES('O''Brien; Ada');
+            CREATE TABLE child(id INTEGER PRIMARY KEY, parent_name TEXT REFERENCES parent(name));
+            WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<2010)
+            INSERT INTO child SELECT n,'O''Brien; Ada' FROM seq").unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.open_table("parent");
+        a.sync();
+        a.visible_cols_width = 120;
+        a.apply(Command::ToggleSplit);
+        a.sync();
+        a.apply(Command::Focus(Focus::Detail));
+        a.apply(Command::GridBottom);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        assert!(
+            matches!(&a.overlay, Overlay::Edit(ed) if ed.table=="child" && ed.rowid==2010 && ed.row_abs==2009)
+        );
+        a.apply(Command::EditPage(-1));
+        assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.rowid==2009));
+        a.apply(Command::EditSave);
+        a.apply(Command::OpenInsert);
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("new child")
+        };
+        assert_eq!(ed.fields[1].1, PValue::Text("O'Brien; Ada".into()));
+        a.apply(Command::EditSave);
+        assert_eq!(a.db.count("child").unwrap(), 2011);
+    }
+
+    #[test]
+    fn related_commands_refuse_ambiguous_rows_and_composite_parent_links() {
+        for ddl in [
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY); INSERT INTO parent VALUES(1);
+             CREATE TABLE child(rowid TEXT, _rowid_ TEXT, oid TEXT, parent_id INTEGER REFERENCES parent(id));
+             INSERT INTO child VALUES('a','b','c',1)",
+            "CREATE TABLE parent(a INTEGER,b INTEGER,PRIMARY KEY(a,b)); INSERT INTO parent VALUES(1,2);
+             CREATE TABLE child(id INTEGER PRIMARY KEY,a INTEGER,b INTEGER,FOREIGN KEY(a,b) REFERENCES parent(a,b));
+             INSERT INTO child VALUES(7,1,2)",
+        ] {
+            let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+            db.execute(ddl).unwrap();
+            let mut a = App::new(Box::new(db),None);
+            a.open_table("parent"); a.sync(); a.visible_cols_width=120;
+            a.apply(Command::ToggleSplit); a.sync(); a.apply(Command::Focus(Focus::Detail));
+            for command in [Command::OpenEdit,Command::OpenInsert,Command::DeleteRow,Command::DeleteRow] {
+                a.apply(command);
+                assert!(matches!(a.overlay,Overlay::None));
+                assert!(a.status.as_ref().is_some_and(|(m,_)| m.contains("identity") || m.contains("multiple fields")));
+            }
+            assert_eq!(a.db.count("child").unwrap(),1);
+            assert_eq!(a.db.count("parent").unwrap(),1);
+        }
+    }
+
+    #[test]
+    fn export_completion_and_failure_are_visible_through_the_worker() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE source(n INTEGER); WITH RECURSIVE s(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM s WHERE n<10005) INSERT INTO source SELECT n FROM s").unwrap();
+        let mut a = App::new(Box::new(db), None);
+        let file = crate::test_support::TestDb::new();
+        a.prompt.input = format!("export source {}", file.path());
+        a.apply(Command::PromptRun);
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, e)| !e && m.contains("exported 10005 row(s)")));
+        let previous = std::fs::read(file.path()).unwrap();
+        a.prompt.input = format!(
+            "export SELECT abs(-9223372036854775808) FROM source {}",
+            file.path()
+        );
+        a.apply(Command::PromptRun);
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, e)| *e && m.contains("destination unchanged")));
+        assert_eq!(std::fs::read(file.path()).unwrap(), previous);
+    }
 
     #[test]
     fn remote_import_error_is_visible_and_worker_transaction_rolls_back() {

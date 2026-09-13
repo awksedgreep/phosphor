@@ -77,6 +77,7 @@ pub struct HealthData {
 pub struct DetailData {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<PValue>>,
+    pub rowids: Option<Vec<i64>>,
     pub total: i64,
 }
 
@@ -338,6 +339,19 @@ impl DbLink for DbHandle {
             .query()
     }
 
+    fn stream_query(&self, sql: &str, sink: crate::db::RowSink) -> DbResult<usize> {
+        let sql = sql.to_owned();
+        let mut sink = Some(sink);
+        self.call(Box::new(move |db| {
+            DbResponse::Count(
+                db.stream_query(&sql, sink.take().unwrap())
+                    .map(|n| n as i64),
+            )
+        }))
+        .count()
+        .map(|n| n as usize)
+    }
+
     fn apply_schema_changes(&self, statements: &[String]) -> DbResult<Duration> {
         let statements = statements.to_owned();
         self.call(Box::new(move |db| {
@@ -365,12 +379,12 @@ impl DbLink for DbHandle {
             .execute()
     }
 
-    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<()> {
+    fn update_row(&self, table: &str, rowid: i64, changes: &[(String, PValue)]) -> DbResult<i64> {
         let (t, c) = (table.to_owned(), changes.to_vec());
         self.call(Box::new(move |db| {
-            DbResponse::Unit(db.update_row(&t, rowid, &c))
+            DbResponse::Insert(db.update_row(&t, rowid, &c))
         }))
-        .unit()
+        .insert()
     }
 
     fn insert_row(&self, table: &str, changes: &[(String, PValue)]) -> DbResult<i64> {

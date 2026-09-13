@@ -14,6 +14,7 @@ mod csv_io;
 mod db;
 mod forms;
 mod help;
+mod output;
 mod qbe;
 mod remote;
 mod report;

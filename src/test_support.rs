@@ -346,6 +346,105 @@ pub fn assert_transaction_and_script_workflows(db: &dyn crate::db::DbLink) {
     assert_eq!(db.count("remote_text").unwrap(), 2);
 }
 
+pub fn assert_complete_output(db: &dyn crate::db::DbLink) {
+    use crate::db::PValue;
+    db.execute(
+        "CREATE TABLE output_rows(n INTEGER PRIMARY KEY, label TEXT, amount INTEGER);
+        WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<10005)
+        INSERT INTO output_rows SELECT n, printf('recipient-%05d',n), 2 FROM seq",
+    )
+    .unwrap();
+    assert!(db.query("SELECT * FROM output_rows").unwrap().truncated);
+    let file = TestDb::new();
+    let message = crate::csv_io::export_csv(db, "output_rows", file.path()).unwrap();
+    assert!(message.contains("10005 row(s)"), "{message}");
+    let mut csv = csv::Reader::from_path(file.path()).unwrap();
+    let rows = csv.records().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(rows.len(), 10005);
+    assert_eq!(&rows.last().unwrap()[1], "recipient-10005");
+    let limited = db.query_complete("WITH selected AS (SELECT n FROM output_rows) SELECT n FROM selected ORDER BY n DESC LIMIT 3;").unwrap();
+    assert_eq!(
+        limited.rows,
+        vec![
+            vec![PValue::Int(10005)],
+            vec![PValue::Int(10004)],
+            vec![PValue::Int(10003)]
+        ]
+    );
+    assert_eq!(
+        db.query_complete("SELECT n FROM output_rows -- LIMIT is only a comment")
+            .unwrap()
+            .rows
+            .len(),
+        10005
+    );
+    let labels = crate::report::labels(db, "output_rows").unwrap().join("\n");
+    assert_eq!(labels.matches("recipient-").count(), 10005);
+    assert!(labels.contains("recipient-10005"));
+    let report = crate::report::render(db, &crate::report::ReportSpec::for_table("output_rows"))
+        .unwrap()
+        .join("\n");
+    assert!(report.contains("TOTAL (10005 rows)"));
+    assert!(report.contains("20010"));
+    assert!(report.contains("recipient-10005"));
+    let grouped = crate::report::ReportSpec {
+        name: "grouped output".into(),
+        title: "Complete totals".into(),
+        source: "SELECT n%2 AS cohort, amount FROM output_rows; -- complete source".into(),
+        group_by: Some("cohort".into()),
+    };
+    let text = crate::report::render(db, &grouped).unwrap().join("\n");
+    assert!(text.contains("subtotal (5002 rows)"));
+    assert!(text.contains("subtotal (5003 rows)"));
+    assert!(text.contains("TOTAL (10005 rows)"));
+
+    for sql in [
+        "SELECT * FROM missing_output_table",
+        "SELECT CASE WHEN n=10005 THEN abs(-9223372036854775808) ELSE n END FROM output_rows",
+        "WITH x AS (SELECT 1) DELETE FROM output_rows RETURNING n",
+    ] {
+        std::fs::write(file.path(), "previous completed output").unwrap();
+        assert!(
+            crate::csv_io::export_csv(db, sql, file.path()).is_err(),
+            "{sql}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "previous completed output"
+        );
+        let mut spec = crate::report::ReportSpec::for_table("unused");
+        spec.source = sql.into();
+        assert!(crate::report::render(db, &spec).is_err(), "{sql}");
+    }
+    assert_eq!(db.count("output_rows").unwrap(), 10005);
+    db.begin_transaction().unwrap();
+    db.execute("INSERT INTO output_rows VALUES(10006,'pending',2)")
+        .unwrap();
+    assert_eq!(
+        db.query_complete("SELECT n FROM output_rows WHERE n=10006")
+            .unwrap()
+            .rows,
+        vec![vec![PValue::Int(10006)]]
+    );
+    let error = db
+        .stream_query(
+            "SELECT n FROM output_rows",
+            Box::new(|event| {
+                if matches!(event, crate::db::QueryEvent::Row(_)) {
+                    Err("output disk failure".into())
+                } else {
+                    Ok(())
+                }
+            }),
+        )
+        .unwrap_err();
+    assert!(error.contains("output disk failure"));
+    db.rollback_transaction().unwrap();
+    assert_eq!(db.count("output_rows").unwrap(), 10005);
+    crate::csv_io::export_csv(db, "SELECT n FROM output_rows WHERE 0", file.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(file.path()).unwrap(), "n\n");
+}
+
 impl TestDb {
     pub fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -376,6 +475,7 @@ pub struct HranaFixture {
     pub executed: Arc<Mutex<Vec<String>>>,
     pub expire_next: Arc<AtomicBool>,
     pub drop_next: Arc<AtomicBool>,
+    pub truncate_output: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -395,6 +495,8 @@ impl HranaFixture {
         let expire = expire_next.clone();
         let drop_next = Arc::new(AtomicBool::new(false));
         let lose = drop_next.clone();
+        let truncate_output = Arc::new(AtomicBool::new(false));
+        let truncate = truncate_output.clone();
         let thread = std::thread::spawn(move || {
             let mut streams = std::collections::HashMap::<String, Connection>::new();
             let mut serial = 0;
@@ -437,6 +539,44 @@ impl HranaFixture {
                             conn.execute_batch("ROLLBACK").unwrap();
                         }
                     }
+                }
+                if body["batch"].is_object() {
+                    serial += 1;
+                    let baton = format!("stream-{serial}");
+                    let conn = connection.as_ref().unwrap();
+                    let mut entries = vec![json!({"baton":baton, "base_url":null})];
+                    for (i, step) in body["batch"]["steps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                    {
+                        if !condition(&step["condition"], &[], conn.is_autocommit()) {
+                            continue;
+                        }
+                        match execute(conn, &step["stmt"], &log, reject_reads) {
+                            Ok(result) => {
+                                entries.push(
+                                    json!({"type":"step_begin", "step":i, "cols":result["cols"]}),
+                                );
+                                for row in result["rows"].as_array().unwrap() {
+                                    entries.push(json!({"type":"row", "row":row}));
+                                }
+                                entries.push(json!({"type":"step_end", "affected_row_count":0, "last_insert_rowid":null}));
+                            }
+                            Err(error) => entries.push(
+                                json!({"type":"step_error", "step":i, "error":{"message":error}}),
+                            ),
+                        }
+                    }
+                    if truncate.swap(false, Ordering::Relaxed) {
+                        entries.truncate(3);
+                    }
+                    entries.push(json!({"type":"replication_index", "replication_index":null}));
+                    streams.insert(baton, connection.take().unwrap());
+                    let body = entries.iter().map(|v| format!("{v}\n")).collect::<String>();
+                    let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    continue;
                 }
                 let mut results = Vec::new();
                 for req in body["requests"].as_array().unwrap() {
@@ -505,6 +645,7 @@ impl HranaFixture {
             executed,
             expire_next,
             drop_next,
+            truncate_output,
             stop,
             thread: Some(thread),
         }

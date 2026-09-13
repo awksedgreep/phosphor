@@ -125,28 +125,33 @@ pub fn export_csv(db: &dyn DbLink, source: &str, path: &str) -> DbResult<String>
         format!("SELECT * FROM \"{}\"", src.replace('"', "\"\""))
     };
 
-    let q = db.query(&sql)?;
-    let p = Path::new(path);
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("export: cannot create dir {parent:?}: {e}"))?;
-        }
-    }
-    let file = File::create(p).map_err(|e| format!("export: cannot create {path:?}: {e}"))?;
+    let (output, file) = crate::output::AtomicOutput::create(Path::new(path))
+        .map_err(|e| format!("export: cannot create {path:?}: {e}"))?;
     let mut wtr = csv::Writer::from_writer(BufWriter::new(file));
-    wtr.write_record(&q.columns)
-        .map_err(|e| format!("export: write header: {e}"))?;
-    for row in &q.rows {
-        let rec: Vec<String> = row.iter().map(to_csv_string).collect();
-        wtr.write_record(&rec)
-            .map_err(|e| format!("export: write row: {e}"))?;
-    }
-    wtr.flush().map_err(|e| format!("export: flush: {e}"))?;
-    Ok(format!(
-        "exported {} row(s) from {src:?} to {path:?}",
-        q.rows.len()
-    ))
+    let count = db
+        .stream_query(
+            &sql,
+            Box::new(move |event| match event {
+                crate::db::QueryEvent::Columns(columns) => {
+                    wtr.write_record(columns).map_err(|e| e.to_string())
+                }
+                crate::db::QueryEvent::Row(row) => wtr
+                    .write_record(row.iter().map(to_csv_string))
+                    .map_err(|e| e.to_string()),
+                crate::db::QueryEvent::End => {
+                    wtr.flush().map_err(|e| e.to_string())?;
+                    wtr.get_ref()
+                        .get_ref()
+                        .sync_all()
+                        .map_err(|e| e.to_string())
+                }
+            }),
+        )
+        .map_err(|e| format!("export incomplete; destination unchanged: {e}"))?;
+    output
+        .publish()
+        .map_err(|e| format!("export: cannot publish {path:?}: {e}"))?;
+    Ok(format!("exported {count} row(s) from {src:?} to {path:?}"))
 }
 
 #[cfg(test)]

@@ -43,7 +43,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", required=True)
     parser.add_argument("--reels", nargs="*", default=["data", "scripting", "forms", "apps", "tableeditor", "kiosk",
-                                                     "csvrollback", "sqltext", "rowidentity", "insertidentity", "generated"])
+                                                     "csvrollback", "sqltext", "rowidentity", "insertidentity", "generated",
+                                                     "relations", "reports", "detailcrud", "completeoutput"])
     args = parser.parse_args()
     root = Path(tempfile.mkdtemp(prefix="pfr-", dir="/tmp"))
     ui.DB, ui.OUT, ui.WORK = [str(root / n) for n in ("ui.db", "casts", "work")]
