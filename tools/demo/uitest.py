@@ -191,6 +191,8 @@ def seed():
     # Fixture for the `data` reel's CSV import.
     with open(os.path.join(WORK, "people-import.csv"), "w") as f:
         f.write("id,name\n1,Imported Ada\n2,Imported Grace\n")
+    with open(os.path.join(WORK, "malformed.csv"), "w") as f:
+        f.write("name,city\nAda,London\nGrace\n")
 
 
 def reels():
@@ -578,6 +580,45 @@ def reels():
     r.key(ESC).key(".").type("INSERT INTO defaults DEFAULT VALUES").key(ENTER, 0.6)
     r.key(".").type("SELECT state FROM defaults").key(ENTER, 0.6)
     r.expect("1 row(s)").expect("new")
+    out.append(r)
+
+    r = Reel("rowidentity", "Edit and delete safely with a user-defined rowid column")
+    r.key(".").type("CREATE TABLE safe(rowid INTEGER, name TEXT)").key(ENTER, 0.5)
+    r.type("INSERT INTO safe VALUES(7,'Alice'),(7,'Bob')").key(ENTER, 0.5)
+    r.key(ESC).key("s").key(ENTER, 0.6).key(ENTER, 0.5)
+    r.key(TAB).type("Alicia").key(ENTER, 0.5).expect("Alicia")
+    r.key(F10, 0.5).key("x").expect("DELETE rowid 1")
+    r.key("x", 0.5).key(".").type("SELECT name FROM safe").key(ENTER, 0.6)
+    r.expect("1 row(s)").expect("Bob").expect_absent("Alicia")
+    out.append(r)
+
+    r = Reel("insertidentity", "An explicit inserted ID stays open for subsequent typing")
+    r.key(".").type("CREATE TABLE gaps(id INTEGER PRIMARY KEY, name TEXT)").key(ENTER, 0.5)
+    r.type("INSERT INTO gaps VALUES(1,'first'),(100,'original last')").key(ENTER, 0.5)
+    r.key(ESC).key("g").key(ENTER, 0.6).key("a", 0.5)
+    r.type("50").key(ENTER, 0.5).expect("EDIT gaps · 2/3")
+    r.type("inserted").key(ENTER, 0.5).key(F10, 0.5)
+    r.key(".").type("SELECT id,name FROM gaps WHERE id >= 50").key(ENTER, 0.6)
+    r.expect("2 row(s)").expect("inserted").expect("original last")
+    out.append(r)
+
+    r = Reel("generated", "Generated columns align, stay read-only, and refresh after saves")
+    r.key(".").type("CREATE TABLE derived(id INTEGER PRIMARY KEY, size INTEGER AS (length(name)), name TEXT)")
+    r.key(ENTER, 0.5).type("INSERT INTO derived(name) VALUES('Alice')").key(ENTER, 0.5)
+    r.key(ESC).key("d").key(ENTER, 0.6).key(ENTER, 0.5).expect("Alice")
+    r.key(TAB).type("Beatrice").key(ENTER, 0.5).expect("Beatrice").expect("ƒ")
+    r.key(F10, 0.5).key("a", 0.5).key(TAB).type("Charlie").key(ENTER, 0.5)
+    r.expect("EDIT derived · 2/2").expect("Charlie")
+    r.key(F10, 0.5).key(".").type("SELECT name,size FROM derived").key(ENTER, 0.6)
+    r.expect("2 row(s)").expect("Beatrice").expect("Charlie")
+    out.append(r)
+
+    r = Reel("csvrollback", "A malformed CSV leaves no partial import or open transaction")
+    r.key(".").type("CREATE TABLE csvbad(name TEXT, city TEXT)").key(ENTER, 0.5)
+    r.type(f"import csvbad {WORK}/malformed.csv").key(ENTER, 0.6).expect("import: csv record")
+    r.type("SELECT * FROM csvbad").key(ENTER, 0.6).expect("0 row(s)")
+    r.key(".").type("BEGIN").key(ENTER, 0.5).expect("ok, 0 row(s) affected")
+    r.type("ROLLBACK").key(ENTER, 0.5).expect("ok, 0 row(s) affected")
     out.append(r)
 
     return out
