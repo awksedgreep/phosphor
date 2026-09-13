@@ -284,20 +284,21 @@ def ch05_painted_form(s):
     s.k("F", 1.0)                                          # form designer
     s.keys(["r"], gap=0.5)                                 # name required
     s.k(F2, 1.2)                                         # THE PAINTER
-    s.keys(["l"] * 6, gap=0.22)                            # walk canvas
     s.k(TAB, 0.5)                                          # select name
     s.k(" ", 0.6)                                          # place it here
     s.keys(["j", "j"], gap=0.3)
-    s.k(TAB, 0.5)
+    s.k(TAB, 0.5)                                          # select city
     s.k(" ", 0.6)
     s.keys(["j", "j"], gap=0.3)
-    s.k(TAB, 0.5)
+    s.k(TAB, 0.5)                                          # select balance
     s.k(" ", 0.6)
     s.keys(["+", "+"], gap=0.35)                           # widen balance
+    s.keys(["j"] * 3, gap=0.2)                             # clear of the fields
     s.k("t", 0.6)                                          # a title
     s.type("CUSTOMER CARD", cps=32, wait=0.4).k(ENTER, 0.6)
+    s.k("h", 0.2).k("k", 0.2)                              # one cell of padding
     s.k("b", 0.5)                                          # box corner 1
-    s.keys(["j"] * 8 + ["h"] * 4, gap=0.18)
+    s.keys(["l"] * 14 + ["j"] * 2, gap=0.14)               # around the title
     s.k("b", 0.6)                                          # corner 2
     s.k(F6, 1.2)                                           # save layout
     s.k(ESC, 1.0)                                          # painter -> list

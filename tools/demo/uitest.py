@@ -290,12 +290,13 @@ def reels():
     r.key(ENTER, 0.3).type("Total").key(ENTER, 0.4).expect("Total")  # relabel
     r.key(F6, 0.6).expect("saved form")
     r.key(F2, 0.8).expect("FORM PAINTER · orders")
-    r.key(TAB, 0.4)                                   # select next field
-    r.keys([RIGHT] * 3 + [DOWN] * 2, gap=0.2)
-    r.key(SPACE, 0.4)                                 # place it
-    r.key(UP, 0.3).key(UP, 0.3)
+    r.key(TAB, 0.4)                                   # select `product`
+    r.keys([DOWN] * 12, gap=0.12)                     # to the clear bottom row
+    r.key(SPACE, 0.4)                                 # place it there
+    r.keys([UP] * 12, gap=0.12)                       # back to the freed gap
     r.key("t", 0.3).type("ORDER ENTRY").key(ENTER, 0.5)
-    r.key("b", 0.3).keys([DOWN] * 3 + [RIGHT] * 8, gap=0.15).key("b", 0.5)
+    r.key(LEFT, 0.2).key(UP, 0.2)                     # one cell of padding
+    r.key("b", 0.3).keys([RIGHT] * 12 + [DOWN] * 2, gap=0.12).key("b", 0.5)
     r.key(F6, 0.6).expect("saved painted form")
     r.key(ESC, 0.4).key(ESC, 0.5)
     r.key(ENTER, 0.6)                                 # browse orders
