@@ -870,8 +870,18 @@ impl DbLink for EmbeddedDb {
             self.conn.execute_batch(sql).map_err(|e| e.to_string())?;
             return Ok((-1, start.elapsed()));
         }
+        // sqlite3_changes retains the last DML count across BEGIN,
+        // COMMIT and DDL. Report zero when this statement did no writes.
+        let before = self.conn.total_changes();
         match self.conn.execute(sql, []) {
-            Ok(n) => Ok((n as i64, start.elapsed())),
+            Ok(n) => Ok((
+                if self.conn.total_changes() == before {
+                    0
+                } else {
+                    n as i64
+                },
+                start.elapsed(),
+            )),
             Err(e) => Err(e.to_string()),
         }
     }
