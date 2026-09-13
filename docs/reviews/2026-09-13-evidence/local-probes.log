@@ -1,0 +1,126 @@
+   Compiling phosphor v0.1.0 (/var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.76s
+     Running unittests src/main.rs (target/debug/deps/phosphor-32554611a8bc5ba2)
+
+running 20 tests
+
+thread 'review_tests::review_pragma_query_works' (346842269) panicked at src/review_tests.rs:121:2:
+global LIMIT rewriting makes PRAGMA syntax invalid
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'review_tests::review_shadowed_rowid_does_not_modify_multiple_rows' (346842275) panicked at src/review_tests.rs:135:2:
+assertion `left != right` failed: both rows were modified despite expected-one-row error
+  left: Int(2)
+ right: Int(2)
+test review_tests::review_pragma_query_works ... FAILED
+
+thread 'review_tests::review_import_malformed_csv_rolls_back' (346842262) panicked at src/review_tests.rs:42:2:
+assertion `left == right` failed: import failed but left inserted rows in transaction: import: csv record: CSV error: record 2 (line: 3, byte: 21): found record with 1 fields, but the previous record has 2 fields
+  left: 1
+ right: 0
+test review_tests::review_shadowed_rowid_does_not_modify_multiple_rows ... FAILED
+test review_tests::review_import_malformed_csv_rolls_back ... FAILED
+
+thread 'review_tests::review_lua_cannot_write_host_files' (346842266) panicked at src/review_tests.rs:145:2:
+sandboxed Lua wrote a host file; script result=Ok(Outcome { messages: ["script: ok"], error: None, effects: [] })
+test review_tests::review_lua_cannot_write_host_files ... FAILED
+
+thread 'review_tests::review_rebuild_preserves_schema' (346842273) panicked at src/review_tests.rs:53:2:
+duplicate accepted=true, CHECK violation accepted=true, triggers=Int(0)
+test review_tests::review_rebuild_preserves_schema ... FAILED
+
+thread 'review_tests::review_help_restores_draft' (346842261) panicked at src/review_tests.rs:67:2:
+F1 then Esc discarded the table draft
+
+thread 'review_tests::review_unchanged_default_is_noop' (346842289) panicked at src/review_tests.rs:60:2:
+unchanged table schedules rebuild: ["PRAGMA foreign_keys = OFF", "BEGIN", "CREATE TABLE \"__phosphor_rebuild\" (\n  \"id\" INTEGER PRIMARY KEY,\n  \"status\" TEXT DEFAULT '''new'''\n)", "INSERT INTO \"__phosphor_rebuild\" (\"id\", \"status\") SELECT \"id\", \"status\" FROM \"t\"", "DROP TABLE \"t\"", "ALTER TABLE \"__phosphor_rebuild\" RENAME TO \"t\"", "COMMIT", "PRAGMA foreign_key_check", "PRAGMA foreign_keys = ON"]
+test review_tests::review_help_restores_draft ... FAILED
+test review_tests::review_unchanged_default_is_noop ... FAILED
+
+thread 'review_tests::review_generated_columns_align_with_values' (346842260) panicked at src/review_tests.rs:82:2:
+assertion `left == right` failed: generated column caused positional mismatch
+  left: Int(5)
+ right: Text("Alice")
+test review_tests::review_generated_columns_align_with_values ... FAILED
+
+thread 'review_tests::review_picker_reaches_customer_201' (346842268) panicked at src/review_tests.rs:89:2:
+picker offers only 200 customers, with no search or paging
+test review_tests::review_picker_reaches_customer_201 ... FAILED
+
+thread 'review_tests::review_no_sql_crm_starts_on_name' (346842267) panicked at src/review_tests.rs:128:2:
+documented type Ada, Enter path types into id: Some(("datatype mismatch", true))
+test review_tests::review_no_sql_crm_starts_on_name ... FAILED
+
+thread 'review_tests::review_qbe_run_keeps_design' (346842270) panicked at src/review_tests.rs:176:2:
+run discards query filters, reopening starts over
+test review_tests::review_qbe_run_keeps_design ... FAILED
+
+thread 'review_tests::review_readonly_rejects_cte_write' (346842272) panicked at src/review_tests.rs:96:2:
+assertion `left == right` failed: read-only database accepted a write through query path
+  left: 1
+ right: 0
+test review_tests::review_readonly_rejects_cte_write ... FAILED
+
+thread 'review_tests::review_readonly_prefs_do_not_mutate_db' (346842271) panicked at src/review_tests.rs:102:2:
+read-only session created metadata tables and stored preferences
+test review_tests::review_readonly_prefs_do_not_mutate_db ... FAILED
+
+thread 'review_tests::review_insert_keeps_inserted_identity' (346842263) panicked at src/review_tests.rs:154:2:
+assertion `left == right` failed: successful insert switched editable form to unrelated last row
+  left: 100
+ right: 50
+test review_tests::review_insert_keeps_inserted_identity ... FAILED
+
+thread 'review_tests::review_status_error_visible_with_long_path' (346842288) panicked at src/review_tests.rs:161:2:
+long database name hides validation error
+test review_tests::review_status_error_visible_with_long_path ... FAILED
+
+thread 'review_tests::review_report_preview_returns_to_designer' (346842274) panicked at src/review_tests.rs:75:2:
+preview then Esc discarded report designer
+test review_tests::review_report_preview_returns_to_designer ... FAILED
+
+thread 'review_tests::review_long_form_keeps_field_visible' (346842264) panicked at src/review_tests.rs:116:2:
+selected field is below viewport and form never scrolls
+test review_tests::review_long_form_keeps_field_visible ... FAILED
+
+thread 'review_tests::review_split_enter_edits_selected_child' (346842276) panicked at src/review_tests.rs:168:2:
+Enter in focused order pane opened parent record
+test review_tests::review_split_enter_edits_selected_child ... FAILED
+
+thread 'review_tests::review_long_sidebar_keeps_selected_table_visible' (346842265) panicked at src/review_tests.rs:109:2:
+selected sidebar table 35 is below viewport and list never scrolls
+test review_tests::review_long_sidebar_keeps_selected_table_visible ... FAILED
+
+thread 'review_tests::review_export_all_rows' (346842259) panicked at src/review_tests.rs:34:2:
+assertion `left == right` failed: exported 10000 row(s) from "t" to "/var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-export.csv"
+  left: 10000
+ right: 10001
+test review_tests::review_export_all_rows ... FAILED
+
+failures:
+
+failures:
+    review_tests::review_export_all_rows
+    review_tests::review_generated_columns_align_with_values
+    review_tests::review_help_restores_draft
+    review_tests::review_import_malformed_csv_rolls_back
+    review_tests::review_insert_keeps_inserted_identity
+    review_tests::review_long_form_keeps_field_visible
+    review_tests::review_long_sidebar_keeps_selected_table_visible
+    review_tests::review_lua_cannot_write_host_files
+    review_tests::review_no_sql_crm_starts_on_name
+    review_tests::review_picker_reaches_customer_201
+    review_tests::review_pragma_query_works
+    review_tests::review_qbe_run_keeps_design
+    review_tests::review_readonly_prefs_do_not_mutate_db
+    review_tests::review_readonly_rejects_cte_write
+    review_tests::review_rebuild_preserves_schema
+    review_tests::review_report_preview_returns_to_designer
+    review_tests::review_shadowed_rowid_does_not_modify_multiple_rows
+    review_tests::review_split_enter_edits_selected_child
+    review_tests::review_status_error_visible_with_long_path
+    review_tests::review_unchanged_default_is_noop
+
+test result: FAILED. 0 passed; 20 failed; 0 ignored; 0 measured; 149 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--bin phosphor`

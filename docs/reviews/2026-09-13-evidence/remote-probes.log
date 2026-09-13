@@ -1,0 +1,33 @@
+   Compiling phosphor v0.1.0 (/var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.03s
+     Running unittests src/main.rs (target/debug/deps/phosphor-32554611a8bc5ba2)
+
+running 3 tests
+
+thread 'review_tests::review_remote_semicolon_literal' (346852922) panicked at src/review_tests.rs:186:2:
+ordinary quoted semicolon was split as SQL: Err("unrecognized token: \"'Ada\"")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test review_tests::review_remote_semicolon_literal ... FAILED
+
+thread 'review_tests::review_remote_failed_batch_is_atomic' (346852920) panicked at src/review_tests.rs:201:2:
+assertion `left == right` failed: pipeline kept executing COMMIT after failed statement
+  left: 1
+ right: 0
+test review_tests::review_remote_failed_batch_is_atomic ... FAILED
+
+thread 'review_tests::review_remote_import_atomic' (346852921) panicked at src/review_tests.rs:194:2:
+assertion `left == right` failed: failed remote import partially committed: import: row 2: UNIQUE constraint failed: remote_csv.id
+  left: 1
+ right: 0
+test review_tests::review_remote_import_atomic ... FAILED
+
+failures:
+
+failures:
+    review_tests::review_remote_failed_batch_is_atomic
+    review_tests::review_remote_import_atomic
+    review_tests::review_remote_semicolon_literal
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 169 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--bin phosphor`

@@ -1,0 +1,30 @@
+┌ Data ────────────────┐┌ BROWSE customers ────────────────────────────────────────────────────────┐
+│▪ customers           ││id   name     city      balance                                           │
+│▪ notes               ││1    Ada      Testville 120.5                                             │
+│▪ orders              ││2    Grace    Arlington 80.0                                              │
+│▪ people              ││3    Edsger   Austin    200.0                                             │
+│  … 4 internal (i)    ││4    Barbara  London    310.0                                             │
+│                      ││5    Donald   Austin    45.5                                              │
+│                    ┌ NEW customers record ──────────────────────────────────┐                    │
+│                    │                  CUSTOMER CARD                         │                    │
+│                    │ ┌──────────────────────────────────────────────────┐   │                    │
+│                    │ │                                                  │   │                    │
+│                    │ │  Name: ∅                                         │   │                    │
+│                    │ │                                                  │   │                    │
+│                    │ │  City: ∅                                         │   │                    │
+│                    │ │                                                  │   │                    │
+│                    │ │  Balance: ∅                                      │   │                    │
+│                    │ │                                                  │   │                    │
+│                    │ │                                                  │   │                    │
+│                    │ │                                                  │   │                    │
+│                    │ └──────────────────────────────────────────────────┘   │                    │
+│                    │                                                        │                    │
+│                    │                                                        │                    │
+│                    └ type to edit · ↑↓/Tab field · Enter save · PgUp/PgDn re┘                    │
+│                      ││                                                                          │
+│                      ││                                                                          │
+│                      ││                                                                          │
+│                      ││                                                                          │
+└──────────────────────┘└──────────────────────────────────────────────────────────────────────────┘
+ .                                                                                                  
+ /var/folders/yk/nytf9f6d6g13fg7xmwv0x70m0000gn/T/phosphor-review-1ki21fcp/ui.row 1/8 · id  0.1ms ○ 
