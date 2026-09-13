@@ -331,9 +331,10 @@ indent, F6 saves, Esc closes without saving). In the
 Applications Generator, E opens the same editor on the selected
 script menu item.
 
-Sandbox: a 32 MB heap cap and an instruction budget stop runaway
-scripts. A script reaches the database, never the filesystem or
-the network.
+Sandbox: a 32 MB heap cap and an instruction budget limit runaway
+scripts. Lua's math, string, table, and utf8 libraries are available.
+File, process, and network APIs, module/script loading, and
+coroutines are unavailable. Use the database and ui helpers above.
 ```
 
 ## The DBHEALTH console

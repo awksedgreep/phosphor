@@ -24,7 +24,7 @@
 
 use std::cell::RefCell;
 
-use mlua::{Lua, Value};
+use mlua::{Lua, LuaOptions, StdLib, Value};
 
 use crate::db::{DbLink, DbResult, PValue, QueryResult};
 use crate::store;
@@ -250,16 +250,29 @@ fn sql_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-/// A fresh sandbox with the resource caps applied.
-fn engine() -> Lua {
-    let lua = Lua::new();
+/// A fresh sandbox with only in-memory libraries and the resource caps.
+fn engine() -> mlua::Result<Lua> {
+    // mlua's ALL_SAFE means safe for Rust, not isolated from the host:
+    // it includes io, os, and package. Load only the libraries scripts
+    // need for calculations and formatting. Coroutines are omitted
+    // because the instruction hook below belongs to the main thread.
+    let lua = Lua::new_with(
+        StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::MATH,
+        LuaOptions::default(),
+    )?;
+    // The base library is always loaded, including its file loaders.
+    // Host code loads the authored script; scripts cannot load files
+    // or dynamically supplied chunks themselves.
+    for name in ["dofile", "loadfile", "load"] {
+        lua.globals().set(name, Value::Nil)?;
+    }
     // 32 MB of Lua heap is plenty for a menu action.
-    let _ = lua.set_memory_limit(32 * 1024 * 1024);
+    lua.set_memory_limit(32 * 1024 * 1024)?;
     lua.set_hook(
         mlua::HookTriggers::new().every_nth_instruction(200_000),
         |_lua, _debug| Err(mlua::Error::RuntimeError("script exceeded budget".into())),
     );
-    lua
+    Ok(lua)
 }
 
 /// Register the queued `ui` table inside a `lua.scope` block. A macro
@@ -486,7 +499,7 @@ macro_rules! install_host {
 /// Run `source` as a menu/standalone action. Returns the transcript and
 /// any queued effects.
 pub fn run(db: &dyn DbLink, source: &str) -> Result<Outcome, String> {
-    let lua = engine();
+    let lua = engine().map_err(|e| e.to_string())?;
     let messages: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let effects: RefCell<Vec<Effect>> = RefCell::new(Vec::new());
 
@@ -521,7 +534,7 @@ pub fn run_form_event(
     field: Option<&str>,
     inserting: bool,
 ) -> Result<Outcome, String> {
-    let lua = engine();
+    let lua = engine().map_err(|e| e.to_string())?;
     let messages: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let effects: RefCell<Vec<Effect>> = RefCell::new(Vec::new());
     let failure: RefCell<Option<String>> = RefCell::new(None);
@@ -652,6 +665,59 @@ mod tests {
         let db = db();
         let err = run(&db, "while true do end").unwrap_err();
         assert!(err.contains("budget"), "{err}");
+    }
+
+    #[test]
+    fn sandbox_excludes_host_and_loading_capabilities_in_both_runners() {
+        let db = db();
+        let source = r#"
+            for _, name in ipairs({
+                "io", "os", "package", "require", "debug", "ffi",
+                "loadfile", "dofile", "load", "coroutine"
+            }) do
+                assert(_G[name] == nil, name .. " must not be available")
+            end
+            local values = {string.upper(trim("  ada  ")), "Grace"}
+            table.sort(values)
+            assert(math.floor(4.5) == 4)
+            assert(utf8.len("café") == 4)
+            assert(json.decode(json.encode(values))[1] == "ADA")
+            assert(scalar("SELECT 6 * 7") == 42)
+            ui.browse("t")
+            say(table.concat(values, ", "))
+        "#;
+        let menu = run(&db, source).unwrap();
+        assert_eq!(menu.messages, ["ADA, Grace"]);
+        assert_eq!(menu.effects, [Effect::Browse("t".into())]);
+
+        let mut record = vec![("name".into(), PValue::Text("Ada".into()))];
+        let form = run_form_event(&db, source, &mut record, Some("name"), true).unwrap();
+        assert_eq!(form.messages, menu.messages);
+        assert_eq!(form.effects, menu.effects);
+        assert!(form.error.is_none());
+    }
+
+    #[test]
+    fn sandbox_rejects_file_writes_and_file_loading() {
+        let db = db();
+        let path = std::env::temp_dir().join(format!(
+            "phosphor-script-sandbox-{}.lua",
+            std::process::id()
+        ));
+        std::fs::write(&path, "return 'host-file-executed'").unwrap();
+        let quoted = serde_json::to_string(path.to_str().unwrap()).unwrap();
+        let attempts = [
+            format!("local f = io.open({quoted}, 'w'); f:write('changed'); f:close()"),
+            format!("return dofile({quoted})"),
+            format!("return loadfile({quoted})()"),
+        ];
+        for source in attempts {
+            let result = run(&db, &source);
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert!(result.is_err(), "unexpected host access: {source}");
+            assert_eq!(contents, "return 'host-file-executed'");
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
