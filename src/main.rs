@@ -14,6 +14,7 @@ mod csv_io;
 mod db;
 mod forms;
 mod help;
+mod operation;
 mod output;
 mod picker;
 mod qbe;
@@ -175,6 +176,8 @@ fn main() -> std::io::Result<()> {
         ratatui::crossterm::event::EnableMouseCapture
     );
     let result = loop {
+        // A reply may have arrived while the last frame was being drawn.
+        app.pump();
         // Dirty-flag redraw: the screen is static between commands, so
         // idle 250ms ticks skip the full render. A viewport change
         // repaints once more so paging math matches the new size.
@@ -196,7 +199,7 @@ fn main() -> std::io::Result<()> {
         let mut first = true;
         loop {
             let ready = if first {
-                event::poll(std::time::Duration::from_millis(250))
+                event::poll(app.poll_timeout())
             } else {
                 event::poll(std::time::Duration::ZERO)
             };
@@ -208,10 +211,6 @@ fn main() -> std::io::Result<()> {
                             // The command bus: every action goes through
                             // apply() (DESIGN.md, "Building scripting-ready").
                             app.apply(cmd);
-                        }
-                        budget -= 1;
-                        if budget == 0 || app.quit {
-                            break;
                         }
                     }
                     // A resize paints nothing by itself — flag it so the
@@ -226,6 +225,12 @@ fn main() -> std::io::Result<()> {
                 },
                 Ok(false) => break,
                 Err(e) => return finish(terminal, Err(e)),
+            }
+            // Mouse motion and resize floods must yield to worker replies
+            // and redraws too, not just keyboard repeat.
+            budget -= 1;
+            if budget == 0 || app.quit {
+                break;
             }
         }
         app.tick();

@@ -33,3 +33,5 @@ jobs:
         run: cargo test --release perf_budget
       - name: build release
         run: cargo build --release
+      - name: terminal response latency and slow output cancellation
+        run: python3 tools/test_latency.py

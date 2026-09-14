@@ -198,6 +198,7 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
     draw_prompt(f, app, prompt_line);
 
     match &app.overlay {
+        Overlay::Busy(_) => draw_busy(f, app),
         Overlay::SaveDatabase(_) => draw_save_database(f, app),
         Overlay::Help(_) => draw_help(f, app),
         Overlay::Edit(_) => draw_edit(f, app),
@@ -394,6 +395,40 @@ fn draw_save_database(f: &mut Frame, app: &App) {
             Line::from(editing_span(path, inner.width.saturating_sub(1), app.theme)),
         ]),
         input,
+    );
+}
+
+fn draw_busy(f: &mut Frame, app: &App) {
+    let Overlay::Busy(b) = &app.overlay else {
+        return;
+    };
+    let area = centered(dialog_area(f.area()), 66, 10);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(app.theme.base())
+        .border_style(app.theme.bright())
+        .title(format!(" {} ", b.label))
+        .title_bottom(" Esc cancel · F1 help · Ctrl-Q quit ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let lines = vec![
+        Line::raw(if b.control.cancelled() {
+            "Cancelling; waiting for the database to finish."
+        } else {
+            "Working; your previous screen is kept."
+        }),
+        Line::raw(format!(
+            "{} rows read · {}s elapsed",
+            b.control.rows(),
+            b.started.elapsed().as_secs()
+        )),
+        Line::raw(""),
+        Line::raw("F1 Help and F12 details remain available."),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
     );
 }
 

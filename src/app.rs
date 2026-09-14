@@ -40,6 +40,7 @@ pub enum Focus {
 #[allow(clippy::large_enum_variant)]
 pub enum Overlay {
     None,
+    Busy(BusyState),
     SaveDatabase(String),
     Help(HelpState),
     Edit(EditState),
@@ -54,6 +55,15 @@ pub enum Overlay {
     AppMenu(AppMenuState),
     /// The multi-line Lua editor for a form lifecycle script.
     ScriptEditor(ScriptState),
+}
+
+pub struct BusyState {
+    pub label: String,
+    pub control: crate::operation::Control,
+    pub started: std::time::Instant,
+    tag: crate::worker::Token,
+    previous: Box<Overlay>,
+    progress: (usize, u64),
 }
 
 struct PreviewReturn {
@@ -565,6 +575,9 @@ pub enum Command {
 /// The single worker answers FIFO. QBE also tracks cancellation so a
 /// result cannot replace a revised or closed design.
 enum PendingOp {
+    Output {
+        preview: bool,
+    },
     /// Table open: build + swap in a fresh grid on arrival.
     Open {
         name: String,
@@ -705,6 +718,7 @@ pub struct App {
     pane_cache: HashMap<(String, String, String), LinkPane>,
     /// Outstanding async worker jobs by token (finish_db routes answers).
     pending: HashMap<crate::worker::Token, PendingOp>,
+    deferred: Vec<(crate::worker::Token, std::time::Duration, DbResponse)>,
     /// Latest in-flight scroll window (token, table, want_start): older
     /// arrivals drop, so hold-to-fly converges on the newest window.
     pending_page: Option<(crate::worker::Token, String, i64)>,
@@ -777,6 +791,7 @@ impl App {
             fks_cache: HashMap::new(),
             pane_cache: HashMap::new(),
             pending: HashMap::new(),
+            deferred: Vec::new(),
             pending_page: None,
             pending_detail: None,
             pending_edit: None,
@@ -811,9 +826,44 @@ impl App {
     /// iteration (unarrived responses apply on a later tick). Tests
     /// needing determinism use sync() instead.
     pub fn pump(&mut self) {
-        for (tag, took, resp) in self.db.poll() {
+        let mut replies = if self.busy_tag().is_none() {
+            std::mem::take(&mut self.deferred)
+        } else {
+            Vec::new()
+        };
+        replies.extend(self.db.poll());
+        for (tag, took, resp) in replies {
+            if self.busy_tag().is_some_and(|busy| busy != tag) {
+                // Some old continuations read preferences synchronously. They
+                // must not wait behind the output job and block its Cancel UI.
+                self.deferred.push((tag, took, resp));
+                continue;
+            }
             self.apply(Command::DbReady(tag, took, resp));
         }
+    }
+
+    fn busy_tag(&self) -> Option<crate::worker::Token> {
+        match &self.overlay {
+            Overlay::Busy(b) => Some(b.tag),
+            Overlay::Help(_) => match &self.help_return {
+                Some(Overlay::Busy(b)) => Some(b.tag),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Pending work should appear within a frame, without polling a static
+    /// idle screen at that rate. A viewport repaint must not wait either.
+    pub fn poll_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(if self.dirty {
+            0
+        } else if self.pending.is_empty() {
+            250
+        } else {
+            8
+        })
     }
 
     /// Blocking drain for tests: parks (briefly) until every pending
@@ -871,6 +921,11 @@ impl App {
     ) {
         if matches!(resp, DbResponse::Gone) {
             self.pending.remove(&tag);
+            if matches!(&self.overlay, Overlay::Busy(b) if b.tag == tag) {
+                if let Overlay::Busy(b) = std::mem::replace(&mut self.overlay, Overlay::None) {
+                    self.overlay = *b.previous;
+                }
+            }
             self.err("database worker is gone");
             return;
         }
@@ -878,6 +933,49 @@ impl App {
             return;
         };
         match (op, resp) {
+            (PendingOp::Output { preview }, DbResponse::Output(result)) => {
+                if !matches!(&self.overlay, Overlay::Busy(b) if b.tag == tag) {
+                    return;
+                }
+                let Overlay::Busy(b) = std::mem::replace(&mut self.overlay, Overlay::None) else {
+                    unreachable!()
+                };
+                self.overlay = *b.previous;
+                self.last_ms = Some(took.as_secs_f64() * 1000.0);
+                if b.control.cancelled() {
+                    match result {
+                        Err(error)
+                            if error.contains("transaction outcome")
+                                || (!error.contains("cancelled")
+                                    && !error.contains("interrupted")) =>
+                        {
+                            self.err(error)
+                        }
+                        _ => self.say("operation cancelled · previous work retained"),
+                    }
+                    return;
+                }
+                match result {
+                    Ok(crate::operation::Output::Pager {
+                        title,
+                        lines,
+                        file_stem,
+                    }) => {
+                        if preview {
+                            self.park_preview();
+                        }
+                        self.overlay = Overlay::Pager(PagerState {
+                            title,
+                            lines,
+                            file_stem,
+                            offset: 0,
+                        });
+                        self.say("ready · w writes a file · Esc returns");
+                    }
+                    Ok(crate::operation::Output::Message(message)) => self.say(message),
+                    Err(error) => self.err(error),
+                }
+            }
             (PendingOp::Picker, DbResponse::Picker(result)) => {
                 let Overlay::Edit(ed) = &mut self.overlay else {
                     return;
@@ -1408,6 +1506,9 @@ impl App {
                 _ => return None,
             });
         }
+        if matches!(self.overlay, Overlay::Busy(_)) {
+            return (key.code == Esc).then_some(Command::Back);
+        }
         if let Overlay::Edit(ed) = &self.overlay {
             // Search input is explicit, so browsing retains j/k shortcuts.
             if let Some(p) = &ed.picker {
@@ -1891,6 +1992,19 @@ impl App {
         // The command bus is the ONLY place state changes, so one flag
         // here drives the main loop's dirty-flag redraw (main.rs).
         self.dirty = true;
+        if matches!(self.overlay, Overlay::Busy(_))
+            && !matches!(
+                cmd,
+                Command::DbReady(..)
+                    | Command::Quit
+                    | Command::Back
+                    | Command::Help
+                    | Command::StatusDetails
+                    | Command::StatusScroll(_)
+            )
+        {
+            return;
+        }
         // An edited/cancelled QBE must not be replaced by an older result.
         if !matches!(
             cmd,
@@ -2469,19 +2583,7 @@ impl App {
                 None => self.err(format!("no saved query named {name:?}")),
             },
             Command::OpenSavedReport(name) => {
-                let spec = ReportSpec::load(self.db.link(), &name)
-                    .unwrap_or_else(|| ReportSpec::for_table(&name));
-                match report::render(self.db.link(), &spec) {
-                    Ok(lines) => {
-                        self.overlay = Overlay::Pager(PagerState {
-                            title: format!("REPORT · {}", spec.title),
-                            lines,
-                            offset: 0,
-                            file_stem: format!("report_{}", spec.name),
-                        })
-                    }
-                    Err(e) => self.err(e),
-                }
+                self.start_report(None, name);
             }
             Command::OpenFormScript { table, event } => self.open_form_script(table, event),
             Command::OpenSelectedScript => self.open_selected_item_script(),
@@ -2573,6 +2675,15 @@ impl App {
             self.overlay = self.help_return.take().unwrap_or(Overlay::None);
             return;
         }
+        if let Overlay::Busy(b) = &self.overlay {
+            let cancelled = b.control.cancel();
+            self.say(if cancelled {
+                "cancelling · waiting for the database · Ctrl-Q quits"
+            } else {
+                "finishing file publication · Ctrl-Q quits"
+            });
+            return;
+        }
         if !self.preview_returns.is_empty()
             && (matches!(self.overlay, Overlay::Pager(_) | Overlay::AppMenu(_))
                 || (matches!(self.overlay, Overlay::None) && self.focus != Focus::Prompt))
@@ -2649,6 +2760,7 @@ impl App {
             }
             Overlay::ScriptEditor(_) => self.close_script_editor(),
             Overlay::Edit(_)
+            | Overlay::Busy(_)
             | Overlay::SaveDatabase(_)
             | Overlay::Help(_)
             | Overlay::Health(_)
@@ -2757,6 +2869,13 @@ impl App {
     /// passive vtab never samples itself (that is the design), so the
     /// open console volunteers as the collector.
     pub fn tick(&mut self) {
+        if let Overlay::Busy(b) = &mut self.overlay {
+            let progress = (b.control.rows(), b.started.elapsed().as_secs());
+            if b.progress != progress {
+                b.progress = progress;
+                self.dirty = true;
+            }
+        }
         if matches!(self.overlay, Overlay::Health(_))
             && self.last_auto_sample.elapsed() >= std::time::Duration::from_secs(5)
         {
@@ -2769,6 +2888,7 @@ impl App {
     /// F1: open help on the topic for wherever the user is right now.
     fn open_help(&mut self) {
         let key = match &self.overlay {
+            Overlay::Busy(_) => "operations",
             Overlay::SaveDatabase(_) => "files",
             Overlay::Edit(_) => "browse",
             Overlay::Health(_) => "health",
@@ -3167,17 +3287,59 @@ impl App {
         let Some(table) = self.target_table(table) else {
             return self.err("labels: no table selected (labels <table>)");
         };
-        match report::labels(self.db.link(), &table) {
-            Ok(lines) => {
-                self.overlay = Overlay::Pager(PagerState {
-                    title: format!("LABELS · {table}"),
-                    lines,
-                    offset: 0,
-                    file_stem: format!("labels_{table}"),
-                })
-            }
-            Err(e) => self.err(e),
-        }
+        self.start_output("Preparing labels", false, move |db, control| {
+            Ok(crate::operation::Output::Pager {
+                title: format!("LABELS · {table}"),
+                lines: report::labels_controlled(db, &table, control)?,
+                file_stem: format!("labels_{table}"),
+            })
+        });
+    }
+
+    fn start_output<F>(&mut self, label: &str, preview: bool, mut work: F)
+    where
+        F: FnMut(
+                &mut dyn DbLink,
+                &crate::operation::Control,
+            ) -> crate::db::DbResult<crate::operation::Output>
+            + Send
+            + 'static,
+    {
+        let control = crate::operation::Control::default();
+        let progress = control.clone();
+        let Some(tag) = self.db.submit(Box::new(move |db| {
+            db.read_cancellation(Some(progress.clone()));
+            let result = progress.check().and_then(|_| work(db, &progress));
+            db.read_cancellation(None);
+            DbResponse::Output(result)
+        })) else {
+            return self.err("database worker is gone");
+        };
+        let previous = Box::new(std::mem::replace(&mut self.overlay, Overlay::None));
+        self.overlay = Overlay::Busy(BusyState {
+            label: label.into(),
+            control,
+            tag,
+            previous,
+            started: std::time::Instant::now(),
+            progress: (0, 0),
+        });
+        self.pending.insert(tag, PendingOp::Output { preview });
+        self.say(format!("{label} · Esc cancel · F1 help"));
+    }
+
+    fn start_report(&mut self, spec: Option<ReportSpec>, name: String) {
+        let preview = matches!(self.overlay, Overlay::Report(_) | Overlay::AppMenu(_));
+        self.start_output("Preparing report", preview, move |db, control| {
+            let spec = spec.clone().unwrap_or_else(|| {
+                ReportSpec::load(db, &name).unwrap_or_else(|| ReportSpec::for_table(&name))
+            });
+            Ok(crate::operation::Output::Pager {
+                title: format!("REPORT · {}", spec.title),
+                lines: report::render_controlled(db, &spec, control)?,
+                file_stem: format!("report_{}", spec.name),
+            })
+        });
     }
 
     fn designer_page(&mut self, d: i64, edge: Option<bool>) {
@@ -3688,18 +3850,7 @@ impl App {
             }
             Overlay::Report(st) => {
                 let spec = st.spec.clone();
-                match report::render(self.db.link(), &spec) {
-                    Ok(lines) => {
-                        self.park_preview();
-                        self.overlay = Overlay::Pager(PagerState {
-                            title: format!("REPORT · {}", spec.title),
-                            lines,
-                            offset: 0,
-                            file_stem: format!("report_{}", spec.name),
-                        })
-                    }
-                    Err(e) => self.err(e),
-                }
+                self.start_report(Some(spec), String::new());
             }
             Overlay::Apps(st) => {
                 let app = st.app.clone();
@@ -3775,10 +3926,7 @@ impl App {
     fn app_run_item(&mut self, item: &AppItem) {
         if !self.preview_returns.is_empty()
             && matches!(self.overlay, Overlay::AppMenu(_))
-            && matches!(
-                item.kind,
-                ActionKind::Browse | ActionKind::Query | ActionKind::Report
-            )
+            && matches!(item.kind, ActionKind::Browse | ActionKind::Query)
         {
             self.park_preview();
         }
@@ -3803,19 +3951,7 @@ impl App {
                 )),
             },
             ActionKind::Report => {
-                let spec = ReportSpec::load(self.db.link(), &item.action_ref)
-                    .unwrap_or_else(|| ReportSpec::for_table(&item.action_ref));
-                match report::render(self.db.link(), &spec) {
-                    Ok(lines) => {
-                        self.overlay = Overlay::Pager(PagerState {
-                            title: format!("REPORT · {}", spec.title),
-                            lines,
-                            offset: 0,
-                            file_stem: format!("report_{}", spec.name),
-                        })
-                    }
-                    Err(e) => self.err(e),
-                }
+                self.start_report(None, item.action_ref.clone());
             }
             ActionKind::Sql => {
                 if self.readonly {
@@ -6628,10 +6764,11 @@ impl App {
             self.err("usage: export <table|SELECT> <path>");
             return;
         }
-        match crate::csv_io::export_csv(self.db.link(), source, path) {
-            Ok(msg) => self.say(msg),
-            Err(e) => self.err(e),
-        }
+        let (source, path) = (source.to_owned(), path.to_owned());
+        self.start_output("Exporting CSV", false, move |db, control| {
+            crate::csv_io::export_controlled(db, &source, &path, control)
+                .map(crate::operation::Output::Message)
+        });
     }
 
     /// `script <table> <event> <lua>` — bind a form lifecycle script.
@@ -7270,6 +7407,7 @@ pub(crate) fn assert_builder_workflow(connect: impl Fn() -> Box<dyn DbLink>) {
         st.cursor = 2;
     }
     a.apply(Command::DesignerRun);
+    a.sync();
     assert!(matches!(a.overlay, Overlay::Pager(_)));
     a.apply(Command::Back);
     assert!(
@@ -7679,6 +7817,147 @@ pub(crate) fn assert_first_entry_workflow(db: Box<dyn DbLink>) {
 mod tests {
     use super::*;
     use crate::db::EmbeddedDb;
+
+    #[test]
+    fn cancelling_an_embedded_read_preserves_the_callers_transaction() {
+        crate::test_support::assert_cancelled_read_keeps_transaction(
+            &EmbeddedDb::open(":memory:").unwrap().0,
+        );
+    }
+
+    #[test]
+    fn cancelling_a_remote_read_preserves_the_callers_transaction() {
+        let server = crate::test_support::HranaFixture::new(false);
+        crate::test_support::assert_cancelled_read_keeps_transaction(
+            &crate::remote::RemoteDb::open(&server.url).unwrap(),
+        );
+    }
+
+    #[test]
+    fn slow_output_keeps_help_and_drafts_and_can_be_cancelled() {
+        let mut a = app();
+        a.open_report(Some("t".into()));
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        a.start_output("Preparing report", true, move |db, control| {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            Ok(crate::operation::Output::Pager {
+                title: "cancelled result".into(),
+                file_stem: "cancelled".into(),
+                lines: report::render_controlled(db, &ReportSpec::for_table("t"), control)?,
+            })
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        a.dirty = false;
+        assert_eq!(a.poll_timeout(), std::time::Duration::from_millis(8));
+        a.apply(Command::Help);
+        assert!(render_at(&mut a, 80, 24).contains("HELP"));
+        a.apply(Command::StatusDetails);
+        assert!(render_at(&mut a, 40, 12).contains("STATUS & CONNECTION"));
+        a.apply(Command::Back);
+        a.apply(Command::Back);
+        assert!(render_at(&mut a, 40, 12).contains("rows read"));
+        a.apply(Command::OpenInsert); // must not wait for the occupied worker
+        assert!(matches!(a.overlay, Overlay::Busy(_)));
+        a.apply(Command::Back);
+        assert!(a.status.as_ref().unwrap().0.contains("cancelling"));
+        release.send(()).unwrap();
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::Report(_)));
+        assert!(a.preview_returns.is_empty());
+        assert!(a.status.as_ref().unwrap().0.contains("cancelled"));
+        // Retry and complete while Help is open. Returning from Help reveals
+        // the finished preview, and Esc still restores the report designer.
+        a.apply(Command::DesignerRun);
+        a.apply(Command::Help);
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::Help(_)));
+        a.apply(Command::Back);
+        assert!(
+            matches!(&a.overlay, Overlay::Pager(p) if p.lines.join("\n").contains("TOTAL (500 rows)"))
+        );
+        a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::Report(_)));
+        a.sync();
+        a.dirty = false;
+        assert_eq!(a.poll_timeout(), std::time::Duration::from_millis(250));
+        // A cancellation request must not hide a real connection failure.
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = std::sync::mpsc::channel();
+        a.start_output("Preparing report", true, move |_, _| {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            Err("interrupted; remote transaction outcome unknown".into())
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        a.apply(Command::Back);
+        release.send(()).unwrap();
+        a.sync();
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(message, error)| *error && message.contains("outcome unknown")));
+    }
+
+    #[test]
+    fn worker_exit_resolves_queued_jobs_and_restores_the_progress_screen() {
+        let mut a = app();
+        a.open_report(Some("t".into()));
+        let (release, wait) = std::sync::mpsc::channel();
+        a.start_output("Preparing report", true, move |_, _| {
+            wait.recv().unwrap();
+            panic!("intentional worker failure");
+        });
+        let tag =
+            a.db.submit(Box::new(|db| DbResponse::Query(db.query("VALUES(42)"))))
+                .unwrap();
+        a.pending.insert(
+            tag,
+            PendingOp::Select {
+                seq: a.status_seq,
+                preview: false,
+            },
+        );
+        a.apply(Command::Help);
+        release.send(()).unwrap();
+        a.sync();
+        assert!(a.pending.is_empty());
+        assert!(matches!(a.overlay, Overlay::Help(_)));
+        a.apply(Command::Back);
+        assert!(matches!(a.overlay, Overlay::Report(_)));
+        assert!(a.status.as_ref().unwrap().0.contains("worker is gone"));
+        a.apply(Command::Quit);
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn old_read_completions_wait_until_output_releases_the_worker() {
+        let mut a = app();
+        a.open_table("t"); // its continuation includes synchronous preferences
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = std::sync::mpsc::channel();
+        a.start_output("Preparing labels", false, move |_, _| {
+            started.send(()).unwrap();
+            wait.recv().unwrap();
+            Ok(crate::operation::Output::Message("done".into()))
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        a.pump(); // must defer the old read instead of blocking on preferences
+        assert!(!a.deferred.is_empty());
+        a.apply(Command::Help);
+        release.send(()).unwrap();
+        a.sync();
+        assert!(matches!(a.overlay, Overlay::Help(_)));
+        assert_eq!(a.grid.as_ref().unwrap().total, 500);
+        assert!(a.deferred.is_empty());
+    }
 
     #[test]
     fn query_previews_preserve_sql_and_bound_results() {
@@ -8335,6 +8614,7 @@ mod tests {
             st.spec.source = "SELECT bad_column FROM t".into();
         }
         a.apply(Command::DesignerRun);
+        a.sync();
         assert!(a.status.as_ref().unwrap().1);
         assert!(matches!(&a.overlay, Overlay::Report(st) if st.spec.source.contains("bad_column")));
         a.open_qbe(Some("t".into()));
@@ -8428,6 +8708,7 @@ mod tests {
         let file = crate::test_support::TestDb::new();
         a.prompt.input = format!("export source {}", file.path());
         a.apply(Command::PromptRun);
+        a.sync();
         assert!(a
             .status
             .as_ref()
@@ -8438,6 +8719,7 @@ mod tests {
             file.path()
         );
         a.apply(Command::PromptRun);
+        a.sync();
         assert!(a
             .status
             .as_ref()
@@ -9207,6 +9489,7 @@ mod tests {
         a.apply(Command::OpenReport(Some("t".into())));
         assert!(matches!(a.overlay, Overlay::Report(_)));
         a.apply(Command::DesignerRun); // preview
+        a.sync();
         let Overlay::Pager(p) = &a.overlay else {
             panic!("expected pager");
         };
@@ -9242,6 +9525,7 @@ mod tests {
         };
         assert_eq!(st.spec.group_by.as_deref(), Some("substr(region,1,1)"));
         a.apply(Command::DesignerRun);
+        a.sync();
         let Overlay::Pager(p) = &a.overlay else {
             panic!("expected pager")
         };
@@ -10379,6 +10663,7 @@ mod tests {
         a.app_home = Some("demo".into());
         a.apply(Command::OpenAppMenu(Some("demo".into())));
         a.apply(Command::DesignerRun); // run the report → pager
+        a.sync();
         assert!(matches!(a.overlay, Overlay::Pager(_)));
         a.apply(Command::Back); // Esc: home means home
         assert!(

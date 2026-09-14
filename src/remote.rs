@@ -378,6 +378,9 @@ impl RemoteDb {
                 }
                 // An autocommit read owns this cursor. Stop after the lookahead
                 // row and close its stream; never abandon a caller's transaction.
+                if error.is_some() && previous.is_none() {
+                    break; // failed/cancelled output owns this stream; close it
+                }
                 if may_stop
                     && previous.is_none()
                     && error.is_none()
@@ -402,6 +405,12 @@ impl RemoteDb {
             }
             if !complete_response {
                 state.lost = true;
+                return Err(format!(
+                    "{}; remote transaction outcome unknown; reopen and check the database",
+                    result
+                        .err()
+                        .unwrap_or_else(|| "output response incomplete".into())
+                ));
             }
         } else if let Some(stream) = continuation {
             self.close_stream(&stream);
@@ -1051,6 +1060,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lost_output_reply_reports_unknown_transaction_and_is_not_replayed() {
+        let server = crate::test_support::HranaFixture::new(false);
+        let db = RemoteDb::open(&server.url).unwrap();
+        db.execute("CREATE TABLE lost_output(n); BEGIN; INSERT INTO lost_output VALUES(1)")
+            .unwrap();
+        server
+            .drop_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = db
+            .stream_query("SELECT * FROM lost_output", Box::new(|_| Ok(())))
+            .unwrap_err();
+        assert!(error.contains("transaction outcome unknown"), "{error}");
+        let before = server.executed.lock().unwrap().len();
+        assert!(db
+            .query("VALUES(42)")
+            .unwrap_err()
+            .contains("outcome unknown"));
+        assert_eq!(
+            server.executed.lock().unwrap().len(),
+            before,
+            "an uncertain transaction was retried"
+        );
+    }
+
+    #[test]
     fn remote_complete_outputs_include_rows_beyond_the_preview_cap() {
         let server = crate::test_support::HranaFixture::new(false);
         let db = RemoteDb::open(&server.url).unwrap();
@@ -1341,5 +1375,6 @@ mod tests {
         crate::app::assert_picker_workflow(Box::new(RemoteDb::open(url).unwrap()));
         crate::app::assert_query_preview_workflow(Box::new(RemoteDb::open(url).unwrap()));
         crate::app::assert_first_entry_workflow(Box::new(RemoteDb::open(url).unwrap()));
+        crate::test_support::assert_cancelled_read_keeps_transaction(&RemoteDb::open(url).unwrap());
     }
 }

@@ -118,20 +118,36 @@ fn rpad(s: &str, w: usize) -> String {
 
 /// Render the report to pageable text lines. Pure layout over DbLink
 /// data — the same render drives the screen pager and the file writer.
+#[cfg(test)]
 pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
+    render_controlled(db, spec, &crate::operation::Control::default())
+}
+
+pub fn render_controlled(
+    db: &dyn DbLink,
+    spec: &ReportSpec,
+    control: &crate::operation::Control,
+) -> DbResult<Vec<String>> {
     let crate::db::QueryResult {
         mut columns,
         mut rows,
         ..
-    } = db.query_complete(&spec.source_sql()?)?;
+    } = crate::operation::collect(db, &spec.source_sql()?, control)?;
 
     // Split the synthetic grouping column off before layout. `group_vals`
     // is then the band key per row; what remains are the real columns.
     let group_vals: Option<Vec<String>> =
         if spec.group_by.is_some() && columns.last().is_some_and(|c| c == GROUP_ALIAS) {
             let idx = columns.len() - 1;
-            let vals = rows.iter().map(|r| r[idx].render()).collect();
+            let vals = rows
+                .iter()
+                .map(|r| {
+                    control.check()?;
+                    Ok(r[idx].render())
+                })
+                .collect::<DbResult<Vec<_>>>()?;
             for r in rows.iter_mut() {
+                control.check()?;
                 r.pop();
             }
             columns.pop();
@@ -147,6 +163,7 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
     let mut numeric = vec![!rows.is_empty(); ncols];
     let mut grand = vec![0f64; ncols];
     for row in &rows {
+        control.check()?;
         for (i, v) in row.iter().enumerate() {
             match v {
                 PValue::Int(n) => grand[i] += *n as f64,
@@ -200,6 +217,7 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
     let mut rendered: Vec<Vec<String>> = Vec::with_capacity(rows.len());
     let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
     for row in &rows {
+        control.check()?;
         let mut r = Vec::with_capacity(ncols);
         for (i, v) in row.iter().enumerate() {
             let s = v.render();
@@ -286,6 +304,7 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
     // all (group keys and cells are reused strings). `grand` was already
     // accumulated in pass 1 — only group subtotals accrue here.
     for (ri, row) in rows.iter().enumerate() {
+        control.check()?;
         let rrow = &rendered[ri];
         if let (Some(label), Some(vals)) = (&group_label, &group_vals) {
             let g = vals[ri].as_str();
@@ -335,14 +354,24 @@ pub fn render(db: &dyn DbLink, spec: &ReportSpec) -> DbResult<Vec<String>> {
 
 /// The label writer: every visible column of each row becomes a line,
 /// three labels across — Avery 5160 energy, zero configuration.
+#[cfg(test)]
 pub fn labels(db: &dyn DbLink, table: &str) -> DbResult<Vec<String>> {
+    labels_controlled(db, table, &crate::operation::Control::default())
+}
+
+pub fn labels_controlled(
+    db: &dyn DbLink,
+    table: &str,
+    control: &crate::operation::Control,
+) -> DbResult<Vec<String>> {
     const ACROSS: usize = 3;
     const LABEL_W: usize = 32;
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-    let q = db.query_complete(&format!("SELECT * FROM {quoted}"))?;
+    let q = crate::operation::collect(db, &format!("SELECT * FROM {quoted}"), control)?;
     let per_label = q.columns.len().max(1) + 1; // + blank separator
     let mut out = Vec::new();
     for chunk in q.rows.chunks(ACROSS) {
+        control.check()?;
         for line_idx in 0..per_label {
             let mut line = String::with_capacity(ACROSS * LABEL_W);
             for row in chunk {

@@ -224,6 +224,9 @@ pub struct QueryResult {
 pub const QUERY_CAP: usize = 10_000;
 
 pub trait DbLink: Send {
+    /// Install only around a cancellable read job, then clear before the
+    /// next job. Backends without a VM hook check at streamed row boundaries.
+    fn read_cancellation(&self, _control: Option<crate::operation::Control>) {}
     fn backend(&self) -> &'static str;
     fn name(&self) -> &str;
     fn readonly(&self) -> bool;
@@ -260,6 +263,7 @@ pub trait DbLink: Send {
     /// End is delivered only after successful completion, including zero rows.
     fn stream_query(&self, sql: &str, sink: RowSink) -> DbResult<usize>;
     /// Layouts needing multiple passes retain the complete streamed result.
+    #[cfg(test)]
     fn query_complete(&self, sql: &str) -> DbResult<QueryResult> {
         let start = Instant::now();
         let data = std::sync::Arc::new(Mutex::new((Vec::new(), Vec::new())));
@@ -824,6 +828,14 @@ impl EmbeddedDb {
 }
 
 impl DbLink for EmbeddedDb {
+    fn read_cancellation(&self, control: Option<crate::operation::Control>) {
+        match control {
+            Some(control) => self
+                .conn
+                .progress_handler(1000, Some(move || control.cancelled())),
+            None => self.conn.progress_handler(0, None::<fn() -> bool>),
+        }
+    }
     fn save_scratch(&mut self, path: &str) -> DbResult<()> {
         self.require_writable()?;
         if self.name != ":memory:" {

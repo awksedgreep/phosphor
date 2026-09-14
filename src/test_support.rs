@@ -346,6 +346,28 @@ pub fn assert_transaction_and_script_workflows(db: &dyn crate::db::DbLink) {
     assert_eq!(db.count("remote_text").unwrap(), 2);
 }
 
+pub fn assert_cancelled_read_keeps_transaction(db: &dyn crate::db::DbLink) {
+    use crate::db::QueryEvent;
+    let control = crate::operation::Control::default();
+    let cancellation = control.clone();
+    db.execute("CREATE TABLE cancellation_state(n INTEGER); INSERT INTO cancellation_state VALUES(1); BEGIN; INSERT INTO cancellation_state VALUES(2)").unwrap();
+    db.read_cancellation(Some(control));
+    let mut received = 0;
+    let result = db.stream_query("WITH RECURSIVE s(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM s WHERE n<10005) SELECT n FROM s", Box::new(move |event| {
+        if matches!(event, QueryEvent::Row(_)) {
+            received += 1;
+            if received == 50 { cancellation.cancel(); }
+        }
+        cancellation.check()
+    }));
+    db.read_cancellation(None);
+    assert!(result.unwrap_err().contains("cancelled"));
+    assert_eq!(db.count("cancellation_state").unwrap(), 2);
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(db.count("cancellation_state").unwrap(), 1);
+    assert_eq!(db.query("VALUES(42)").unwrap().rows.len(), 1);
+}
+
 pub fn assert_complete_output(db: &dyn crate::db::DbLink) {
     use crate::db::PValue;
     db.execute(
@@ -575,6 +597,9 @@ impl HranaFixture {
                     entries.push(json!({"type":"replication_index", "replication_index":null}));
                     streams.insert(baton, connection.take().unwrap());
                     let body = entries.iter().map(|v| format!("{v}\n")).collect::<String>();
+                    if lose.swap(false, Ordering::Relaxed) {
+                        continue; // cursor ran and rotated its baton; reply was lost
+                    }
                     let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                     continue;
                 }

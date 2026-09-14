@@ -112,7 +112,18 @@ pub fn import_csv(db: &dyn DbLink, table: &str, path: &str) -> DbResult<String> 
 /// `export <source> <path>` — `source` is a table name or a SELECT/WITH.
 ///
 /// Writes a headered CSV. Uses `csv` crate for quoting.
+#[cfg(test)]
 pub fn export_csv(db: &dyn DbLink, source: &str, path: &str) -> DbResult<String> {
+    export_controlled(db, source, path, &crate::operation::Control::default())
+}
+
+pub fn export_controlled(
+    db: &dyn DbLink,
+    source: &str,
+    path: &str,
+    control: &crate::operation::Control,
+) -> DbResult<String> {
+    control.check()?;
     let src = source.trim();
     if src.is_empty() {
         return Err("export: missing source".into());
@@ -128,26 +139,33 @@ pub fn export_csv(db: &dyn DbLink, source: &str, path: &str) -> DbResult<String>
     let (output, file) = crate::output::AtomicOutput::create(Path::new(path))
         .map_err(|e| format!("export: cannot create {path:?}: {e}"))?;
     let mut wtr = csv::Writer::from_writer(BufWriter::new(file));
+    let progress = control.clone();
     let count = db
         .stream_query(
             &sql,
-            Box::new(move |event| match event {
-                crate::db::QueryEvent::Columns(columns) => {
-                    wtr.write_record(columns).map_err(|e| e.to_string())
-                }
-                crate::db::QueryEvent::Row(row) => wtr
-                    .write_record(row.iter().map(to_csv_string))
-                    .map_err(|e| e.to_string()),
-                crate::db::QueryEvent::End => {
-                    wtr.flush().map_err(|e| e.to_string())?;
-                    wtr.get_ref()
-                        .get_ref()
-                        .sync_all()
-                        .map_err(|e| e.to_string())
+            Box::new(move |event| {
+                progress.check()?;
+                match event {
+                    crate::db::QueryEvent::Columns(columns) => {
+                        wtr.write_record(columns).map_err(|e| e.to_string())
+                    }
+                    crate::db::QueryEvent::Row(row) => {
+                        progress.row()?;
+                        wtr.write_record(row.iter().map(to_csv_string))
+                            .map_err(|e| e.to_string())
+                    }
+                    crate::db::QueryEvent::End => {
+                        wtr.flush().map_err(|e| e.to_string())?;
+                        wtr.get_ref()
+                            .get_ref()
+                            .sync_all()
+                            .map_err(|e| e.to_string())
+                    }
                 }
             }),
         )
         .map_err(|e| format!("export incomplete; destination unchanged: {e}"))?;
+    control.publish()?;
     output
         .publish()
         .map_err(|e| format!("export: cannot publish {path:?}: {e}"))?;

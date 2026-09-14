@@ -616,3 +616,32 @@ next time: phosphor crm.db, or phosphor --app crm.db for its menu.
 F1 Help and F12 details preserve the filename being entered.
 Esc cancels the dialog and leaves the scratch database open.
 ```
+
+## Progress & cancellation
+
+```text
+Reports, labels, and CSV exports run in the database worker.
+Their progress screen shows rows read and elapsed seconds.
+F1 Help, F12 details, resizing, and Ctrl-Q remain responsive.
+Other database actions wait until this operation finishes.
+
+Esc requests cancellation. Your previous screen and design stay
+available after the worker acknowledges it. A cancelled export
+does not replace its destination. Once publication begins, let
+the file finish; cancellation cannot undo a published file.
+
+Embedded reads check cancellation while SQLite computes as well
+as between rows. A remote request may need to respond or time out
+before cancellation is acknowledged. Reads inside an existing
+remote transaction finish draining to preserve that transaction.
+Ctrl-Q exits without waiting; finish transactions before quitting.
+
+Ordinary query/table/page replies are checked every 8 ms while
+work is pending. An idle screen keeps the longer sleep and only
+redraws when something changes. Backend timings in the status bar
+measure database work, not the whole input-to-display interval.
+
+Record and schema writes, imports, script execution, printer calls,
+and some metadata loads still wait synchronously. These operations
+do not use this cancellation screen.
+```

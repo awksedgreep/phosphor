@@ -18,6 +18,7 @@
 //!   blocking calls return it, the UI shows it as a status error.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -52,6 +53,7 @@ pub enum DbResponse {
     /// Split-view detail pane: filtered child rows + total in one job.
     Detail(DbResult<DetailData>),
     Picker(DbResult<crate::picker::PickerPage>),
+    Output(DbResult<crate::operation::Output>),
 }
 
 /// Everything open_table needs to build a Grid, from one worker job.
@@ -172,6 +174,7 @@ pub struct DbHandle {
     /// tag (only matters once async submits exist).
     buffer: RefCell<Vec<(Token, std::time::Duration, DbResponse)>>,
     next: Cell<Token>,
+    outstanding: RefCell<HashSet<Token>>,
 }
 
 /// Spawn the worker owning `link`; returns the UI-side handle.
@@ -208,6 +211,7 @@ pub fn spawn(link: Box<dyn DbLink>) -> DbHandle {
         rx: res_rx,
         buffer: RefCell::new(Vec::new()),
         next: Cell::new(1),
+        outstanding: RefCell::new(HashSet::new()),
     }
 }
 
@@ -250,22 +254,37 @@ impl DbHandle {
         }
     }
 
-    /// Fire-and-forget for later slices; responses surface via poll().
+    /// Queue background work; responses surface via poll() with this token.
     /// Returns None when the worker is gone.
-    #[allow(dead_code)] // slice 1 is blocking-parity; async slices use this
     pub fn submit(&self, work: Work) -> Option<Token> {
         let tag = self.alloc();
         self.tx.send(Job { tag, work }).ok()?;
+        self.outstanding.borrow_mut().insert(tag);
         Some(tag)
     }
 
     /// Drain all arrived async responses (plus anything buffered).
-    #[allow(dead_code)] // slice 1 is blocking-parity; async slices use this
     pub fn poll(&self) -> Vec<(Token, std::time::Duration, DbResponse)> {
-        while let Ok(msg) = self.rx.try_recv() {
-            self.buffer.borrow_mut().push(msg);
+        let disconnected = loop {
+            match self.rx.try_recv() {
+                Ok(msg) => self.buffer.borrow_mut().push(msg),
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        let mut replies = std::mem::take(&mut *self.buffer.borrow_mut());
+        let mut outstanding = self.outstanding.borrow_mut();
+        for (tag, _, _) in &replies {
+            outstanding.remove(tag);
         }
-        std::mem::take(&mut *self.buffer.borrow_mut())
+        if disconnected {
+            replies.extend(
+                outstanding
+                    .drain()
+                    .map(|tag| (tag, Duration::ZERO, DbResponse::Gone)),
+            );
+        }
+        replies
     }
 }
 
