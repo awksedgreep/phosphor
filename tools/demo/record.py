@@ -2,7 +2,7 @@
 """Scripted pty recorder → asciinema cast v2.
 
 No human, no timing luck: scenarios are (at_seconds, keys) lists, the
-child runs in a real pty at a fixed size, and output is captured with
+child runs in a real pty, and output is captured with
 timestamps. Render the .cast with agg to get a GIF.
 """
 import codecs
@@ -30,6 +30,10 @@ def record(cmd, steps, out_path, cols=100, rows=30, env=None, tail=1.5, title=""
         os.execvpe(cmd[0], cmd, child_env)
 
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    # Large input can fill the pty while the app is waiting for us to
+    # drain its redraws. Keep both directions moving instead of blocking.
+    os.set_blocking(fd, False)
+    pending_input = bytearray()
 
     start = time.monotonic()
     events = []
@@ -44,10 +48,24 @@ def record(cmd, steps, out_path, cols=100, rows=30, env=None, tail=1.5, title=""
         now = time.monotonic() - start
         while idx < len(steps) and steps[idx][0] <= now:
             try:
-                os.write(fd, steps[idx][1].encode())
+                action = steps[idx][1]
+                if isinstance(action, tuple):
+                    new_cols, new_rows = action
+                    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", new_rows, new_cols, 0, 0))
+                    events.append([round(now, 4), "r", f"{new_cols}x{new_rows}"])
+                else:
+                    pending_input.extend(action.encode())
             except OSError:
                 pass
             idx += 1
+        if pending_input:
+            try:
+                written = os.write(fd, pending_input)
+                del pending_input[:written]
+            except BlockingIOError:
+                pass
+            except OSError:
+                break
         try:
             r, _, _ = select.select([fd], [], [], 0.02)
         except (OSError, ValueError):

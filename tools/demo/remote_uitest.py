@@ -44,7 +44,8 @@ def main():
     parser.add_argument("--bin", required=True)
     parser.add_argument("--reels", nargs="*", default=["data", "scripting", "forms", "apps", "tableeditor", "kiosk",
                                                      "csvrollback", "sqltext", "rowidentity", "insertidentity", "generated",
-                                                     "relations", "reports", "detailcrud", "completeoutput", "builders", "status80"])
+                                                     "relations", "reports", "detailcrud", "completeoutput", "builders", "status80",
+                                                     "scrolling", "lookup"])
     args = parser.parse_args()
     root = Path(tempfile.mkdtemp(prefix="pfr-", dir="/tmp"))
     ui.DB, ui.OUT, ui.WORK = [str(root / n) for n in ("ui.db", "casts", "work")]

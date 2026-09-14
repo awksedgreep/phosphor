@@ -110,6 +110,12 @@ class Screen:
     def text(self):
         return "\n".join("".join(row) for row in self.grid)
 
+    def resize(self, cols, rows):
+        self.grid = [(self.grid[y] if y < self.rows else [])[:cols] for y in range(rows)]
+        self.grid = [row + [" "] * (cols - len(row)) for row in self.grid]
+        self.cols, self.rows = cols, rows
+        self.r, self.c = min(self.r, rows - 1), min(self.c, cols - 1)
+
 
 class Reel:
     def __init__(self, name, title, argv=None, cols=100, rows=30):
@@ -158,6 +164,9 @@ class Reel:
         self.restarts += 1
         return self.key(CTRL_Q, wait=1.1)
 
+    def resize(self, cols, rows):
+        return self.key((cols, rows), wait=0.6)
+
     def run(self):
         cast = os.path.join(OUT, f"{self.name}.cast")
         self.key(CTRL_Q, wait=0.0)
@@ -182,11 +191,14 @@ class Reel:
                 verdict = "not on screen" if want else "unexpectedly on screen"
                 failures.append(f"{verdict} at t={t}: {marker!r}")
 
-        for at, _, data in events:
+        for at, kind, data in events:
             while i < len(pending) and pending[i][0] <= at:
                 check(*pending[i])
                 i += 1
-            screen.feed(data)
+            if kind == "r":
+                screen.resize(*map(int, data.split("x")))
+            else:
+                screen.feed(data)
         for t, marker, want in pending[i:]:
             check(t, marker, want)
         return failures
@@ -707,6 +719,45 @@ def reels():
     r.key(F12, 0.5).expect("DELETE customers rowid 9").key(ESC).key("x", 0.6).expect("row deleted")
     r.key(".").type("INSERT INTO customers(id,name) VALUES(1,'duplicate')").key(ENTER, 0.6)
     r.expect("UNIQUE constraint failed").expect("F12 details")
+    out.append(r)
+
+    r = Reel("scrolling", "Long lists, forms, menus, and input survive terminal resizing", cols=80, rows=24)
+    schema = ";".join(f"CREATE TABLE scroll{i:02}(id INTEGER)" for i in range(40))
+    fields = ",".join(f"f{i:02} TEXT" + (" NOT NULL DEFAULT 'required'" if i == 34 else "") for i in range(35))
+    schema += f"; CREATE TABLE zwide({fields}); INSERT INTO zwide DEFAULT VALUES"
+    schema += "; INSERT INTO _phosphor_apps(name) VALUES('long_menu')"
+    schema += "; WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<39) INSERT INTO _phosphor_items(app_id,label,action_kind,action_ref,seq) SELECT (SELECT id FROM _phosphor_apps WHERE name='long_menu'), printf('Menu%02d',x), 'browse','zwide',x FROM n"
+    r.key(".").key(schema).key(ENTER, 1.0).key(ESC).key(END).expect("zwide")
+    r.resize(40, 12).expect("zwide").resize(100, 30).expect("zwide")
+    r.key("Q", 0.5).key(END).expect("f34").resize(40, 12).expect("f34")
+    r.key(ENTER).key("long filter " * 20 + "FILTERTAIL").expect("FILTERTAIL")
+    r.key(F1).key(ESC).expect("FILTERTAIL").key(ESC).key(ESC)
+    r.resize(80, 24).key("E", 0.5).key(END).expect("f34").resize(40, 12).expect("f34")
+    r.key(ESC).key("F", 0.5).key(END).expect("f34").key(F2, 0.5)
+    r.keys([TAB] * 34, gap=0.06).expect("f34:").key(F6, 0.5).key(ESC).key(ESC)
+    r.resize(80, 24).key(ENTER, 0.5).key(ENTER, 0.5).key("\x1b[1;5F").expect("f34")
+    r.resize(40, 12).expect("f34").type("last field saved").expect("last field saved")
+    r.key(F10, 0.7).expect("saved 1 field(s)")
+    r.resize(80, 24).key(".").type("SELECT f34 FROM zwide").key(ENTER, 0.5).expect("last field saved")
+    r.key(".").type("apps long_menu").key(ENTER, 0.5).key(END).expect("Menu39")
+    r.resize(80, 24).expect("Menu39").key(F2, 0.5).key(END).expect("Menu39")
+    r.resize(40, 12).expect("Menu39").key(HOME).expect("Menu00")
+    out.append(r)
+
+    r = Reel("lookup", "Search and page through all 1,005 parents while retaining record drafts", cols=80, rows=24)
+    r.key(".").key("CREATE TABLE zlookup_customers(id INTEGER PRIMARY KEY,name TEXT,city TEXT); CREATE TABLE ylookup_orders(id INTEGER PRIMARY KEY,customer_id INTEGER REFERENCES zlookup_customers(id),note TEXT); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1005) INSERT INTO zlookup_customers SELECT x,printf('Customer %04d',x),'Lookup City' FROM n; INSERT INTO ylookup_orders VALUES(1,1,'draft')").key(ENTER, 1.0)
+    r.key(ESC).key("y").key(ENTER, 0.5).key(ENTER, 0.5).key(DOWN).key(DOWN)
+    r.type("retained draft").key("\x1b[Z").key(F7, 0.7).expect("1 / 1005 matches")
+    r.key(PGDN, 0.6).expect("101 / 1005 matches").expect("Customer 0101")
+    r.key(END, 0.6).expect("1005 / 1005 matches").expect("Customer 1005")
+    r.resize(40, 12).expect("Customer 1005").expect("Enter pick")
+    r.key(ENTER).expect("retained draft").key(F10, 0.7).expect("saved 2 field(s)")
+    r.resize(80, 24).key(".").type("SELECT customer_id,note FROM ylookup_orders").key(ENTER, 0.5).expect("1005").expect("retained draft")
+    r.resize(80, 24).key(ESC).key(ESC).key("y").key(ENTER, 0.5).key(ENTER, 0.5).key(DOWN).key(F7, 0.7)
+    r.key("/").type("missing customer").key(ENTER, 0.6).expect("No matching records")
+    r.key(ENTER).expect("PICK").key("/").type("customer 0999").key(ENTER, 0.6)
+    r.expect("1 / 1 matches").expect("Customer 0999").key(ENTER).key(F10, 0.7).expect("saved 1 field(s)")
+    r.key(".").type("SELECT customer_id,note FROM ylookup_orders").key(ENTER, 0.5).expect("999").expect("retained draft")
     out.append(r)
 
     return out

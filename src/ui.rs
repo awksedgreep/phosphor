@@ -3,13 +3,142 @@
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use std::borrow::Cow;
 
 use crate::app::{App, DetailState, Focus, Grid, GridSource, Overlay, ScriptTarget};
 use crate::db::{DbLink, PValue};
+
+#[derive(Default)]
+pub struct Scroll {
+    pub top: usize,
+    pub rows: usize,
+}
+
+impl Scroll {
+    fn follow(&mut self, selected: usize, count: usize, rows: usize) {
+        self.rows = rows;
+        let selected = selected.min(count.saturating_sub(1));
+        self.top = self.top.min(count.saturating_sub(rows));
+        if selected < self.top {
+            self.top = selected;
+        }
+        if selected >= self.top + rows {
+            self.top = selected.saturating_sub(rows.saturating_sub(1));
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Viewports {
+    pub sidebar: Scroll,
+    pub create: Scroll,
+    pub form: Scroll,
+    pub apps: Scroll,
+    pub menu: Scroll,
+    pub qbe: Scroll,
+    pub report: Scroll,
+    pub edit: Scroll,
+    pub picker: Scroll,
+    pub script: Scroll,
+    pub help_topics: Scroll,
+    pub script_left: usize,
+    pub prompt_left: usize,
+    pub paint_x: u16,
+    pub paint_y: u16,
+}
+
+/// Keep headers fixed and move the data window just far enough to show
+/// the selection. Resizing follows the same rule as keyboard navigation.
+fn draw_rows(
+    f: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'_>>,
+    headers: usize,
+    selected: usize,
+    scroll: &mut Scroll,
+) {
+    let headers = if area.height as usize > headers {
+        headers
+    } else {
+        0
+    };
+    let rows = (area.height as usize).saturating_sub(headers);
+    scroll.follow(
+        selected.saturating_sub(headers),
+        lines.len().saturating_sub(headers),
+        rows,
+    );
+    let visible: Vec<_> = lines
+        .iter()
+        .take(headers)
+        .cloned()
+        .chain(lines.iter().skip(headers + scroll.top).take(rows).cloned())
+        .collect();
+    f.render_widget(Paragraph::new(visible), area);
+}
+
+fn dialog_area(area: Rect) -> Rect {
+    Rect {
+        height: area.height.saturating_sub(4),
+        ..area
+    }
+}
+
+fn text_from_column(text: &str, column: usize) -> String {
+    let mut skipped = 0;
+    for (byte, g) in text.grapheme_indices(true) {
+        if skipped >= column {
+            return text[byte..].to_owned();
+        }
+        skipped += g.width();
+        if skipped > column {
+            return format!(
+                "{}{}",
+                " ".repeat(skipped - column),
+                &text[byte + g.len()..]
+            );
+        }
+    }
+    String::new()
+}
+
+/// Horizontal scrolling follows the caret in terminal cells, not bytes.
+fn caret_line(
+    text: &str,
+    byte: usize,
+    width: u16,
+    left: &mut usize,
+    th: &crate::theme::Theme,
+) -> Line<'static> {
+    let mut byte = byte.min(text.len());
+    if let Some((start, _)) = text
+        .grapheme_indices(true)
+        .find(|(start, g)| *start <= byte && byte < start + g.len())
+    {
+        byte = start;
+    }
+    let (before, after) = text.split_at(byte);
+    let caret = after.graphemes(true).next().unwrap_or(" ");
+    let column = before.width();
+    let room = width.max(1) as usize;
+    if column < *left {
+        *left = column;
+    }
+    if column + caret.width().max(1) > *left + room {
+        *left = (column + caret.width().max(1)).saturating_sub(room);
+    }
+    let rest = after.get(caret.len()..).unwrap_or("");
+    Line::from(vec![
+        Span::styled(text_from_column(before, *left), th.base()),
+        Span::styled(caret.to_owned(), th.cursor()),
+        Span::styled(rest.to_owned(), th.base()),
+    ])
+}
 
 pub fn draw(f: &mut Frame, app: &mut App) -> bool {
     // Returns true when the measured viewport changed: paging math
@@ -83,10 +212,11 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
         Overlay::ScriptEditor(_) => draw_script_editor(f, app),
         Overlay::None => {}
     }
+    draw_editor_input(f, app);
     // The FK value picker draws over the record form (same overlay).
     if let Overlay::Edit(ed) = &app.overlay {
         if ed.picker.is_some() {
-            draw_picker(f, app, ed);
+            draw_picker(f, app);
         }
     }
     // Outcomes stay visible even when a designer fills the screen.
@@ -110,7 +240,128 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
     app.visible_rows != old_rows || app.visible_cols_width != old_cols
 }
 
-fn draw_create(f: &mut Frame, app: &App) {
+/// A full-width input line keeps the caret available even when a table
+/// designer's fixed columns cannot all fit in a narrow terminal.
+fn draw_editor_input(f: &mut Frame, app: &App) {
+    let input = match &app.overlay {
+        Overlay::Edit(ed) if ed.picker.is_none() => ed.editing.as_deref().map(|buf| {
+            (
+                format!(
+                    "{} · {}",
+                    ed.table,
+                    ed.labels
+                        .get(ed.cursor)
+                        .map(String::as_str)
+                        .unwrap_or("field")
+                ),
+                buf,
+            )
+        }),
+        Overlay::Qbe(st) => st.editing.as_deref().map(|buf| {
+            (
+                if st.naming {
+                    app.design_name_action.label().into()
+                } else {
+                    format!("{} · filter", st.spec.cols[st.cursor].name)
+                },
+                buf,
+            )
+        }),
+        Overlay::Report(st) => st.editing.as_deref().map(|buf| {
+            (
+                if st.naming {
+                    app.design_name_action.label().into()
+                } else {
+                    ["report title", "report source", "report grouping"][st.cursor.min(2)].into()
+                },
+                buf,
+            )
+        }),
+        Overlay::Form(st) => st.editing.as_deref().map(|buf| {
+            (
+                format!(
+                    "{} · {}",
+                    st.spec
+                        .fields
+                        .get(st.cursor)
+                        .map(|fl| fl.column.as_str())
+                        .unwrap_or("field"),
+                    if st.editing_mask {
+                        "mask"
+                    } else if st.editing_computed {
+                        "computed expression"
+                    } else {
+                        "label"
+                    }
+                ),
+                buf,
+            )
+        }),
+        Overlay::Apps(st) => st.editing.as_deref().map(|buf| {
+            (
+                (if st.renaming_app {
+                    "application name"
+                } else if st.editing_ref {
+                    "menu target"
+                } else {
+                    "menu label"
+                })
+                .into(),
+                buf,
+            )
+        }),
+        Overlay::Create(st) => st.editing.as_deref().map(|buf| {
+            (
+                format!(
+                    "{} · {}",
+                    st.draft.table,
+                    if st.cursor == 0 {
+                        "table name"
+                    } else {
+                        match st.slot {
+                            crate::creator::EditSlot::Name => "field name",
+                            crate::creator::EditSlot::Default => "default",
+                            crate::creator::EditSlot::Refs => "foreign key",
+                        }
+                    }
+                ),
+                buf,
+            )
+        }),
+        Overlay::Paint(st) => st
+            .editing
+            .as_deref()
+            .map(|buf| ("painted text".into(), buf)),
+        _ => None,
+    };
+    let Some((label, buf)) = input else { return };
+    let area = Rect {
+        y: f.area().bottom().saturating_sub(4),
+        height: 2.min(f.area().height),
+        ..f.area()
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!(
+                    " {label} · Enter {} · Esc cancels input",
+                    if matches!(app.overlay, Overlay::Edit(_)) {
+                        "saves"
+                    } else {
+                        "applies"
+                    }
+                ),
+                app.theme.dim(),
+            ),
+            Line::from(editing_span(buf, area.width.saturating_sub(1), app.theme)),
+        ])
+        .style(app.theme.base()),
+        area,
+    );
+}
+
+fn draw_create(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Overlay::Create(st) = &app.overlay else {
         return;
@@ -127,7 +378,7 @@ fn draw_create(f: &mut Frame, app: &App) {
         " F3 type F4 pk F5 null F6 uniq F7 dflt F10 fk F8 ins F9 del [] move F2 create "
     };
     let area = centered(
-        f.area(),
+        dialog_area(f.area()),
         86,
         (st.draft.fields.len() as u16 + 12).min(f.area().height),
     );
@@ -146,7 +397,7 @@ fn draw_create(f: &mut Frame, app: &App) {
     let name_selected = st.cursor == 0;
     use crate::creator::EditSlot;
     let name_span: Span = match (name_selected, st.slot, &st.editing) {
-        (true, EditSlot::Name, Some(buf)) => editing_span(buf, 17, th),
+        (true, EditSlot::Name, Some(buf)) => editing_span(buf, inner.width.saturating_sub(19), th),
         _ => Span::styled(
             st.draft.table.clone(),
             if name_selected {
@@ -185,7 +436,9 @@ fn draw_create(f: &mut Frame, app: &App) {
             _ => Span::styled(pad(fld.default.text(), 13), style),
         };
         let refs: Span = match (selected, st.slot, &st.editing) {
-            (true, EditSlot::Refs, Some(buf)) => editing_span(buf, 0, th),
+            (true, EditSlot::Refs, Some(buf)) => {
+                editing_span(buf, inner.width.saturating_sub(60), th)
+            }
             _ => Span::styled(fld.references.clone(), style),
         };
         lines.push(Line::from(vec![
@@ -198,10 +451,17 @@ fn draw_create(f: &mut Frame, app: &App) {
             refs,
         ]));
     }
-    let rows_h = lines.len() as u16 + 1;
+    let rows_h = (lines.len() as u16 + 1).min(inner.height.saturating_sub(4).max(1));
     let [rows_area, sql_area] =
         Layout::vertical([Constraint::Length(rows_h), Constraint::Fill(1)]).areas(inner);
-    f.render_widget(Paragraph::new(lines), rows_area);
+    draw_rows(
+        f,
+        rows_area,
+        lines,
+        3,
+        if st.cursor == 0 { 0 } else { st.cursor + 2 },
+        &mut app.viewports.create,
+    );
     // The SQL that F2 will run: CREATE for a new table, the compiled
     // native ALTERs for an existing one — or the
     // reason it can't be applied.
@@ -242,23 +502,36 @@ fn draw_create(f: &mut Frame, app: &App) {
     );
 }
 
-/// A Rect at canvas coords (x,y) inside `inner`, clamped so partially
-/// off-canvas elements truncate instead of panicking.
-fn canvas_rect(inner: Rect, x: u16, y: u16, w: u16, h: u16) -> Option<Rect> {
-    if x >= inner.width || y >= inner.height {
-        return None;
+/// Draw one canvas line through a clipped viewport without allocating a
+/// buffer the size of a saved form. Coordinates remain design coordinates.
+fn canvas_line(
+    f: &mut Frame,
+    inner: Rect,
+    origin: (u16, u16),
+    x: u16,
+    y: u16,
+    line: Line<'_>,
+    width: u16,
+) {
+    let dy = y as i64 - origin.1 as i64;
+    if dy < 0 || dy >= inner.height as i64 {
+        return;
     }
-    Some(Rect {
-        x: inner.x + x,
-        y: inner.y + y,
-        width: w.min(inner.width - x),
-        height: h.min(inner.height - y),
-    })
+    let dx = x as i64 - origin.0 as i64;
+    let clip = (-dx).max(0) as u16;
+    let start = dx.max(0) as u16;
+    if clip >= width || start >= inner.width {
+        return;
+    }
+    let rect = Rect {
+        x: inner.x + start,
+        y: inner.y + dy as u16,
+        width: (width - clip).min(inner.width - start),
+        height: 1,
+    };
+    f.render_widget(Paragraph::new(line).scroll((0, clip)), rect);
 }
 
-/// Paint a form's boxes, texts, and fields into `inner`. Shared by the
-/// painter canvas and the painted EDIT form — designers must never
-/// drift from the runtime.
 #[allow(clippy::too_many_arguments)]
 fn paint_spec(
     f: &mut Frame,
@@ -266,54 +539,118 @@ fn paint_spec(
     spec: &crate::forms::FormSpec,
     th: &crate::theme::Theme,
     selected_col: Option<&str>,
+    origin: (u16, u16),
     mut value_of: impl FnMut(&str) -> Option<Span<'static>>,
 ) {
     for b in &spec.boxes {
-        if let Some(r) = canvas_rect(inner, b.x, b.y, b.w, b.h) {
-            f.render_widget(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(th.dim()),
-                r,
+        if b.w < 2 || b.h < 2 {
+            continue;
+        }
+        let edge = "─".repeat(b.w.saturating_sub(2) as usize);
+        canvas_line(
+            f,
+            inner,
+            origin,
+            b.x,
+            b.y,
+            Line::styled(format!("┌{edge}┐"), th.dim()),
+            b.w,
+        );
+        canvas_line(
+            f,
+            inner,
+            origin,
+            b.x,
+            b.y.saturating_add(b.h - 1),
+            Line::styled(format!("└{edge}┘"), th.dim()),
+            b.w,
+        );
+        for y in b.y.saturating_add(1).max(origin.1)
+            ..b.y
+                .saturating_add(b.h - 1)
+                .min(origin.1.saturating_add(inner.height))
+        {
+            canvas_line(f, inner, origin, b.x, y, Line::styled("│", th.dim()), 1);
+            canvas_line(
+                f,
+                inner,
+                origin,
+                b.x.saturating_add(b.w - 1),
+                y,
+                Line::styled("│", th.dim()),
+                1,
             );
         }
     }
     for t in &spec.texts {
-        let w = t.text.chars().count() as u16;
-        if let Some(r) = canvas_rect(inner, t.x, t.y, w, 1) {
-            f.render_widget(Paragraph::new(Line::styled(t.text.clone(), th.bright())), r);
-        }
+        canvas_line(
+            f,
+            inner,
+            origin,
+            t.x,
+            t.y,
+            Line::styled(t.text.clone(), th.bright()),
+            t.text.width().min(u16::MAX as usize) as u16,
+        );
     }
-    for field in spec.fields.iter().filter(|fl| fl.include) {
+    // Draw the selection last so an overlapping saved layout cannot hide it.
+    let fields = spec
+        .fields
+        .iter()
+        .filter(|fl| fl.include && selected_col != Some(fl.column.as_str()))
+        .chain(
+            spec.fields
+                .iter()
+                .filter(|fl| fl.include && selected_col == Some(fl.column.as_str())),
+        );
+    for field in fields {
         let Some((x, y)) = field.pos else { continue };
         let selected = selected_col == Some(field.column.as_str());
         let label = format!("{}:", field.label);
-        let lw = label.chars().count() as u16;
-        if let Some(r) = canvas_rect(inner, x, y, lw, 1) {
-            f.render_widget(
-                Paragraph::new(Line::styled(
-                    label,
-                    if selected { th.cursor() } else { th.base() },
-                )),
-                r,
-            );
-        }
-        let vx = x + lw + 1;
+        let lw = label.width().min(u16::MAX as usize) as u16;
+        canvas_line(
+            f,
+            inner,
+            origin,
+            x,
+            y,
+            Line::styled(label, if selected { th.cursor() } else { th.base() }),
+            lw,
+        );
         let value = value_of(&field.column)
             .unwrap_or_else(|| Span::styled("_".repeat(field.width as usize), th.dim()));
-        if let Some(r) = canvas_rect(inner, vx, y, field.width, 1) {
-            f.render_widget(Paragraph::new(Line::from(value)), r);
-        }
+        canvas_line(
+            f,
+            inner,
+            origin,
+            x.saturating_add(lw).saturating_add(1),
+            y,
+            Line::from(value),
+            field.width,
+        );
     }
 }
 
-fn draw_paint(f: &mut Frame, app: &App) {
+fn follow_canvas(offset: &mut u16, position: u16, size: u16) {
+    if position < *offset {
+        *offset = position;
+    }
+    if position as u32 >= *offset as u32 + size as u32 {
+        *offset = position.saturating_sub(size.saturating_sub(1));
+    }
+}
+
+fn draw_paint(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Overlay::Paint(st) = &app.overlay else {
         return;
     };
     let (cw, ch) = st.spec.size;
-    let area = centered(f.area(), cw + 2, ch + 2);
+    let area = centered(
+        dialog_area(f.area()),
+        cw.saturating_add(2),
+        ch.saturating_add(2),
+    );
     f.render_widget(Clear, area);
     let sel_name = st
         .spec
@@ -343,22 +680,36 @@ fn draw_paint(f: &mut Frame, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    follow_canvas(&mut app.viewports.paint_x, st.cursor.0, inner.width);
+    follow_canvas(&mut app.viewports.paint_y, st.cursor.1, inner.height);
+    let origin = (app.viewports.paint_x, app.viewports.paint_y);
     let selected_col = st.spec.fields.get(st.selected).map(|fl| fl.column.clone());
-    paint_spec(f, inner, &st.spec, th, selected_col.as_deref(), |_| None);
-
-    // Pending box corner marker, then the cursor cell on top.
+    paint_spec(
+        f,
+        inner,
+        &st.spec,
+        th,
+        selected_col.as_deref(),
+        origin,
+        |_| None,
+    );
     if let Some((bx, by)) = st.pending_box {
-        if let Some(r) = canvas_rect(inner, bx, by, 1, 1) {
-            f.render_widget(Paragraph::new(Line::styled("┌", th.bright())), r);
-        }
+        canvas_line(f, inner, origin, bx, by, Line::styled("┌", th.bright()), 1);
     }
     if let Some(buf) = &st.editing {
-        // Live text entry rendered at the cursor.
-        let w = (buf.chars().count() as u16 + 1).max(1);
-        if let Some(r) = canvas_rect(inner, st.cursor.0, st.cursor.1, w, 1) {
-            f.render_widget(Paragraph::new(Line::from(editing_span(buf, w, th))), r);
-        }
-    } else if let Some(r) = canvas_rect(inner, st.cursor.0, st.cursor.1, 1, 1) {
+        let available = inner
+            .width
+            .saturating_sub(st.cursor.0.saturating_sub(origin.0));
+        canvas_line(
+            f,
+            inner,
+            origin,
+            st.cursor.0,
+            st.cursor.1,
+            Line::from(editing_span(buf, available.saturating_sub(1), th)),
+            available,
+        );
+    } else {
         // Invert the glyph under the cursor instead of blotting it out
         // ("▒ame:" on film). Look up what lives at this cell.
         let (cx, cy) = st.cursor;
@@ -381,20 +732,25 @@ fn draw_paint(f: &mut Frame, app: &App) {
             }
         }
         let shown = if under == ' ' { '▒' } else { under };
-        f.render_widget(
-            Paragraph::new(Line::styled(shown.to_string(), th.cursor())),
-            r,
+        canvas_line(
+            f,
+            inner,
+            origin,
+            st.cursor.0,
+            st.cursor.1,
+            Line::styled(shown.to_string(), th.cursor()),
+            1,
         );
     }
 }
 
-fn draw_form(f: &mut Frame, app: &App) {
+fn draw_form(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Overlay::Form(st) = &app.overlay else {
         return;
     };
     let area = centered(
-        f.area(),
+        dialog_area(f.area()),
         88,
         (st.spec.fields.len() as u16 + 6).min(f.area().height),
     );
@@ -429,7 +785,7 @@ fn draw_form(f: &mut Frame, app: &App) {
             selected && !st.editing_mask && !st.editing_computed,
             &st.editing,
         ) {
-            (true, Some(buf)) => editing_span(buf, 0, th),
+            (true, Some(buf)) => editing_span(buf, inner.width.saturating_sub(63), th),
             _ => Span::styled(field.label.clone(), style),
         };
         let mask: Span = match (selected && st.editing_mask, &st.editing) {
@@ -449,7 +805,7 @@ fn draw_form(f: &mut Frame, app: &App) {
             label,
         ]));
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    draw_rows(f, inner, lines, 1, st.cursor + 1, &mut app.viewports.form);
 }
 
 /// One-line preview of a possibly-multiline menu target (`⏎` when the
@@ -463,13 +819,13 @@ fn ref_preview(s: &str) -> String {
     }
 }
 
-fn draw_apps(f: &mut Frame, app: &App) {
+fn draw_apps(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Overlay::Apps(st) = &app.overlay else {
         return;
     };
     let area = centered(
-        f.area(),
+        dialog_area(f.area()),
         72,
         (st.items.len() as u16 + 7).max(10).min(f.area().height),
     );
@@ -493,7 +849,11 @@ fn draw_apps(f: &mut Frame, app: &App) {
     if st.renaming_app {
         lines.push(Line::from(vec![
             Span::styled("app name: ", th.bright()),
-            editing_span(st.editing.as_deref().unwrap_or(""), 0, th),
+            editing_span(
+                st.editing.as_deref().unwrap_or(""),
+                inner.width.saturating_sub(11),
+                th,
+            ),
         ]));
         lines.push(Line::raw(""));
     }
@@ -508,7 +868,7 @@ fn draw_apps(f: &mut Frame, app: &App) {
         let (label, target): (Span, Span) = match (selected, &st.editing) {
             (true, Some(buf)) if st.editing_ref => (
                 Span::styled(pad(&item.label, 24), style),
-                editing_span(buf, 0, th),
+                editing_span(buf, inner.width.saturating_sub(35), th),
             ),
             (true, Some(buf)) => (
                 editing_span(buf, 24, th),
@@ -528,17 +888,24 @@ fn draw_apps(f: &mut Frame, app: &App) {
     if st.items.is_empty() {
         lines.push(Line::styled("  n adds the first menu item", th.dim()));
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    draw_rows(
+        f,
+        inner,
+        lines,
+        if st.renaming_app { 3 } else { 1 },
+        if st.renaming_app { 0 } else { st.cursor + 1 },
+        &mut app.viewports.apps,
+    );
 }
 
-fn draw_app_menu(f: &mut Frame, app: &App) {
+fn draw_app_menu(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Overlay::AppMenu(st) = &app.overlay else {
         return;
     };
     let width = 46u16;
     let area = centered(
-        f.area(),
+        dialog_area(f.area()),
         width,
         (st.items.len() as u16 * 2 + 6).min(f.area().height),
     );
@@ -576,29 +943,47 @@ fn draw_app_menu(f: &mut Frame, app: &App) {
         ]));
         lines.push(Line::raw(""));
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    draw_rows(
+        f,
+        inner,
+        lines,
+        0,
+        st.cursor * 2 + 1,
+        &mut app.viewports.menu,
+    );
 }
 
 /// The editing cell: buffer + caret, PADDED to the column width so the
 /// columns to its right hold still while you type (they used to slide
 /// with every keystroke — the designer's "drifting type" bug).
-fn editing_span<'a>(buf: &'a str, width: u16, th: &crate::theme::Theme) -> Span<'a> {
+fn editing_span(buf: &str, width: u16, th: &crate::theme::Theme) -> Span<'static> {
+    if width == 0 {
+        return Span::styled("", th.cursor());
+    }
+    let room = width.saturating_sub(1) as usize;
+    let mut suffix = String::new();
+    let mut used = 0;
+    for g in buf.graphemes(true).rev() {
+        let w = g.width();
+        if used + w > room {
+            break;
+        }
+        suffix.insert_str(0, g);
+        used += w;
+    }
     Span::styled(
-        pad(
-            &format!("{buf}▏"),
-            width.max(buf.chars().count() as u16 + 1),
-        ),
+        format!("{suffix}▏{} ", " ".repeat(room - used)),
         th.cursor(),
     )
 }
 
-fn draw_qbe(f: &mut Frame, app: &App) {
+fn draw_qbe(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Overlay::Qbe(st) = &app.overlay else {
         return;
     };
     let area = centered(
-        f.area(),
+        dialog_area(f.area()),
         76,
         (st.spec.cols.len() as u16 + 12).min(f.area().height.saturating_sub(2)),
     );
@@ -632,7 +1017,7 @@ fn draw_qbe(f: &mut Frame, app: &App) {
         let selected = i == st.cursor;
         let row_style = if selected { th.cursor() } else { th.base() };
         let filter: Span = match (selected && !st.naming, &st.editing) {
-            (true, Some(buf)) => editing_span(buf, 0, th),
+            (true, Some(buf)) => editing_span(buf, inner.width.saturating_sub(32), th),
             _ => Span::styled(col.filter.clone(), row_style),
         };
         lines.push(Line::from(vec![
@@ -642,6 +1027,7 @@ fn draw_qbe(f: &mut Frame, app: &App) {
             filter,
         ]));
     }
+    let column_lines = std::mem::take(&mut lines);
     if let Some(j) = &st.spec.join {
         lines.push(Line::from(vec![
             Span::styled("JOIN  ", th.dim()),
@@ -668,13 +1054,33 @@ fn draw_qbe(f: &mut Frame, app: &App) {
     if st.naming {
         lines.push(Line::from(vec![
             Span::styled(format!("{}: ", app.design_name_action.label()), th.bright()),
-            editing_span(st.editing.as_deref().unwrap_or(""), 0, th),
+            editing_span(
+                st.editing.as_deref().unwrap_or(""),
+                inner
+                    .width
+                    .saturating_sub(app.design_name_action.label().len() as u16 + 3),
+                th,
+            ),
         ]));
     }
-    let rows_h = lines.len() as u16;
-    let [rows_area, sql_area] =
-        Layout::vertical([Constraint::Length(rows_h), Constraint::Fill(1)]).areas(inner);
-    f.render_widget(Paragraph::new(lines), rows_area);
+    let controls_h = lines.len() as u16;
+    let rows_h =
+        (column_lines.len() as u16).min(inner.height.saturating_sub(controls_h + 3).max(1));
+    let [rows_area, controls_area, sql_area] = Layout::vertical([
+        Constraint::Length(rows_h),
+        Constraint::Length(controls_h),
+        Constraint::Fill(1),
+    ])
+    .areas(inner);
+    draw_rows(
+        f,
+        rows_area,
+        column_lines,
+        1,
+        st.cursor + 1,
+        &mut app.viewports.qbe,
+    );
+    f.render_widget(Paragraph::new(lines), controls_area);
     // The generated SQL WRAPS — on film it silently clipped at the box
     // edge and the ORDER BY was never visible. Showing the SQL is the
     // whole point of QBE; it must never be cut off.
@@ -688,12 +1094,12 @@ fn draw_qbe(f: &mut Frame, app: &App) {
     );
 }
 
-fn draw_report(f: &mut Frame, app: &App) {
+fn draw_report(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Overlay::Report(st) = &app.overlay else {
         return;
     };
-    let area = centered(f.area(), 76, 12);
+    let area = centered(dialog_area(f.area()), 76, 12);
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -722,7 +1128,7 @@ fn draw_report(f: &mut Frame, app: &App) {
     for (i, (label, value)) in fields.iter().enumerate() {
         let selected = i == st.cursor && !st.naming;
         let value_span = match (selected, &st.editing) {
-            (true, Some(buf)) => editing_span(buf, 0, th),
+            (true, Some(buf)) => editing_span(buf, inner.width.saturating_sub(13), th),
             _ => Span::styled(
                 value.clone(),
                 if selected { th.cursor() } else { th.base() },
@@ -743,7 +1149,13 @@ fn draw_report(f: &mut Frame, app: &App) {
                 format!("{} : ", app.design_name_action.label()),
                 th.bright(),
             ),
-            editing_span(st.editing.as_deref().unwrap_or(""), 0, th),
+            editing_span(
+                st.editing.as_deref().unwrap_or(""),
+                inner
+                    .width
+                    .saturating_sub(app.design_name_action.label().len() as u16 + 4),
+                th,
+            ),
         ]));
     } else {
         lines.push(Line::raw(""));
@@ -752,7 +1164,14 @@ fn draw_report(f: &mut Frame, app: &App) {
             th.dim(),
         ));
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    draw_rows(
+        f,
+        inner,
+        lines,
+        0,
+        if st.naming { 4 } else { st.cursor },
+        &mut app.viewports.report,
+    );
 }
 
 fn draw_pager(f: &mut Frame, app: &App) {
@@ -902,7 +1321,7 @@ fn focus_style(app: &App, mine: Focus) -> ratatui::style::Style {
     }
 }
 
-fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
+fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -910,28 +1329,37 @@ fn draw_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .title(Span::styled(" Data ", focus_style(app, Focus::Sidebar)));
     let visible = app.visible_tables();
     let hidden = app.tables.len() - visible.len();
-    let items: Vec<ListItem> =
-        visible
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let marker = if t.is_view { "◇ " } else { "▪ " };
-                let internal = crate::app::App::is_internal(t);
-                let style = if i == app.sidebar_idx {
-                    th.cursor()
-                } else if internal || t.is_view {
-                    th.dim()
-                } else {
-                    th.base()
-                };
-                ListItem::new(Line::styled(format!("{marker}{}", t.name), style))
-            })
-            .chain((hidden > 0 && !app.show_internals).then(|| {
-                ListItem::new(Line::styled(format!("  … {hidden} internal (i)"), th.dim()))
-            }))
-            .collect();
+    let items: Vec<Line> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let marker = if t.is_view { "◇ " } else { "▪ " };
+            let internal = crate::app::App::is_internal(t);
+            let style = if i == app.sidebar_idx {
+                th.cursor()
+            } else if internal || t.is_view {
+                th.dim()
+            } else {
+                th.base()
+            };
+            Line::styled(format!("{marker}{}", t.name), style)
+        })
+        .chain(
+            (hidden > 0 && !app.show_internals)
+                .then(|| Line::styled(format!("  … {hidden} internal (i)"), th.dim())),
+        )
+        .collect();
     let empty = app.tables.is_empty();
-    f.render_widget(List::new(items).block(block), area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    draw_rows(
+        f,
+        inner,
+        items,
+        0,
+        app.sidebar_idx,
+        &mut app.viewports.sidebar,
+    );
     if empty {
         let hint = Rect {
             x: area.x + 2,
@@ -1146,41 +1574,44 @@ fn draw_detail_panel(f: &mut Frame, app: &App, state: &DetailState, area: Rect) 
 
 fn pad(s: &str, width: u16) -> String {
     let width = width as usize;
-    let mut out: String = s.chars().take(width).collect();
-    if s.chars().count() > width && width > 0 {
-        out.pop();
+    let clipped = s.width() > width;
+    let room = width.saturating_sub(usize::from(clipped));
+    let mut out = String::new();
+    let mut used = 0;
+    for g in s.graphemes(true) {
+        if used + g.width() > room {
+            break;
+        }
+        out.push_str(g);
+        used += g.width();
+    }
+    if clipped && width > 0 {
         out.push('…');
+        used += 1;
     }
-    while out.chars().count() < width {
-        out.push(' ');
-    }
-    out.push(' ');
+    out.push_str(&" ".repeat(width - used + 1));
     out
 }
 
-fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
+fn draw_prompt(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Prompt && matches!(app.overlay, Overlay::None);
     let dot = Span::styled(" . ", if focused { th.bright() } else { th.dim() });
-    let mut spans = vec![dot];
-    if focused {
-        // Byte-index cursor, always on a char boundary by construction;
-        // snap defensively so a stale value can never panic split_at.
-        let input = app.prompt.input.as_str();
-        let mut cur = app.prompt.cursor.min(input.len());
-        while cur > 0 && !input.is_char_boundary(cur) {
-            cur -= 1;
-        }
-        let (before, after) = input.split_at(cur);
-        spans.push(Span::styled(before, th.base()));
-        let mut chars = after.chars();
-        let cursor_char = chars.next().unwrap_or(' ');
-        spans.push(Span::styled(cursor_char.to_string(), th.cursor()));
-        spans.push(Span::styled(chars.as_str(), th.base()));
+    let [prefix, content] =
+        Layout::horizontal([Constraint::Length(3), Constraint::Fill(1)]).areas(area);
+    f.render_widget(Paragraph::new(Line::from(dot)), prefix);
+    let line = if focused {
+        caret_line(
+            &app.prompt.input,
+            app.prompt.cursor,
+            content.width,
+            &mut app.viewports.prompt_left,
+            th,
+        )
     } else {
-        spans.push(Span::styled(app.prompt.input.as_str(), th.dim()));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+        Line::styled(app.prompt.input.as_str(), th.dim())
+    };
+    f.render_widget(Paragraph::new(line), content);
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -1396,19 +1827,34 @@ fn link_pane_lines(ed: &crate::app::EditState, th: &crate::theme::Theme) -> Vec<
     lines
 }
 
-fn draw_edit(f: &mut Frame, app: &App) {
+fn draw_edit(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Overlay::Edit(ed) = &app.overlay else {
         return;
     };
     // Painted forms render CREATE SCREEN style; unpainted stay a list.
-    if let Some(spec) = &ed.painted {
+    let fits = |spec: &&crate::forms::FormSpec| {
+        let area = dialog_area(f.area());
+        spec.size.0.saturating_add(2) <= area.width
+            && spec.size.1.saturating_add(2) <= area.height
+            && ed.fields.iter().all(|(c, _)| {
+                spec.fields.iter().any(|fl| {
+                    fl.column == c.name
+                        && fl.pos.is_some_and(|(x, y)| {
+                            x as usize + fl.label.width() + 2 + fl.width as usize
+                                <= spec.size.0 as usize
+                                && y < spec.size.1
+                        })
+                })
+            })
+    };
+    if let Some(spec) = ed.painted.as_ref().filter(fits) {
         let (cw, ch) = spec.size;
         let panes = link_pane_lines(ed, th);
         let area = centered(
-            f.area(),
-            (cw + 2).max(50),
-            (ch + 2 + panes.len() as u16).min(f.area().height),
+            dialog_area(f.area()),
+            cw.saturating_add(2).max(50),
+            (ch.saturating_add(2).saturating_add(panes.len() as u16)).min(f.area().height),
         );
         f.render_widget(Clear, area);
         let dirty = if ed.dirty() { " *" } else { "" };
@@ -1440,11 +1886,19 @@ fn draw_edit(f: &mut Frame, app: &App) {
         f.render_widget(block, area);
 
         let selected_col = ed.fields.get(ed.cursor).map(|(c, _)| c.name.clone());
-        paint_spec(f, inner, spec, th, selected_col.as_deref(), |col| {
+        app.viewports.edit.rows = inner.height as usize;
+        paint_spec(f, inner, spec, th, selected_col.as_deref(), (0, 0), |col| {
             let i = ed.fields.iter().position(|(c, _)| c.name == col)?;
             let selected = i == ed.cursor;
             Some(match (selected, &ed.editing) {
-                (true, Some(buf)) => Span::styled(format!("{buf}▏"), th.cursor()),
+                (true, Some(buf)) => editing_span(
+                    buf,
+                    spec.fields
+                        .iter()
+                        .find(|fl| fl.column == col)
+                        .map_or(1, |fl| fl.width.saturating_sub(1)),
+                    th,
+                ),
                 _ => {
                     let (text, edited) = match &ed.inputs[i] {
                         Some(t) => (note_display(t), true),
@@ -1483,7 +1937,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
         .clamp(4, 20);
     let panes = link_pane_lines(ed, th);
     let area = centered(
-        f.area(),
+        dialog_area(f.area()),
         if panes.is_empty() { 62 } else { 66 },
         (ed.fields.len() as u16 + 4 + panes.len() as u16).min(f.area().height),
     );
@@ -1533,7 +1987,7 @@ fn draw_edit(f: &mut Frame, app: &App) {
         );
         let selected = i == ed.cursor;
         let value_span = if let (true, Some(buf)) = (selected, &ed.editing) {
-            Span::styled(format!("{buf}▏"), th.cursor())
+            editing_span(buf, inner.width.saturating_sub(label_w as u16 + 5), th)
         } else {
             let (text, edited) = match &ed.inputs[i] {
                 Some(t) => (note_display(t), true),
@@ -1559,52 +2013,114 @@ fn draw_edit(f: &mut Frame, app: &App) {
         "type to edit · Tab next · Enter save · PgUp/PgDn record · Esc cancel",
         th.dim(),
     ));
-    f.render_widget(Paragraph::new(lines), inner);
+    draw_rows(f, inner, lines, 0, ed.cursor, &mut app.viewports.edit);
 }
 
 /// The F7 foreign-key value picker: a scrollable list of parent rows;
 /// the first column is the key that gets written into the field.
-fn draw_picker(f: &mut Frame, app: &App, ed: &crate::app::EditState) {
+fn draw_picker(f: &mut Frame, app: &mut App) {
     let th = app.theme;
+    let Overlay::Edit(ed) = &app.overlay else {
+        return;
+    };
     let Some(p) = &ed.picker else { return };
-    let area = centered(
-        f.area(),
-        (p.columns.len() as u16 * 20).clamp(40, f.area().width.saturating_sub(4)),
-        (p.rows.len() as u16 + 4)
-            .min(f.area().height.saturating_sub(2))
-            .max(6),
-    );
+    let area = centered(dialog_area(f.area()), 84, 24);
     f.render_widget(Clear, area);
+    let position = if p.loading.is_some() {
+        "loading…".into()
+    } else if p.error.is_some() {
+        "lookup failed · F5 retry".into()
+    } else {
+        format!(
+            "{} / {} matches",
+            if p.total == 0 { 0 } else { p.cursor + 1 },
+            p.total
+        )
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(th.bright())
         .style(th.base())
-        .title(Span::styled(p.title.clone(), th.bright()))
-        .title_bottom(Line::styled(" ↑↓ · Enter pick · Esc ", th.dim()));
+        .title(format!(" PICK · {} · {position} ", p.parent))
+        .title_bottom(" / search · Enter pick · Esc close · PgUp/PgDn · Home/End · ←→ columns ");
     let inner = block.inner(area);
     f.render_widget(block, area);
-
-    let mut lines: Vec<Line> = vec![Line::from(
-        p.columns
+    let [search_area, rows_area] =
+        Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(inner);
+    let mut search = vec![Span::styled("Search: ", th.bright())];
+    search.push(match &p.editing {
+        Some(buf) => editing_span(buf, inner.width.saturating_sub(9), th),
+        None => Span::styled(
+            if p.search.is_empty() {
+                "(all records)"
+            } else {
+                &p.search
+            },
+            th.base(),
+        ),
+    });
+    f.render_widget(
+        Paragraph::new(vec![Line::from(search), Line::styled(position, th.dim())]),
+        search_area,
+    );
+    if p.loading.is_some() {
+        f.render_widget(
+            Paragraph::new("Loading matching records…").style(th.dim()),
+            rows_area,
+        );
+        return;
+    }
+    if let Some(error) = &p.error {
+        f.render_widget(Paragraph::new(format!("Lookup failed: {error}\nF5 retries; / changes the search; Esc returns to the form."))
+            .wrap(ratatui::widgets::Wrap { trim: false }).style(th.error()), rows_area);
+        return;
+    }
+    if p.rows.is_empty() {
+        f.render_widget(Paragraph::new("No matching records.\nPress / to change or clear the search; Esc returns to the form.")
+            .wrap(ratatui::widgets::Wrap { trim: false }).style(th.dim()), rows_area);
+        return;
+    }
+    // Freeze the key; arrow horizontally through the descriptive fields.
+    let count = ((inner.width as usize / 20).max(2)).min(p.columns.len());
+    let indexes: Vec<_> = std::iter::once(0)
+        .chain((p.column + 1..p.columns.len()).take(count.saturating_sub(1)))
+        .collect();
+    let width = inner.width / indexes.len().max(1) as u16;
+    let mut lines = vec![Line::from(
+        indexes
             .iter()
-            .map(|c| Span::styled(pad(c, 20), th.dim()))
+            .map(|&i| Span::styled(pad(&p.columns[i], width.saturating_sub(1)), th.dim()))
             .collect::<Vec<_>>(),
     )];
-    let visible = inner.height.saturating_sub(1).max(1) as usize;
-    let start = p.cursor.saturating_sub(visible.saturating_sub(1));
-    for (i, row) in p.rows.iter().enumerate().skip(start).take(visible) {
-        let style = if i == p.cursor {
+    for (i, row) in p.rows.iter().enumerate() {
+        let style = if p.start + i == p.cursor {
             th.cursor()
         } else {
             th.base()
         };
         lines.push(Line::from(
-            row.iter()
-                .map(|v| Span::styled(pad(&v.render(), 20), style))
+            indexes
+                .iter()
+                .map(|&c| {
+                    Span::styled(
+                        pad(
+                            &row.get(c).map(PValue::render).unwrap_or_default(),
+                            width.saturating_sub(1),
+                        ),
+                        style,
+                    )
+                })
                 .collect::<Vec<_>>(),
         ));
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    draw_rows(
+        f,
+        rows_area,
+        lines,
+        1,
+        p.cursor.saturating_sub(p.start) + 1,
+        &mut app.viewports.picker,
+    );
 }
 
 /// The multi-line Lua editor: line numbers, an inverse caret, dirty
@@ -1615,7 +2131,7 @@ fn note_display(text: &str) -> String {
     text.replace('\n', "␤")
 }
 
-fn draw_script_editor(f: &mut Frame, app: &App) {
+fn draw_script_editor(f: &mut Frame, app: &mut App) {
     let th = app.theme;
     let Overlay::ScriptEditor(st) = &app.overlay else {
         return;
@@ -1640,39 +2156,56 @@ fn draw_script_editor(f: &mut Frame, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let visible = inner.height as usize;
-    let start = st.row.saturating_sub(visible.saturating_sub(1));
-    let mut lines: Vec<Line> = Vec::with_capacity(visible);
-    for (i, text) in st.lines.iter().enumerate().skip(start).take(visible) {
-        let num = format!("{:>3} ", i + 1);
-        if i == st.row {
-            let chars: Vec<char> = text.chars().collect();
-            let col = st.col.min(chars.len());
-            let before: String = chars[..col].iter().collect();
-            let cur = chars.get(col).copied().unwrap_or(' ');
-            let after: String = chars
-                .get(col + 1..)
-                .map(|s| s.iter().collect())
-                .unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::styled(num, th.dim()),
-                Span::styled(before, th.base()),
-                Span::styled(cur.to_string(), th.cursor()),
-                Span::styled(after, th.base()),
-            ]));
+    let number_width = (st.lines.len().to_string().len().max(3) + 1) as u16;
+    let [numbers, content] =
+        Layout::horizontal([Constraint::Length(number_width), Constraint::Fill(1)]).areas(inner);
+    app.viewports
+        .script
+        .follow(st.row, st.lines.len(), inner.height as usize);
+    let start = app.viewports.script.top;
+    let current = st.lines.get(st.row).map(String::as_str).unwrap_or("");
+    let byte = current
+        .char_indices()
+        .nth(st.col)
+        .map(|(b, _)| b)
+        .unwrap_or(current.len());
+    let current_line = caret_line(
+        current,
+        byte,
+        content.width,
+        &mut app.viewports.script_left,
+        th,
+    );
+    let mut nums = Vec::new();
+    let mut lines = Vec::new();
+    for (i, text) in st
+        .lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(inner.height as usize)
+    {
+        nums.push(Line::styled(
+            format!(
+                "{:>w$} ",
+                i + 1,
+                w = number_width.saturating_sub(1) as usize
+            ),
+            th.dim(),
+        ));
+        lines.push(if i == st.row {
+            current_line.clone()
         } else {
-            lines.push(Line::from(vec![
-                Span::styled(num, th.dim()),
-                Span::styled(text.clone(), th.base()),
-            ]));
-        }
+            Line::styled(text_from_column(text, app.viewports.script_left), th.base())
+        });
     }
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(nums), numbers);
+    f.render_widget(Paragraph::new(lines), content);
 }
 
-fn draw_help(f: &mut Frame, app: &App) {
+fn draw_help(f: &mut Frame, app: &mut App) {
     let th = app.theme;
-    let Overlay::Help(st) = &app.overlay else {
+    let Overlay::Help(st) = &mut app.overlay else {
         return;
     };
     let topics = crate::help::TOPICS;
@@ -1695,12 +2228,17 @@ fn draw_help(f: &mut Frame, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let [toc, _, body] = Layout::horizontal([
-        Constraint::Length(16),
-        Constraint::Length(2),
-        Constraint::Fill(1),
-    ])
-    .areas(inner);
+    let (toc, body) = if inner.width >= 64 {
+        let [toc, _, body] = Layout::horizontal([
+            Constraint::Length(16),
+            Constraint::Length(2),
+            Constraint::Fill(1),
+        ])
+        .areas(inner);
+        (toc, body)
+    } else {
+        (Rect::default(), inner)
+    };
 
     let toc_lines: Vec<Line> = topics
         .iter()
@@ -1712,14 +2250,25 @@ fn draw_help(f: &mut Frame, app: &App) {
             )
         })
         .collect();
-    f.render_widget(Paragraph::new(toc_lines), toc);
+    draw_rows(
+        f,
+        toc,
+        toc_lines,
+        0,
+        st.topic,
+        &mut app.viewports.help_topics,
+    );
 
     let mut body_lines: Vec<Line> = vec![
         Line::styled(topic.title.to_uppercase(), th.bright()),
         Line::raw(""),
     ];
     body_lines.extend(topic.body.lines().map(|l| Line::styled(l, th.base())));
-    let scroll =
-        (st.scroll as usize).min(body_lines.len().saturating_sub(body.height as usize / 2)) as u16;
-    f.render_widget(Paragraph::new(body_lines).scroll((scroll, 0)), body);
+    let paragraph = Paragraph::new(body_lines).wrap(ratatui::widgets::Wrap { trim: false });
+    let max = paragraph
+        .line_count(body.width)
+        .saturating_sub(body.height as usize)
+        .min(u16::MAX as usize) as u16;
+    st.scroll = st.scroll.min(max);
+    f.render_widget(paragraph.scroll((st.scroll, 0)), body);
 }

@@ -1282,5 +1282,6 @@ mod tests {
         run().unwrap();
         crate::app::assert_related_record_workflow(Box::new(RemoteDb::open(url).unwrap()));
         crate::app::assert_builder_workflow(|| Box::new(RemoteDb::open(url).unwrap()));
+        crate::app::assert_picker_workflow(Box::new(RemoteDb::open(url).unwrap()));
     }
 }

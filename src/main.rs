@@ -15,6 +15,7 @@ mod db;
 mod forms;
 mod help;
 mod output;
+mod picker;
 mod qbe;
 mod remote;
 mod report;

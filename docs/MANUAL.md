@@ -45,6 +45,8 @@ The left panel lists tables (▪) and views (◇). Move with the arrow
 keys — or just type a letter to jump to the next table starting
 with it — and press Enter to open one in BROWSE, a grid that loads
 rows as you scroll, so a million-row table opens instantly.
+The table list follows your selection. PgUp/PgDn moves a screenful;
+Home/End reaches its first or last table.
 phosphor's own machinery (shadow tables, _phosphor catalogs, the
 dbhealth views) stays hidden; press i to reveal it. Press C for
 the TABLE DESIGNER — define fields as rows while the CREATE
@@ -91,11 +93,21 @@ In the grid:
     cancels. It is the same editor that writes Lua scripts.
   · Tab moves to the next field (committing anything typed);
     Shift-Tab moves back. Both skip computed and generated fields.
+    Up/Down also lets you inspect read-only fields. Alt-PgUp/PgDn
+    pages through fields; Ctrl-Home/End reaches the first or last.
+    Long forms scroll to keep the selected field visible.
   · Declared FOREIGN KEYS become child panes under the form —
     open a customer and their orders are right there, refreshed
     live as you page. F4/F5/F6 opens a pane as a filtered BROWSE
     of the child table. On a foreign-key FIELD, F7 opens a picker:
-    choose a parent row and its key is written for you.
+    choose a parent row and its key is written for you. The picker
+    shows the match count and loads every parent in pages of 100.
+    Press /, type a name, key, or other detail, then Enter to search.
+    Search finds literal text across the parent's fields. PgUp/PgDn
+    pages through matches; Home/End reaches the first or last match.
+    Left/Right shows more columns while keeping the key visible.
+    Enter chooses; Esc returns to the form with your draft intact.
+    A failed lookup stays open: F5 retries, / changes the search.
   · PgUp/PgDn (or ←/→) in the form flip to the previous/next
     RECORD — and holding the key ACCELERATES, up to ten records a
     stride, so a thousand-row file passes in seconds. Unsaved edits
@@ -272,9 +284,15 @@ column with four properties:
   order     [ and ] move the field up and down.
 
 F6 saves; from then on EDIT and NEW use your form for that table.
+Designer lists follow the selected row as you move. PgUp/PgDn
+moves a page; Home/End reaches the first or last row. Long input
+also appears above the prompt, with the caret kept in view.
 
 Press F2 for the FORM PAINTER — CREATE SCREEN, reborn. Your fields
-appear on a canvas exactly the size the form will render:
+appear on a canvas that scrolls to follow your cursor. New fields
+extend the canvas instead of overlapping at the bottom. On a
+terminal too small for the saved layout, EDIT uses a scrolling list
+with the same labels, field order, and validation rules:
 
   Tab       select the next field (the cursor jumps to it)
   arrows    move the cursor around the canvas
@@ -366,6 +384,9 @@ opens a multi-line editor (type, Enter for a new line, Tab to
 indent, F6 saves, Esc closes without saving). In the
 Applications Generator, E opens the same editor on the selected
 script menu item.
+The editor scrolls vertically and horizontally to follow the caret;
+Home/End reaches the start or end of a line. The dot prompt also
+keeps the caret visible when a command is longer than the screen.
 
 Sandbox: a 32 MB heap cap and an instruction budget limit runaway
 scripts. Lua's math, string, table, and utf8 libraries are available.
@@ -493,6 +514,7 @@ Everywhere
 
 Table list
   ↑↓ move · letters seek · i internals · Enter browse
+  PgUp/PgDn page · Home/End first/last table
   C table designer · E table editor · r refresh · q quit
 
 BROWSE grid
@@ -505,12 +527,19 @@ BROWSE grid
 
 EDIT / NEW record
   ↑↓/Tab field · PgUp/PgDn (or ←→) previous/next record
+  Alt-PgUp/PgDn page fields · Ctrl-Home/End first/last field
   Enter edit value · Enter again commit + SAVE + next field
   F3 full-screen note editor · F7 pick a foreign-key value
   F4/F5/F6 child panes · F10 / Ctrl-S save and close
   Esc cancel value, then close
 
+Foreign-key picker
+  / search name, key, or details · Enter search/choose · Esc back
+  ↑↓ move · PgUp/PgDn 100 records · Home/End first/last match
+  ←→ more columns · F5 retry/refresh · count includes all matches
+
 Designers
+  PgUp/PgDn page · Home/End first/last row (when not typing)
   form: Space show · n add · x del · r required · m mask · c computed
         Enter label · [ ] order · F2 painter · F6 save
   qbe:  Space show · Enter filter · s sort · J join · g group
@@ -533,5 +562,6 @@ Pager (reports, labels)
   ↑↓ PgUp PgDn scroll · g G ends · w write file · p print
 
 Help
-  ←→ topics · ↑↓ PgUp PgDn scroll · Esc close
+  ←→ topics · ↑↓ PgUp PgDn scroll · Home/End top/bottom · Esc close
+  Text wraps to the available width.
 ```

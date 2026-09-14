@@ -89,11 +89,19 @@ impl FormSpec {
     /// column) so the painter always starts from something visible.
     pub fn auto_place(&mut self) {
         let mut y = 1u16;
-        let (w, h) = self.size;
+        let (w, _) = self.size;
+        let mut occupied: std::collections::HashSet<_> =
+            self.fields.iter().filter_map(|f| f.pos).collect();
+        let x = 2.min(w.saturating_sub(1));
         for f in self.fields.iter_mut().filter(|f| f.include) {
             if f.pos.is_none() {
-                f.pos = Some((2.min(w.saturating_sub(1)), y.min(h.saturating_sub(1))));
-                y += 2;
+                while occupied.contains(&(x, y)) && y < u16::MAX - 2 {
+                    y += 2;
+                }
+                f.pos = Some((x, y));
+                occupied.insert((x, y));
+                self.size.1 = self.size.1.max(y.saturating_add(2));
+                y = y.saturating_add(2);
             }
         }
     }

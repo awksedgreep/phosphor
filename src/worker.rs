@@ -51,6 +51,7 @@ pub enum DbResponse {
     HealthConsole(DbResult<HealthData>),
     /// Split-view detail pane: filtered child rows + total in one job.
     Detail(DbResult<DetailData>),
+    Picker(DbResult<crate::picker::PickerPage>),
 }
 
 /// Everything open_table needs to build a Grid, from one worker job.

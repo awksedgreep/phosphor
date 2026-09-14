@@ -16,6 +16,7 @@ use crate::forms::{
     DEFAULT_FIELD_WIDTH,
 };
 use crate::help::{self, HelpState};
+use crate::picker::PickerState;
 use crate::qbe::{QbeSpec, QbeState};
 use crate::report::{self, PagerState, ReportSpec, ReportState};
 use crate::store;
@@ -192,6 +193,8 @@ pub struct EditState {
     pub computed: Vec<Option<String>>,
     /// Edited text per field; None = untouched.
     pub inputs: Vec<Option<String>>,
+    /// Picker choices retain their database type, including empty TEXT and BLOB keys.
+    pub picked_values: HashMap<usize, (String, PValue)>,
     pub cursor: usize,
     /// Some(buffer) while a field is being typed into.
     pub editing: Option<String>,
@@ -205,6 +208,17 @@ pub struct EditState {
 }
 
 impl EditState {
+    fn value(&self, field: usize) -> PValue {
+        match &self.inputs[field] {
+            Some(text) => self
+                .picked_values
+                .get(&field)
+                .filter(|(display, _)| display == text)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| PValue::parse(text, &self.fields[field].0.decl_type)),
+            None => self.fields[field].1.clone(),
+        }
+    }
     pub fn parent_field(&self, field: usize) -> bool {
         self.relation.as_ref().is_some_and(|r| {
             self.fields
@@ -222,19 +236,6 @@ impl EditState {
             || matches!(self.computed.get(field), Some(Some(_)))
             || self.parent_field(field)
     }
-}
-
-/// A value-lookup pop-up for a foreign-key field (dBASE-style `F7`):
-/// pick a parent row and the key value is written into the field.
-pub struct PickerState {
-    pub title: String,
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<PValue>>,
-    pub cursor: usize,
-    /// Index of the EDIT field this picker fills.
-    pub field: usize,
-    /// Index of the key column within `columns`.
-    pub key_col: usize,
 }
 
 pub enum GridSource {
@@ -376,6 +377,14 @@ pub enum Command {
     EditPick,
     /// Move the open picker's cursor.
     PickerMove(i64),
+    PickerPage(i64),
+    PickerEdge(bool),
+    PickerSearch,
+    PickerChar(char),
+    PickerBackspace,
+    PickerFilter,
+    PickerRefresh,
+    PickerColumn(i64),
     /// Write the picked key value into the field and close.
     PickerCommit,
     /// Close the picker without changing the field.
@@ -400,6 +409,8 @@ pub enum Command {
     GridBottom,
     OpenEdit,
     EditMove(i64),
+    EditInspectMove(i64),
+    EditFieldEdge(bool),
     EditBegin,
     EditChar(char),
     EditBackspace,
@@ -420,6 +431,8 @@ pub enum Command {
     OpenReport(Option<String>),
     OpenLabels(Option<String>),
     DesignerMove(i64),
+    DesignerPage(i64),
+    DesignerEdge(bool),
     DesignerToggle,
     DesignerCycle,
     DesignerEditBegin,
@@ -500,6 +513,8 @@ pub enum Command {
     CreateUnique,
     /// First-letter seek in the sidebar (dBASE-style, cycling).
     SidebarSeek(char),
+    SidebarPage(i64),
+    SidebarEdge(bool),
     /// TABLE EDITOR: drop the whole table (`D`, twice to confirm).
     DropTable,
     /// Show/hide internal tables (shadow, _phosphor, dbhealth views).
@@ -537,9 +552,15 @@ pub enum Command {
 /// result cannot replace a revised or closed design.
 enum PendingOp {
     /// Table open: build + swap in a fresh grid on arrival.
-    Open { name: String },
+    Open {
+        name: String,
+    },
     /// Ad-hoc SELECT: build a query grid on arrival.
-    Select { seq: u64, preview: bool },
+    Select {
+        seq: u64,
+        preview: bool,
+    },
+    Picker,
     /// Refresh: total + window into the live grid, then re-seek.
     Refill {
         name: String,
@@ -548,7 +569,10 @@ enum PendingOp {
         want_start: i64,
     },
     /// Scroll window: installs into the live grid when still wanted.
-    Page { table: String, want_start: i64 },
+    Page {
+        table: String,
+        want_start: i64,
+    },
     /// Find scan: one table window per response; hits jump, misses
     /// chain the next window until the cap. Superseded scans die by seq.
     Find {
@@ -572,7 +596,10 @@ enum PendingOp {
     },
     /// Detail-pane rows for a split BROWSE, keyed by the parent key
     /// they were fetched for (stale arrivals drop).
-    Detail { want_key: String, start: i64 },
+    Detail {
+        want_key: String,
+        start: i64,
+    },
 }
 
 pub struct App {
@@ -594,6 +621,7 @@ pub struct App {
     pub shimmer: bool,
     pub focus: Focus,
     pub overlay: Overlay,
+    pub viewports: crate::ui::Viewports,
     /// The complete screen suspended by Help, including uncommitted
     /// input. Taking it on return prevents a second Help from nesting.
     help_return: Option<Overlay>,
@@ -694,6 +722,7 @@ impl App {
             shimmer: false,
             focus: Focus::Sidebar,
             overlay: Overlay::None,
+            viewports: crate::ui::Viewports::default(),
             help_return: None,
             preview_returns: Vec::new(),
             query_preview: None,
@@ -835,6 +864,30 @@ impl App {
             return;
         };
         match (op, resp) {
+            (PendingOp::Picker, DbResponse::Picker(result)) => {
+                let Overlay::Edit(ed) = &mut self.overlay else {
+                    return;
+                };
+                let Some(p) = &mut ed.picker else { return };
+                if p.loading != Some(tag) {
+                    return;
+                }
+                p.loading = None;
+                match result {
+                    Ok(page) => {
+                        p.rows = page.rows;
+                        p.start = page.start;
+                        p.cursor = page.cursor;
+                        p.total = page.total;
+                        p.error = None;
+                        self.last_ms = Some(took.as_secs_f64() * 1000.0);
+                    }
+                    Err(e) => {
+                        p.error = Some(e.clone());
+                        self.err(e);
+                    }
+                }
+            }
             (PendingOp::Open { name }, DbResponse::Opened(r)) => match r {
                 Ok(g) => {
                     // Refresh the schema caches the job already paid for.
@@ -1329,15 +1382,49 @@ impl App {
             });
         }
         if let Overlay::Edit(ed) = &self.overlay {
-            // The FK picker, when open, owns the keyboard.
-            if ed.picker.is_some() {
-                return Some(match key.code {
-                    Up | Char('k') => Command::PickerMove(-1),
-                    Down | Char('j') => Command::PickerMove(1),
-                    Enter => Command::PickerCommit,
-                    Esc | Char('q') => Command::PickerCancel,
+            // Search input is explicit, so browsing retains j/k shortcuts.
+            if let Some(p) = &ed.picker {
+                return Some(match (&p.editing, key.code) {
+                    (Some(_), Enter) => Command::PickerFilter,
+                    (Some(_), Esc) => Command::PickerCancel,
+                    (Some(_), Backspace) => Command::PickerBackspace,
+                    (Some(_), Char(c)) => Command::PickerChar(c),
+                    (None, Up | Char('k')) => Command::PickerMove(-1),
+                    (None, Down | Char('j')) => Command::PickerMove(1),
+                    (None, PageUp) => Command::PickerPage(-1),
+                    (None, PageDown) => Command::PickerPage(1),
+                    (None, Home) => Command::PickerEdge(false),
+                    (None, End) => Command::PickerEdge(true),
+                    (None, Left) => Command::PickerColumn(-1),
+                    (None, Right) => Command::PickerColumn(1),
+                    (None, Char('/')) => Command::PickerSearch,
+                    (None, F(5)) => Command::PickerRefresh,
+                    (None, Enter) => Command::PickerCommit,
+                    (None, Esc | Char('q')) => Command::PickerCancel,
                     _ => return None,
                 });
+            }
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                match key.code {
+                    PageUp => {
+                        return Some(Command::EditInspectMove(
+                            -(self.viewports.edit.rows.max(1) as i64),
+                        ))
+                    }
+                    PageDown => {
+                        return Some(Command::EditInspectMove(
+                            self.viewports.edit.rows.max(1) as i64
+                        ))
+                    }
+                    _ => {}
+                }
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    Home => return Some(Command::EditFieldEdge(false)),
+                    End => return Some(Command::EditFieldEdge(true)),
+                    _ => {}
+                }
             }
             return Some(match (&ed.editing, key.code) {
                 (Some(_), Enter) => Command::EditCommitField,
@@ -1358,8 +1445,10 @@ impl App {
                 (Some(_), Tab) => Command::EditCommitField,
                 (Some(_), BackTab) => Command::EditMove(-1),
                 (Some(_), Char(c)) => Command::EditChar(c),
-                (None, Up | BackTab) => Command::EditMove(-1),
-                (None, Down | Tab) => Command::EditMove(1),
+                (None, BackTab) => Command::EditMove(-1),
+                (None, Tab) => Command::EditMove(1),
+                (None, Up) => Command::EditInspectMove(-1),
+                (None, Down) => Command::EditInspectMove(1),
                 (None, PageDown | Right) => Command::EditPage(1),
                 (None, PageUp | Left) => Command::EditPage(-1),
                 (None, Enter) => Command::EditBegin,
@@ -1418,6 +1507,7 @@ impl App {
                 PageUp => Command::HelpScroll(-20),
                 PageDown | Char(' ') => Command::HelpScroll(20),
                 Home | Char('g') => Command::HelpScroll(i64::MIN / 2),
+                End | Char('G') => Command::HelpScroll(i64::MAX / 2),
                 Left | Char('h') => Command::HelpTopic(-1),
                 Right | Char('l') | Tab => Command::HelpTopic(1),
                 _ => return None,
@@ -1433,6 +1523,10 @@ impl App {
         }
         if let Overlay::Qbe(st) = &self.overlay {
             return Some(match (&st.editing, key.code) {
+                (None, PageUp) => Command::DesignerPage(-1),
+                (None, PageDown) => Command::DesignerPage(1),
+                (None, Home) => Command::DesignerEdge(false),
+                (None, End) => Command::DesignerEdge(true),
                 (Some(_), Enter) => Command::DesignerCommit,
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
@@ -1454,6 +1548,10 @@ impl App {
         }
         if let Overlay::Report(st) = &self.overlay {
             return Some(match (&st.editing, key.code) {
+                (None, PageUp) => Command::DesignerPage(-1),
+                (None, PageDown) => Command::DesignerPage(1),
+                (None, Home) => Command::DesignerEdge(false),
+                (None, End) => Command::DesignerEdge(true),
                 (Some(_), Enter) => Command::DesignerCommit,
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
@@ -1472,6 +1570,10 @@ impl App {
         }
         if let Overlay::Create(st) = &self.overlay {
             return Some(match (&st.editing, key.code) {
+                (None, PageUp) => Command::DesignerPage(-1),
+                (None, PageDown) => Command::DesignerPage(1),
+                (None, Home) => Command::DesignerEdge(false),
+                (None, End) => Command::DesignerEdge(true),
                 (Some(_), Enter) => Command::DesignerCommit,
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
@@ -1520,6 +1622,10 @@ impl App {
         }
         if let Overlay::Form(st) = &self.overlay {
             return Some(match (&st.editing, key.code) {
+                (None, PageUp) => Command::DesignerPage(-1),
+                (None, PageDown) => Command::DesignerPage(1),
+                (None, Home) => Command::DesignerEdge(false),
+                (None, End) => Command::DesignerEdge(true),
                 (Some(_), Enter) => Command::DesignerCommit,
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
@@ -1565,6 +1671,10 @@ impl App {
         }
         if let Overlay::Apps(st) = &self.overlay {
             return Some(match (&st.editing, key.code) {
+                (None, PageUp) => Command::DesignerPage(-1),
+                (None, PageDown) => Command::DesignerPage(1),
+                (None, Home) => Command::DesignerEdge(false),
+                (None, End) => Command::DesignerEdge(true),
                 (Some(_), Enter) => Command::DesignerCommit,
                 (Some(_), Esc) => Command::Back,
                 (Some(_), Backspace) => Command::DesignerBackspace,
@@ -1587,6 +1697,10 @@ impl App {
         }
         if matches!(self.overlay, Overlay::AppMenu(_)) {
             return Some(match key.code {
+                PageUp => Command::DesignerPage(-1),
+                PageDown => Command::DesignerPage(1),
+                Home => Command::DesignerEdge(false),
+                End => Command::DesignerEdge(true),
                 Esc | Char('0') => Command::Back,
                 Up => Command::DesignerMove(-1),
                 Down => Command::DesignerMove(1),
@@ -1621,6 +1735,10 @@ impl App {
                 })
             }
             Focus::Sidebar => Some(match key.code {
+                PageUp => Command::SidebarPage(-1),
+                PageDown => Command::SidebarPage(1),
+                Home => Command::SidebarEdge(false),
+                End => Command::SidebarEdge(true),
                 Char('q') => Command::Quit,
                 Up | Char('k') => Command::SidebarMove(-1),
                 Down | Char('j') => Command::SidebarMove(1),
@@ -1799,42 +1917,95 @@ impl App {
                 }
             }
             Command::EditPick => self.open_picker(),
-            Command::PickerMove(d) => {
+            Command::PickerMove(d) => self.picker_move(d, None),
+            Command::PickerPage(d) => {
+                self.picker_move(d.saturating_mul(crate::picker::PAGE_SIZE as i64), None)
+            }
+            Command::PickerEdge(end) => self.picker_move(0, Some(end)),
+            Command::PickerSearch => {
                 if let Overlay::Edit(ed) = &mut self.overlay {
                     if let Some(p) = &mut ed.picker {
-                        let n = p.rows.len();
-                        if n > 0 {
-                            p.cursor = (p.cursor as i64 + d).rem_euclid(n as i64) as usize;
+                        p.editing = Some(p.search.clone());
+                        self.editor_fresh = true;
+                    }
+                }
+            }
+            Command::PickerChar(c) => {
+                let fresh = std::mem::take(&mut self.editor_fresh);
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    if let Some(buf) = ed.picker.as_mut().and_then(|p| p.editing.as_mut()) {
+                        if fresh {
+                            buf.clear();
                         }
+                        buf.push(c);
+                    }
+                }
+            }
+            Command::PickerBackspace => {
+                self.editor_fresh = false;
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    if let Some(buf) = ed.picker.as_mut().and_then(|p| p.editing.as_mut()) {
+                        buf.pop();
+                    }
+                }
+            }
+            Command::PickerFilter => {
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    if let Some(p) = &mut ed.picker {
+                        if let Some(buf) = p.editing.take() {
+                            p.search = buf;
+                            p.cursor = 0;
+                        }
+                    }
+                }
+                self.refresh_picker(0);
+            }
+            Command::PickerRefresh => {
+                if let Overlay::Edit(ed) = &self.overlay {
+                    if let Some(p) = &ed.picker {
+                        self.refresh_picker(p.cursor);
+                    }
+                }
+            }
+            Command::PickerColumn(d) => {
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    if let Some(p) = &mut ed.picker {
+                        p.column = (p.column as i64 + d)
+                            .clamp(0, p.columns.len().saturating_sub(2) as i64)
+                            as usize;
                     }
                 }
             }
             Command::PickerCancel => {
                 if let Overlay::Edit(ed) = &mut self.overlay {
-                    ed.picker = None;
+                    if let Some(p) = &mut ed.picker {
+                        if p.editing.take().is_none() {
+                            ed.picker = None;
+                        }
+                    }
                 }
             }
             Command::PickerCommit => {
                 let picked = match &self.overlay {
-                    Overlay::Edit(ed) => ed.picker.as_ref().and_then(|p| {
-                        p.rows
-                            .get(p.cursor)
-                            .and_then(|r| r.get(p.key_col))
-                            .map(|v| {
-                                (
-                                    p.field,
-                                    match v {
-                                        PValue::Null => String::new(),
-                                        v => v.render(),
-                                    },
-                                )
-                            })
-                    }),
+                    Overlay::Edit(ed) => ed
+                        .picker
+                        .as_ref()
+                        .filter(|p| p.loading.is_none() && p.error.is_none())
+                        .and_then(|p| {
+                            p.cursor
+                                .checked_sub(p.start)
+                                .and_then(|i| p.rows.get(i))
+                                .and_then(|r| r.first())
+                                .map(|v| (p.field, v.clone()))
+                        }),
                     _ => None,
                 };
                 if let (Some((field, value)), Overlay::Edit(ed)) = (picked, &mut self.overlay) {
                     if field < ed.inputs.len() {
-                        ed.inputs[field] = Some(value);
+                        let text = pvalue_to_input(&value);
+                        ed.picked_values.insert(field, (text.clone(), value));
+                        ed.inputs[field] = Some(text);
+                        ed.editing = None;
                     }
                     ed.picker = None;
                 }
@@ -1862,7 +2033,9 @@ impl App {
             }
             Command::HelpScroll(d) => {
                 if let Overlay::Help(st) = &mut self.overlay {
-                    st.scroll = (st.scroll as i64 + d).clamp(0, 500) as u16;
+                    st.scroll = (st.scroll as i64)
+                        .saturating_add(d)
+                        .clamp(0, u16::MAX as i64) as u16;
                 }
             }
             Command::HelpTopic(d) => {
@@ -1987,6 +2160,25 @@ impl App {
             Command::ColWidth(d) => self.adjust_col_width(d),
             Command::ToggleFreeze => self.toggle_freeze(),
             Command::OpenEdit => self.open_edit(),
+            Command::EditInspectMove(d) => {
+                self.fold_editing_buffer();
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    ed.cursor = (ed.cursor as i64)
+                        .saturating_add(d)
+                        .clamp(0, ed.fields.len().saturating_sub(1) as i64)
+                        as usize;
+                }
+            }
+            Command::EditFieldEdge(end) => {
+                self.fold_editing_buffer();
+                if let Overlay::Edit(ed) = &mut self.overlay {
+                    ed.cursor = if end {
+                        ed.fields.len().saturating_sub(1)
+                    } else {
+                        0
+                    };
+                }
+            }
             Command::EditMove(d) => {
                 self.fold_editing_buffer();
                 if let Overlay::Edit(ed) = &mut self.overlay {
@@ -2150,6 +2342,21 @@ impl App {
             Command::OpenQbe(t) => self.open_qbe(t),
             Command::OpenReport(t) => self.open_report(t),
             Command::OpenLabels(t) => self.open_labels(t),
+            Command::DesignerPage(d) => self.designer_page(d, None),
+            Command::DesignerEdge(end) => self.designer_page(0, Some(end)),
+            Command::SidebarPage(d) => {
+                self.sidebar_idx = (self.sidebar_idx as i64)
+                    .saturating_add(d.saturating_mul(self.viewports.sidebar.rows.max(1) as i64))
+                    .clamp(0, self.visible_tables().len().saturating_sub(1) as i64)
+                    as usize;
+            }
+            Command::SidebarEdge(end) => {
+                self.sidebar_idx = if end {
+                    self.visible_tables().len().saturating_sub(1)
+                } else {
+                    0
+                }
+            }
             Command::DesignerMove(d) => self.designer_move(d),
             Command::DesignerToggle => self.designer_toggle(),
             Command::DesignerCycle => self.designer_cycle(),
@@ -2905,6 +3112,33 @@ impl App {
             }
             Err(e) => self.err(e),
         }
+    }
+
+    fn designer_page(&mut self, d: i64, edge: Option<bool>) {
+        let (cursor, count, rows) = match &mut self.overlay {
+            Overlay::Qbe(st) => (&mut st.cursor, st.spec.cols.len(), self.viewports.qbe.rows),
+            Overlay::Report(st) => (&mut st.cursor, 3, self.viewports.report.rows),
+            Overlay::Form(st) => (
+                &mut st.cursor,
+                st.spec.fields.len(),
+                self.viewports.form.rows,
+            ),
+            Overlay::Apps(st) => (&mut st.cursor, st.items.len(), self.viewports.apps.rows),
+            Overlay::AppMenu(st) => (&mut st.cursor, st.items.len(), self.viewports.menu.rows / 2),
+            Overlay::Create(st) => (
+                &mut st.cursor,
+                st.draft.fields.len() + 1,
+                self.viewports.create.rows,
+            ),
+            _ => return,
+        };
+        *cursor = match edge {
+            Some(true) => count.saturating_sub(1),
+            Some(false) => 0,
+            None => (*cursor as i64)
+                .saturating_add(d.saturating_mul(rows.max(1) as i64))
+                .clamp(0, count.saturating_sub(1) as i64) as usize,
+        };
     }
 
     fn designer_move(&mut self, d: i64) {
@@ -4324,8 +4558,19 @@ impl App {
             }
             return;
         }
+        if !matches!(self.overlay, Overlay::None) {
+            return;
+        }
         match kind {
             K::ScrollUp | K::ScrollDown => {
+                if Self::contains(self.hit.sidebar, col, row) {
+                    self.apply(Command::SidebarMove(if matches!(kind, K::ScrollUp) {
+                        -1
+                    } else {
+                        1
+                    }));
+                    return;
+                }
                 let d: i64 = if matches!(kind, K::ScrollUp) { -1 } else { 1 };
                 if Self::contains(self.hit.master, col, row)
                     || Self::contains(self.hit.detail, col, row)
@@ -4335,7 +4580,8 @@ impl App {
             }
             K::Down(_) => {
                 if Self::contains(self.hit.sidebar, col, row) {
-                    let idx = (row - self.hit.sidebar.unwrap().y) as usize;
+                    let idx =
+                        self.viewports.sidebar.top + (row - self.hit.sidebar.unwrap().y) as usize;
                     self.apply(Command::SidebarClick(idx));
                 } else if Self::contains(self.hit.master, col, row) {
                     let r = self.hit.master.unwrap();
@@ -4764,11 +5010,13 @@ impl App {
         // Enter must update this identity instead of inserting a twin.
         ed.inserting = false;
         ed.rowid = new_rowid;
-        for (i, input) in ed.inputs.iter_mut().enumerate() {
-            if let Some(text) = input.take() {
-                ed.fields[i].1 = PValue::parse(&text, &ed.fields[i].0.decl_type);
+        for i in 0..ed.inputs.len() {
+            if ed.inputs[i].is_some() {
+                ed.fields[i].1 = ed.value(i);
+                ed.inputs[i] = None;
             }
         }
+        ed.picked_values.clear();
         let name = ed.table.clone();
         let relation = ed.relation.clone();
         if let Some(relation) = relation {
@@ -4974,6 +5222,7 @@ impl App {
             masks,
             computed,
             inputs: vec![None; n],
+            picked_values: HashMap::new(),
             cursor: keep_cursor,
             editing: None,
             links,
@@ -5023,6 +5272,9 @@ impl App {
         if matches!(&self.overlay, Overlay::Edit(ed) if ed.parent_field(ed.cursor)) {
             return self.say("parent link is fixed in related forms");
         }
+        if matches!(&self.overlay, Overlay::Edit(ed) if ed.read_only(ed.cursor)) {
+            return self.say("computed and generated fields are read-only");
+        }
         let (parent, keycol, field) = match &self.overlay {
             Overlay::Edit(ed) => match ed.pickers.get(ed.cursor) {
                 Some(Some((t, k))) => (t.clone(), k.clone(), ed.cursor),
@@ -5032,30 +5284,83 @@ impl App {
             },
             _ => return,
         };
-        let sql = format!(
-            "SELECT {} AS \"{}\", * FROM {} ORDER BY {} LIMIT 200",
-            Self::quote_ident(&keycol),
-            keycol,
-            Self::quote_ident(&parent),
-            Self::quote_ident(&keycol)
-        );
-        match self.db.query(&sql) {
-            Ok(q) => {
-                if q.rows.is_empty() {
-                    return self.say(format!("{parent} has no rows to pick"));
-                }
-                if let Overlay::Edit(ed) = &mut self.overlay {
-                    ed.picker = Some(PickerState {
-                        title: format!(" PICK · {parent} "),
-                        columns: q.columns,
-                        rows: q.rows,
-                        cursor: 0,
-                        field,
-                        key_col: 0,
-                    });
+        let cols = match self.cached_columns(&parent) {
+            Ok(cols) => cols,
+            Err(e) => return self.err(e),
+        };
+        let mut display: Vec<_> = cols
+            .into_iter()
+            .filter(|c| !c.name.eq_ignore_ascii_case(&keycol))
+            .collect();
+        display.sort_by_key(|c| match c.name.to_ascii_lowercase().as_str() {
+            "name" | "title" | "label" => 0,
+            _ if c.decl_type.to_ascii_uppercase().contains("TEXT") => 1,
+            _ => 2,
+        });
+        let columns = std::iter::once(keycol)
+            .chain(display.into_iter().map(|c| c.name))
+            .collect();
+        if let Overlay::Edit(ed) = &mut self.overlay {
+            ed.picker = Some(PickerState {
+                parent,
+                columns,
+                rows: Vec::new(),
+                cursor: 0,
+                start: 0,
+                total: 0,
+                field,
+                search: String::new(),
+                editing: None,
+                loading: None,
+                error: None,
+                column: 0,
+            });
+        }
+        self.refresh_picker(0);
+    }
+
+    fn refresh_picker(&mut self, want: usize) {
+        let (parent, columns, search) = match &self.overlay {
+            Overlay::Edit(ed) => match &ed.picker {
+                Some(p) => (p.parent.clone(), p.columns.clone(), p.search.clone()),
+                None => return,
+            },
+            _ => return,
+        };
+        let tag = self.db.submit(Box::new(move |db| {
+            DbResponse::Picker(crate::picker::fetch(db, &parent, &columns, &search, want))
+        }));
+        if let Overlay::Edit(ed) = &mut self.overlay {
+            if let Some(p) = &mut ed.picker {
+                p.loading = tag;
+                if let Some(tag) = tag {
+                    self.pending.insert(tag, PendingOp::Picker);
+                } else {
+                    p.error = Some("database worker is gone; F5 retries".into());
                 }
             }
-            Err(e) => self.err(e),
+        }
+    }
+
+    fn picker_move(&mut self, d: i64, edge: Option<bool>) {
+        let Overlay::Edit(ed) = &mut self.overlay else {
+            return;
+        };
+        let Some(p) = &mut ed.picker else { return };
+        if p.loading.is_some() || p.error.is_some() || p.total == 0 {
+            return;
+        }
+        let want = match edge {
+            Some(true) => p.total - 1,
+            Some(false) => 0,
+            None => (p.cursor as i64)
+                .saturating_add(d)
+                .clamp(0, p.total.saturating_sub(1) as i64) as usize,
+        };
+        if (p.start..p.start + p.rows.len()).contains(&want) {
+            p.cursor = want;
+        } else {
+            self.refresh_picker(want);
         }
     }
 
@@ -5424,6 +5729,7 @@ impl App {
             masks,
             computed,
             inputs: vec![None; n],
+            picked_values: HashMap::new(),
             cursor: 0,
             editing: None,
             pickers,
@@ -5659,13 +5965,10 @@ impl App {
         let Overlay::Edit(ed) = &self.overlay else {
             return false;
         };
-        ed.required.iter().enumerate().all(|(i, req)| {
-            !req || ed.read_only(i)
-                || match &ed.inputs[i] {
-                    Some(text) => PValue::parse(text, &ed.fields[i].0.decl_type) != PValue::Null,
-                    None => ed.fields[i].1 != PValue::Null,
-                }
-        })
+        ed.required
+            .iter()
+            .enumerate()
+            .all(|(i, req)| !req || ed.read_only(i) || ed.value(i) != PValue::Null)
     }
 
     /// An open field-editing buffer counts as an edit: fold it into
@@ -5673,6 +5976,9 @@ impl App {
     fn fold_editing_buffer(&mut self) {
         if let Overlay::Edit(ed) = &mut self.overlay {
             if let Some(buf) = ed.editing.take() {
+                if !self.editor_fresh {
+                    ed.picked_values.remove(&ed.cursor);
+                }
                 ed.inputs[ed.cursor] = Some(buf);
             }
         }
@@ -5695,14 +6001,12 @@ impl App {
                     if !req || ed.read_only(i) {
                         continue;
                     }
-                    let is_null = match &ed.inputs[i] {
-                        Some(text) => {
-                            PValue::parse(text, &ed.fields[i].0.decl_type) == PValue::Null
-                        }
-                        None => ed.fields[i].1 == PValue::Null,
-                    };
+                    let is_null = ed.value(i) == PValue::Null;
                     if is_null {
                         let label = ed.labels[i].clone();
+                        if let Overlay::Edit(ed) = &mut self.overlay {
+                            ed.cursor = i;
+                        }
                         self.err(format!("{label:?} is required"));
                         return false;
                     }
@@ -5718,7 +6022,11 @@ impl App {
                 if let Some(text) = &ed.inputs[i] {
                     if !mask_ok(mask, text) {
                         let label = ed.labels[i].clone();
-                        self.err(format!("{label:?} must match {mask}"));
+                        let message = format!("{label:?} must match {mask}");
+                        if let Overlay::Edit(ed) = &mut self.overlay {
+                            ed.cursor = i;
+                        }
+                        self.err(message);
                         return false;
                     }
                 }
@@ -5741,7 +6049,7 @@ impl App {
                     .filter_map(|(i, (col, _))| {
                         ed.inputs[i]
                             .as_ref()
-                            .map(|text| (col.name.clone(), PValue::parse(text, &col.decl_type)))
+                            .map(|_| (col.name.clone(), ed.value(i)))
                     })
                     .collect();
                 // The link survives hidden form fields and lifecycle scripts.
@@ -5789,11 +6097,13 @@ impl App {
                     // displays, or saved values would revert to the
                     // stale (often NULL) originals on screen.
                     if let Overlay::Edit(ed) = &mut self.overlay {
-                        for (i, input) in ed.inputs.iter_mut().enumerate() {
-                            if let Some(text) = input.take() {
-                                ed.fields[i].1 = PValue::parse(&text, &ed.fields[i].0.decl_type);
+                        for i in 0..ed.inputs.len() {
+                            if ed.inputs[i].is_some() {
+                                ed.fields[i].1 = ed.value(i);
+                                ed.inputs[i] = None;
                             }
                         }
+                        ed.picked_values.clear();
                     }
                 }
                 // OnSave runs after the row is committed (side effects,
@@ -5830,10 +6140,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, (c, _))| {
-                let v = match &ed.inputs[i] {
-                    Some(t) => PValue::parse(t, &c.decl_type),
-                    None => ed.fields[i].1.clone(),
-                };
+                let v = ed.value(i);
                 (c.name.clone(), v)
             })
             .collect();
@@ -5888,11 +6195,9 @@ impl App {
                     if ed.read_only(i) {
                         continue;
                     }
-                    let current = match &ed.inputs[i] {
-                        Some(t) => PValue::parse(t, &ed.fields[i].0.decl_type),
-                        None => ed.fields[i].1.clone(),
-                    };
+                    let current = ed.value(i);
                     if &current != v {
+                        ed.picked_values.remove(&i);
                         ed.inputs[i] = Some(pvalue_to_input(v));
                     }
                 }
@@ -6961,9 +7266,414 @@ pub(crate) fn assert_builder_workflow(connect: impl Fn() -> Box<dyn DbLink>) {
 }
 
 #[cfg(test)]
+pub(crate) fn assert_picker_workflow(db: Box<dyn DbLink>) {
+    fn search(a: &mut App, text: &str) {
+        a.apply(Command::PickerSearch);
+        for c in text.chars() {
+            a.apply(Command::PickerChar(c));
+        }
+        a.apply(Command::PickerFilter);
+        a.sync();
+    }
+    fn picker(a: &App) -> &PickerState {
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("form lost")
+        };
+        ed.picker.as_ref().expect("picker lost")
+    }
+    let mut a = App::new(db, None);
+    a.db.execute("CREATE TABLE lookup_parent(id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+        WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1005)
+        INSERT INTO lookup_parent SELECT x,printf('Customer %04d',x),'London' FROM n;
+        UPDATE lookup_parent SET name='100%_O''Brien;' WHERE id=777;
+        CREATE TABLE lookup_order(id INTEGER PRIMARY KEY, product TEXT, customer INTEGER REFERENCES lookup_parent(id));
+        INSERT INTO lookup_order VALUES(1,'modem',1)").unwrap();
+    a.open_table("lookup_order");
+    a.sync();
+    a.apply(Command::OpenEdit);
+    if let Overlay::Edit(ed) = &mut a.overlay {
+        ed.inputs[1] = Some("keep this draft".into());
+        ed.cursor = 2;
+    }
+    a.apply(Command::EditPick);
+    a.apply(Command::PickerCommit); // no selection before a response exists
+    assert!(picker(&a).loading.is_some());
+    a.sync();
+    assert_eq!(picker(&a).total, 1005);
+    assert_eq!(picker(&a).rows.len(), 100);
+    assert_eq!(picker(&a).columns, ["id", "name", "city"]);
+    a.apply(Command::PickerPage(1));
+    a.sync();
+    assert_eq!(picker(&a).cursor, 100);
+    a.apply(Command::PickerEdge(true));
+    a.sync();
+    assert_eq!(picker(&a).cursor, 1004);
+    a.apply(Command::PickerCommit);
+    assert!(
+        matches!(&a.overlay, Overlay::Edit(ed) if ed.inputs[2].as_deref() == Some("1005") && ed.inputs[1].as_deref() == Some("keep this draft"))
+    );
+    a.apply(Command::EditSave);
+    a.sync();
+    assert_eq!(
+        a.db.query("SELECT product,customer FROM lookup_order")
+            .unwrap()
+            .rows[0],
+        [PValue::Text("keep this draft".into()), PValue::Int(1005)]
+    );
+    a.apply(Command::OpenEdit);
+    a.apply(Command::EditInspectMove(2));
+    a.apply(Command::EditPick);
+    a.sync();
+    a.apply(Command::PickerPage(1)); // superseded before installing the page
+    search(&mut a, "customer 0999");
+    assert_eq!(picker(&a).total, 1);
+    assert_eq!(picker(&a).rows[0][0], PValue::Int(999));
+    search(&mut a, "%_O'Brien;");
+    assert_eq!(picker(&a).total, 1);
+    assert_eq!(picker(&a).rows[0][0], PValue::Int(777));
+    search(&mut a, "no such customer");
+    assert_eq!(picker(&a).total, 0);
+    a.apply(Command::PickerCommit);
+    assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.inputs[2].is_none()));
+    search(&mut a, "Customer 1005");
+    a.db.execute("ALTER TABLE lookup_parent RENAME TO hidden_lookup_parent")
+        .unwrap();
+    a.apply(Command::PickerRefresh);
+    a.sync();
+    assert!(picker(&a).error.is_some());
+    a.apply(Command::PickerCommit);
+    assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.inputs[2].is_none()));
+    a.db.execute("ALTER TABLE hidden_lookup_parent RENAME TO lookup_parent")
+        .unwrap();
+    a.apply(Command::PickerRefresh);
+    a.apply(Command::Help);
+    a.sync();
+    a.apply(Command::Back);
+    assert!(picker(&a).error.is_none());
+    assert_eq!(picker(&a).rows[0][0], PValue::Int(1005));
+    a.apply(Command::PickerRefresh);
+    a.apply(Command::PickerCancel);
+    a.sync();
+    assert!(
+        matches!(&a.overlay, Overlay::Edit(ed) if ed.picker.is_none() && ed.inputs[2].is_none())
+    );
+
+    // Non-numeric foreign keys travel as values, never as display previews.
+    a.db.execute(
+        "CREATE TABLE lookup_keys(k PRIMARY KEY, name TEXT);
+        CREATE TABLE lookup_links(id INTEGER PRIMARY KEY, k REFERENCES lookup_keys(k));
+        INSERT INTO lookup_links VALUES(1,NULL)",
+    )
+    .unwrap();
+    let values = [
+        PValue::Text(String::new()),
+        PValue::Text("  O'Brien;\nsecond line  ".into()),
+        PValue::Blob((0..32).collect()),
+    ];
+    for (i, value) in values.iter().enumerate() {
+        a.db.execute_params(
+            "INSERT INTO lookup_keys VALUES(?1,?2)",
+            &[value.clone(), PValue::Text(format!("choice{i}"))],
+        )
+        .unwrap();
+    }
+    a.apply(Command::Back);
+    a.open_table("lookup_links");
+    a.sync();
+    for (i, value) in values.iter().enumerate() {
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditInspectMove(1));
+        a.apply(Command::EditPick);
+        a.sync();
+        search(&mut a, &format!("choice{i}"));
+        a.apply(Command::PickerCommit);
+        if !matches!(value, PValue::Text(text) if text.contains('\n')) {
+            a.apply(Command::EditBegin);
+            a.apply(Command::EditChar('x'));
+            a.apply(Command::Back);
+            assert!(matches!(&a.overlay, Overlay::Edit(ed) if &ed.value(1) == value));
+            a.apply(Command::EditBegin);
+            a.apply(Command::EditInspectMove(0));
+            assert!(matches!(&a.overlay, Overlay::Edit(ed) if &ed.value(1) == value));
+        }
+        a.apply(Command::EditSave);
+        a.sync();
+        assert_eq!(
+            &a.db.query("SELECT k FROM lookup_links").unwrap().rows[0][0],
+            value
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::EmbeddedDb;
+
+    fn render_at(a: &mut App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::ui::draw(frame, a);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| {
+                let mut line = String::new();
+                let mut column = 0;
+                while column < row.len() {
+                    let symbol = row[column].symbol();
+                    line.push_str(symbol);
+                    column += unicode_width::UnicodeWidthStr::width(symbol).max(1);
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn key(a: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        let command = a
+            .map_key(KeyEvent::new(code, modifiers))
+            .expect("key has no action");
+        a.apply(command);
+    }
+
+    fn wide_app() -> App {
+        let mut a = app();
+        for i in 0..40 {
+            a.db.execute(&format!("CREATE TABLE table{i:02}(id INTEGER)"))
+                .unwrap();
+        }
+        let fields = (0..35)
+            .map(|i| {
+                format!(
+                    "f{i:02} TEXT{}",
+                    if i == 34 {
+                        " NOT NULL DEFAULT 'required'"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        a.db.execute(&format!(
+            "CREATE TABLE wide({fields}); INSERT INTO wide DEFAULT VALUES"
+        ))
+        .unwrap();
+        appsgen::ensure_app(a.db.link(), "long_menu").unwrap();
+        a.db.execute("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<39)
+            INSERT INTO _phosphor_items(app_id,label,action_kind,action_ref,seq)
+            SELECT (SELECT id FROM _phosphor_apps WHERE name='long_menu'), printf('Menu%02d',x), 'browse','wide',x FROM n").unwrap();
+        a.reload_tables();
+        a
+    }
+
+    #[test]
+    fn sidebar_and_every_designer_keep_the_selection_visible_after_resize() {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let mut a = wide_app();
+        a.apply(Command::SidebarSeek('t'));
+        a.apply(Command::SidebarMove(36));
+        let selected = a.visible_tables()[a.sidebar_idx].name.clone();
+        for (w, h) in [(80, 24), (40, 12), (100, 30), (25, 8)] {
+            let screen = render_at(&mut a, w, h);
+            assert!(screen.contains(&selected), "{screen}");
+        }
+        let top = a.viewports.sidebar.top;
+        let hit = a.hit.sidebar.unwrap();
+        a.on_mouse(&MouseEventKind::Down(MouseButton::Left), hit.x, hit.y);
+        assert_eq!(
+            a.sidebar_idx, top,
+            "mouse used an absolute row without the scroll offset"
+        );
+        key(&mut a, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(a.sidebar_idx, a.visible_tables().len() - 1);
+        key(&mut a, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(a.sidebar_idx, 0);
+
+        for command in [
+            Command::OpenQbe(Some("wide".into())),
+            Command::OpenForm(Some("wide".into())),
+            Command::OpenApps(Some("long_menu".into())),
+            Command::OpenAppMenu(Some("long_menu".into())),
+        ] {
+            a.apply(command);
+            render_at(&mut a, 80, 24);
+            key(&mut a, KeyCode::End, KeyModifiers::NONE);
+            let expected = if matches!(a.overlay, Overlay::Apps(_) | Overlay::AppMenu(_)) {
+                "Menu39"
+            } else {
+                "f34"
+            };
+            for (w, h) in [(80, 24), (40, 12), (100, 30)] {
+                let screen = render_at(&mut a, w, h);
+                assert!(
+                    screen.contains(expected),
+                    "selected {expected} missing:\n{screen}"
+                );
+            }
+            key(&mut a, KeyCode::PageUp, KeyModifiers::NONE);
+            key(&mut a, KeyCode::Home, KeyModifiers::NONE);
+            let screen = render_at(&mut a, 40, 12);
+            assert!(screen.contains(if expected == "Menu39" {
+                "Menu00"
+            } else {
+                "f00"
+            }));
+        }
+        a.apply(Command::Back);
+        a.open_table("wide");
+        a.sync();
+        a.apply(Command::OpenTableEditor);
+        key(&mut a, KeyCode::End, KeyModifiers::NONE);
+        for (w, h) in [(80, 24), (40, 12), (100, 30)] {
+            assert!(render_at(&mut a, w, h).contains("f34"));
+        }
+    }
+
+    #[test]
+    fn long_record_forms_and_painted_layouts_remain_editable_on_small_screens() {
+        let mut a = wide_app();
+        a.open_table("wide");
+        a.sync();
+        a.apply(Command::OpenEdit);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.required[34] = true;
+        }
+        key(&mut a, KeyCode::End, KeyModifiers::CONTROL);
+        for (w, h) in [(80, 24), (40, 12), (100, 30)] {
+            assert!(render_at(&mut a, w, h).contains("f34"));
+        }
+        a.apply(Command::EditBegin);
+        for _ in 0.."required".len() {
+            a.apply(Command::EditBackspace);
+        }
+        a.apply(Command::EditFieldEdge(false));
+        a.apply(Command::EditSave);
+        assert!(a.status.as_ref().unwrap().1);
+        assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.cursor == 34));
+        assert!(render_at(&mut a, 80, 24).contains("f34"));
+        assert_eq!(
+            a.db.query("SELECT f34 FROM wide").unwrap().rows[0][0],
+            PValue::Text("required".into())
+        );
+        a.apply(Command::Back);
+        a.open_form(Some("wide".into()));
+        a.apply(Command::DesignerRun);
+        let Overlay::Paint(st) = &a.overlay else {
+            panic!()
+        };
+        let positions = st
+            .spec
+            .fields
+            .iter()
+            .map(|f| f.pos.unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            positions.len(),
+            35,
+            "auto-placement stacked fields on the bottom row"
+        );
+        assert!(st.spec.size.1 >= 70);
+        for _ in 0..34 {
+            a.apply(Command::DesignerCycle);
+        }
+        assert!(render_at(&mut a, 40, 12).contains("f34:"));
+        a.apply(Command::DesignerSave);
+        a.apply(Command::Back);
+        a.apply(Command::Back);
+        a.apply(Command::OpenEdit);
+        key(&mut a, KeyCode::End, KeyModifiers::CONTROL);
+        for (w, h) in [(80, 90), (40, 12), (100, 80)] {
+            assert!(render_at(&mut a, w, h).contains("f34"));
+        }
+        key(&mut a, KeyCode::PageUp, KeyModifiers::ALT);
+        assert!(matches!(&a.overlay,Overlay::Edit(ed) if ed.cursor<34));
+    }
+
+    #[test]
+    fn long_unicode_input_script_carets_and_wrapped_help_stay_visible() {
+        let mut a = wide_app();
+        let draft = format!("{}界e\u{301}TAIL", "a long draft ".repeat(30));
+        for command in [
+            Command::OpenQbe(Some("wide".into())),
+            Command::OpenForm(Some("wide".into())),
+            Command::OpenApps(Some("long_menu".into())),
+            Command::OpenReport(Some("wide".into())),
+            Command::OpenCreate(Some("new_table".into())),
+        ] {
+            a.apply(command);
+            a.apply(Command::DesignerEditBegin);
+            for c in draft.chars() {
+                a.apply(Command::DesignerChar(c));
+            }
+            for (w, h) in [(80, 24), (40, 12), (100, 30)] {
+                let screen = render_at(&mut a, w, h);
+                assert!(screen.contains("界e\u{301}TAIL▏"), "caret lost:\n{screen}");
+            }
+            assert_eq!(a.designer_buffer().unwrap(), &draft);
+            a.apply(Command::Help);
+            a.apply(Command::Back);
+            assert_eq!(a.designer_buffer().unwrap(), &draft);
+        }
+        let lines = (0..60)
+            .map(|i| format!("START{i:02} {} END{i:02}", "界long text ".repeat(30)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        a.overlay = Overlay::ScriptEditor(ScriptState::new(
+            ScriptTarget::Form {
+                table: "wide".into(),
+                event: "OnSave".into(),
+            },
+            &lines,
+        ));
+        a.apply(Command::ScriptMove { dl: 55, dc: 0 });
+        a.apply(Command::ScriptLineEdge(true));
+        for (w, h) in [(80, 24), (40, 12), (100, 30)] {
+            assert!(render_at(&mut a, w, h).contains("END55"));
+        }
+        a.apply(Command::ScriptLineEdge(false));
+        assert!(render_at(&mut a, 40, 12).contains("START55"));
+        a.overlay = Overlay::None;
+        a.focus = Focus::Prompt;
+        a.prompt.input = draft.clone();
+        a.prompt.cursor = draft.len();
+        assert!(render_at(&mut a, 40, 12).contains("界e\u{301}TAIL"));
+        a.prompt.cursor = 0;
+        assert!(render_at(&mut a, 40, 12).contains("a long draft"));
+        a.apply(Command::Help);
+        if let Overlay::Help(st) = &mut a.overlay {
+            st.topic = 0;
+        }
+        a.apply(Command::HelpScroll(i64::MAX / 2));
+        let screen = render_at(&mut a, 40, 12);
+        assert!(
+            screen.contains("travels with") && screen.contains("it."),
+            "help bottom:\n{screen}"
+        );
+        a.apply(Command::HelpScroll(i64::MIN / 2));
+        assert!(render_at(&mut a, 40, 12).contains("Welcome to phosphor"));
+    }
+
+    #[test]
+    fn picker_search_pages_failure_and_typed_keys() {
+        assert_picker_workflow(Box::new(EmbeddedDb::open(":memory:").unwrap().0));
+    }
+
+    #[test]
+    fn remote_picker_search_pages_failure_and_typed_keys() {
+        let server = crate::test_support::HranaFixture::new(false);
+        assert_picker_workflow(Box::new(
+            crate::remote::RemoteDb::open(&server.url).unwrap(),
+        ));
+    }
 
     fn assert_status_workflow(db: Box<dyn DbLink>) {
         use ratatui::{backend::TestBackend, Terminal};
@@ -8667,6 +9377,8 @@ mod tests {
         );
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 0);
         assert_eq!(a.focus, Focus::Grid);
+        assert!(matches!(a.overlay, Overlay::Edit(_)));
+        a.apply(Command::Back);
         a.on_mouse(
             &K::Down(ratatui::crossterm::event::MouseButton::Left),
             30,
@@ -9762,6 +10474,7 @@ mod tests {
         a.apply(Command::OpenEdit);
         a.apply(Command::EditMove(2)); // customer_id field
         a.apply(Command::EditPick);
+        a.sync();
         let Overlay::Edit(ed) = &a.overlay else {
             panic!("edit closed")
         };
