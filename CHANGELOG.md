@@ -2,7 +2,26 @@
 
 ## Unreleased
 
+## 0.2.0 — 2026-09-14
+
+New database and application tools, safer record and schema editing, and
+a more responsive desktop. Includes the code and UX review fixes through
+response latency (#46).
+
 ### Added
+- **Table design and editing**: create tables and edit existing schemas
+  from the desktop, including defaults and foreign-key relationships.
+- **Related records and mouse navigation**: browse parent and child
+  records in linked panes, remember split layouts, and navigate with
+  clicks and the wheel.
+- **Save scratch databases** (#44): F9 saves an in-memory session to a
+  new database file and continues working there. Empty databases offer
+  table creation directly; the CRM tutorial covers a complete workflow
+  from first table through a saved application and restart.
+- **Output progress and cancellation** (#46): reports, labels, and CSV
+  exports run on the database worker with row counts and elapsed time.
+  Help, status details, resizing, and quitting remain responsive; Esc
+  requests cancellation without replacing an existing output file.
 - **CSV import/export** at the dot prompt (#14): `import <table> <path>`
   (headered, case-insensitive column match, empty → NULL, transactional)
   and `export <table|SELECT> <path>` (proper CSV quoting). New `csv_io`
@@ -105,6 +124,30 @@
   only the database.
 
 ### Fixed
+- **Record integrity** (#29–#32): preserve SQL defaults, use unshadowed
+  row identities for edits and deletes, keep inserted forms on the new
+  record, and display generated columns as read-only.
+- **Database safeguards** (#26–#28, #37): restrict Lua host capabilities,
+  enforce read-only access in both backends, preserve live schemas, refuse
+  lossy schema rebuilds, and roll back failed CSV imports.
+- **Remote transactions and SQL text** (#35, #36, #43): retain transaction
+  ownership, report uncertain outcomes after connection loss, preserve
+  saved SQL text, and bound query previews without appending SQL clauses.
+- **Complete output and related-record editing** (#33, #34): reports,
+  labels, and exports include rows beyond the grid's 10,000-row preview;
+  edits and deletes in a child pane target the focused child record.
+- **Draft and builder continuity** (#38, #39): Help restores unfinished
+  input; preview, revise, save, save-as, rename, and reopen preserve the
+  intended query, report, label, form, and application designs.
+- **Visible navigation and feedback** (#40–#42): long status messages
+  remain readable through F12 details, lists and editors keep selections
+  visible while scrolling or resizing, and foreign-key lookup searches
+  and pages through every parent record.
+- **First-record entry** (#44): new forms start on a useful writable
+  field and distinguish automatic integer IDs from manually entered IDs.
+- **Response latency** (#46): completed worker replies reach the screen
+  promptly instead of waiting for the idle input poll. A real terminal
+  regression check covers query latency and slow-output cancellation.
 - **timeless #56**: the TABLE EDITOR now drops/renames columns on a
   database that carries the timeless extension (column DROP is back in
   the `tableeditor` reel). Upstream `dbhealth` registered its metric
