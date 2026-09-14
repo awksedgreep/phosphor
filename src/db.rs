@@ -227,6 +227,9 @@ pub trait DbLink: Send {
     fn backend(&self) -> &'static str;
     fn name(&self) -> &str;
     fn readonly(&self) -> bool;
+    fn save_scratch(&mut self, _path: &str) -> DbResult<()> {
+        Err("Save Database is available for a writable scratch database only".into())
+    }
     fn require_writable(&self) -> DbResult<()> {
         if self.readonly() {
             Err("read-only mode: database writes are disabled".into())
@@ -401,6 +404,27 @@ pub(crate) fn resolve_rowid_column(db: &dyn DbLink, table: &str) -> DbResult<Opt
     }).map(str::to_owned))
 }
 
+/// INTEGER PRIMARY KEY is automatic only when it aliases the rowid.
+/// DESC primary keys and composite keys have a separate primary-key index.
+pub(crate) fn automatic_key(
+    db: &dyn DbLink,
+    table: &str,
+    columns: &[ColumnInfo],
+) -> Option<String> {
+    let keys: Vec<_> = columns.iter().filter(|c| c.pk).collect();
+    if keys.len() != 1 || !keys[0].decl_type.eq_ignore_ascii_case("INTEGER") || !db.has_rowid(table)
+    {
+        return None;
+    }
+    let indexes = db
+        .query(&format!(
+            "SELECT 1 FROM pragma_index_list({}) WHERE origin='pk'",
+            sql_str(table)
+        ))
+        .ok()?;
+    indexes.rows.is_empty().then(|| keys[0].name.clone())
+}
+
 /// Guard the identity in the write statement itself: if another
 /// connection shadows our cached alias, the write must affect no rows.
 /// Qualifying the identifier also disables SQLite's quoted-string fallback.
@@ -517,26 +541,6 @@ impl AnchorIndex {
         while self.map.len() > Self::CAP {
             self.map.pop_first();
         }
-    }
-}
-
-/// True when `sql` already constrains its row count (conservative
-/// substring check — a false positive inside a string literal just
-/// skips the optimization, never changes semantics).
-pub(crate) fn sql_has_limit(sql: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
-    lower.contains("limit")
-}
-
-/// Append a server-side cap so a stray `SELECT * FROM million_rows`
-/// doesn't plan/execute a full scan+sort client-truncated later.
-/// Caller must pass QUERY_CAP+1 so `truncated` stays accurate.
-pub(crate) fn apply_cap(sql: &str, cap_plus_one: usize) -> String {
-    let t = sql.trim().trim_end_matches(';').trim_end();
-    if sql_has_limit(t) {
-        t.to_owned()
-    } else {
-        format!("{t} LIMIT {cap_plus_one}")
     }
 }
 
@@ -820,6 +824,66 @@ impl EmbeddedDb {
 }
 
 impl DbLink for EmbeddedDb {
+    fn save_scratch(&mut self, path: &str) -> DbResult<()> {
+        self.require_writable()?;
+        if self.name != ":memory:" {
+            return Err("this database already saves to its file".into());
+        }
+        if !self.conn.is_autocommit() {
+            return Err(
+                "finish the current transaction with COMMIT or ROLLBACK before saving the database"
+                    .into(),
+            );
+        }
+        if path.is_empty() || path == ":memory:" || path.starts_with("file:") {
+            return Err("enter a new database filename, such as crm.db".into());
+        }
+        let attached: i64 = self
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pragma_database_list WHERE name NOT IN ('main','temp')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if attached > 0 {
+            return Err(
+                "Save Database copies the main database; DETACH attached databases before saving"
+                    .into(),
+            );
+        }
+        let temporary: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM temp.sqlite_schema", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| e.to_string())?;
+        if temporary > 0 {
+            return Err("Save Database copies the main database; move or drop temporary objects before saving".into());
+        }
+        let path = std::path::Path::new(path);
+        if std::fs::symlink_metadata(path).is_ok() {
+            return Err("that file already exists; choose a new filename".into());
+        }
+        let (output, file) = crate::output::AtomicOutput::create(path)?;
+        self.conn
+            .backup("main", output.temporary_path(), None)
+            .map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        output.publish_new()?;
+        // Open by the published filename so subsequent journals and writes
+        // belong to that file. Keep scratch alive if opening fails.
+        let (saved, _) =
+            Self::open(path.to_str().ok_or("filename must be UTF-8")?).map_err(|e| {
+                format!(
+                    "database file was saved but could not be opened: {e}; scratch is still open"
+                )
+            })?;
+        *self = saved;
+        Ok(())
+    }
+
     fn readonly(&self) -> bool {
         self.readonly
     }
@@ -998,11 +1062,10 @@ impl DbLink for EmbeddedDb {
 
     fn query(&self, sql: &str) -> DbResult<QueryResult> {
         let start = Instant::now();
-        // Push the cap into SQLite so the engine can stop early instead
-        // of planning/executing a full scan we truncate client-side.
-        // QUERY_CAP+1 rows => truncated flag stays exact.
-        let capped = apply_cap(sql, QUERY_CAP + 1);
-        let mut stmt = self.conn.prepare(&capped).map_err(|e| {
+        // Execute the statement unchanged; PRAGMA, VALUES, EXPLAIN, comments,
+        // and the user's own LIMIT all retain SQLite's normal semantics.
+        let sql = crate::sql::single_query(sql)?;
+        let mut stmt = self.conn.prepare(sql).map_err(|e| {
             if self.readonly {
                 format!("read-only query: {e}")
             } else {

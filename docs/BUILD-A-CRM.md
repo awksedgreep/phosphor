@@ -1,180 +1,170 @@
-# Build a CRM in ten minutes
+# Build a CRM from an empty database
 
-The whole promise of phosphor in one exercise: start from an empty file,
-end with an application your team can run. No code — just keystrokes,
-and every keystroke is listed. The GIFs linked along the way come from
-the [UI test suite](UI-TOUR.md), so they show exactly what you'll see.
+This walkthrough creates customers and orders, enters records, saves an entry form,
+query and report, and connects them to a CRM menu. The `tutorial` terminal regression
+in `tools/demo/uitest.py` follows these steps at 80×24 against a fresh database,
+then starts a second process to reopen the application. The GIFs elsewhere in the
+repository illustrate earlier recordings; use the keystrokes below for this version.
 
-You'll need the phosphor binary (`cargo build --release`). Optional but
-recommended: the dbhealth extension, so your CRM monitors itself —
+## 1 · Start with a file that will keep your work
 
-```sh
-export PHOSPHOR_EXT=/path/to/libdbhealth_ext.so
-```
-
-## 1 · Open a database that doesn't exist yet
+From the repository folder:
 
 ```sh
-phosphor crm.db
+cargo build --release
+./target/release/phosphor crm.db
 ```
 
-phosphor creates the file and shows an empty table list. Two ways to
-give your CRM bones — press **`C`** for the TABLE DESIGNER (type
-field names directly, F-keys set types and constraints, and the
-CREATE TABLE writes itself underneath — `F2` builds it), or press `.` and speak SQL directly (paste both, one at a
-time):
+Use a **new filename** for this exercise. If you installed `phosphor` on your PATH,
+`phosphor crm.db` works too. No extension or server is required. The file is created
+immediately; saved records and designs stay in it after you quit.
 
-```sql
-CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, city TEXT, balance REAL DEFAULT 0)
-```
-```sql
-CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT NOT NULL REFERENCES customers(name), product TEXT, qty INTEGER, amount REAL, region TEXT)
-```
+Starting without a filename opens **TEMPORARY SCRATCH**, which disappears when you
+quit. To keep a scratch session, save your current record or design, return to the
+browser, and press **F9 Save Database**. Enter a new filename. Existing files are
+refused. After success, phosphor continues working in the new file, so subsequent
+saved changes persist there too.
 
-That `REFERENCES` is the good stuff — in the TABLE DESIGNER it's
-`F10` on a field. Declare it and phosphor gives you dBASE's SET
-RELATION for free: open a customer and their orders appear in a
-pane under the form (keep reading).
+## 2 · Create customers
 
-The tables appear in the sidebar as you create them. *(While you're
-here: if you loaded the extension, `CREATE VIRTUAL TABLE dbhealth USING
-dbhealth` gives the database a pulse — the ● in the status bar.)*
+The empty screen offers **C Create your first table**. Capital letters below mean
+Shift plus that letter. A name in backticks after “type” is text to enter, without
+backticks. Function keys may need Fn on your keyboard.
 
-Designs change. Stand on a table and press **`E`** for the TABLE
-EDITOR: add, rename, or drop columns, or rename the table. The preview
-shows the changes; **`F2`** applies them together and checks foreign
-keys before committing. Failures roll back and keep the draft open.
-Type, constraint, and column-order changes need a SQL migration;
-the editor refuses rebuilds that could discard schema details.
-`D` twice drops the
-whole table. *(Watch it: [tableeditor.gif](demo/ui/tableeditor.gif))*
-
-## 2 · Put some customers in it
-
-`Esc` to the sidebar, then type `c` — first-letter seek jumps to
-`customers`. `Enter` opens BROWSE. It's empty; press **`a`** to add a
-record:
-
-| keys | what happens |
+| Keys | Result |
 |---|---|
-| `a` | a NEW record form opens |
-| type `Ada`, `Enter` | Name filled — the form is live, just type (it's marked `*` — required) |
-| `Tab`, type `London`, `Enter` | City filled |
-| `Enter` again on the last field | commits — and **saves**; Enter is the save key (F10 saves-and-closes) |
-| `PgDn` / `PgUp` (in the form) | flip through records — hold it down and fly; edits save as you page |
+| `C`, `Home`, type `customers`, `Enter`, `Tab` | Name the table; select its supplied `id INTEGER PRIMARY KEY`. |
+| `F8`, type `name`, `Enter`, `F5`, `F6` | Add a TEXT name; make it required and unique. |
+| `F8`, type `city`, `Enter` | Add a TEXT city. |
+| `F8`, type `balance`, `Enter`, `F3` | Add balance and change TEXT to REAL. |
+| `F7`, type `0`, `Enter` | Give balance a default of zero. |
+| `F2` | Build the table and open its empty BROWSE. |
 
-Add two or three more. Try saving one with a blank Name — phosphor
-refuses, politely. And once orders exist, notice the **orders pane**
-under each customer: that's the foreign key at work — it refreshes
-live as you page, and `F4` opens it as a filtered BROWSE.
-*(Watch it: [relations.gif](demo/ui/relations.gif))* That rule came free from `NOT NULL`; you'll add your
-own rules next. *(Watch it: [crud.gif](demo/ui/crud.gif))*
+The SQL preview shows the structure before you apply it. Later, **E** opens the
+Table Editor to add, rename, or drop columns; changes that need a lossy rebuild
+are refused rather than discarding constraints or triggers.
 
-> **Moving data in and out.** Got customers in a spreadsheet? `export`
-> from the old tool, then at the prompt:
->
-> ```text
-> import customers ./customers.csv
-> export customers ./backup.csv
-> ```
->
-> The CSV needs a header row; column names match the table
-> case-insensitively, empty fields become NULL. `export` takes any
-> table *or* a `SELECT`. phosphor reads and writes SQLite/libSQL —
-> native `.dbf` files are deliberately not supported (CSV is the
-> migration path).
+## 3 · Enter your first records
 
-## 3 · Craft the entry form
+Press **a once** to open NEW customers. The cursor starts on `name`; `id` shows
+`(automatic)`. You can deliberately enter an ID with Ctrl-Home, but none is needed
+for this exercise.
 
-Your team shouldn't see raw column names. On `customers`, press **`F`**:
-
-| keys | what happens |
+| Keys | Result |
 |---|---|
-| `Space` on `id` | hidden — nobody types ids |
-| `↓` to `name`, `Enter`, retype `Customer`, `Enter` | your label, not the column's |
-| `r` on the same row | required, enforced at save |
-| `F6` | saved — EDIT uses this form from now on |
+| `F10` before entering a name | The required-name error leaves NEW open. |
+| type `Ada`, `Enter` | Insert Ada with an automatic ID and default balance; move to city. |
+| type `London`, `Enter` | Save city and move to balance. |
+| type `120.5`, `Enter`, `F10` | Save the balance and close the form. |
+| `a`, type `Grace`, `Enter` | Add the next customer. |
+| type `Arlington`, `Enter`, type `80`, `Enter`, `F10` | Finish Grace and close. |
 
-Now press **`F2` — the FORM PAINTER**. Your fields sit on a canvas the
-exact size the form will render:
+**Enter saves and advances.** There is no extra Tab between these entries. F10
+saves and closes; on a clean form it simply closes. A duplicate name or another
+failed constraint keeps the draft open for correction. Fields left untouched use
+the database defaults. In an existing form, PgUp/PgDn moves between records and
+saves edits as you move. F1 Help and F12 error details preserve your draft.
 
-| keys | what happens |
+## 4 · Create orders and choose a customer by name
+
+From BROWSE customers, press **Esc** to return to the table list.
+
+| Keys | Result |
 |---|---|
-| `Tab` | select a field (the cursor jumps to it) |
-| arrows, then `Space` | walk the canvas, drop the field there |
-| `t`, type `CUSTOMER CARD`, `Enter` | a title, placed at the cursor |
-| `b`, move down-right, `b` | a box, corner to corner |
-| `F6` | saved — open any customer and see *your screen* |
+| `C`, `Home`, type `orders`, `Enter`, `Tab` | Name the new table and keep its automatic ID. |
+| `F8`, type `customer`, `Enter`, `F5` | Add a required TEXT customer field. |
+| `F10`, type `customers(name)`, `Enter` | Reference the unique customer name. |
+| `F8`, type `product`, `Enter` | Add a TEXT product. |
+| `F8`, type `qty`, `Enter`, press `F3` four times | Change the new field from TEXT to INTEGER. |
+| `F8`, type `amount`, `Enter`, `F3` | Add a REAL amount. |
+| `F8`, type `region`, `Enter`, `F2` | Add a TEXT region and build the table. |
 
-*(Watch it: [forms.gif](demo/ui/forms.gif))*
+Press **a**, then **F7** on the customer field. The picker shows Ada and Grace.
+Press **Enter** to choose Ada, then **Tab** to move to product. Type `modem`, Enter;
+`2`, Enter; `40`, Enter; `east`, Enter; then **F10** to close. The saved order is
+linked to Ada. For a large customer list, `/` searches names and details, and
+PgUp/PgDn or Home/End reaches records beyond the first page.
 
-## 4 · Save the queries your team actually runs
+## 5 · Craft the customer entry form
 
-On `customers`, press **`Q`** — Query By Example. One line per column,
-and the SQL you're generating stays visible at the bottom (that's the
-point):
+From BROWSE orders, press **Esc**, then **c** to select customers and **F** to design
+its form. The form designer starts on id.
 
-| keys | what happens |
+| Keys | Result |
 |---|---|
-| `↓↓↓` to `balance`, `Enter`, type `> 100`, `Enter` | a filter |
-| `s` `s` | sort descending ▼ |
-| `F2` | run it — your best customers, in the grid |
-| `Esc` (or `Q`), `F6`, type `big-spenders`, `Enter` | return to the same filter and save it |
+| `Space` | Hide id from this entry form. |
+| `Down`, `Enter`, type `Customer`, `Enter`, `r` | Label name as Customer and make it required in the form. |
+| `F6` | Save the form. |
+| `F2`, `Up`, `t`, type `CUSTOMER CARD`, `Enter` | Open the painter and add a caption above the fields. |
+| `F6`, `Esc`, `Esc` | Save the painted form and return through the designer to the table list. |
 
-From now on, `run big-spenders` at the dot prompt replays it — and menus
-can point at it. Use `qbe big-spenders` to reopen the graphical design,
-including after restarting. F6 updates it, F7 saves a separate copy, and
-F8 renames it while updating menu references.
-*(Watch it: [qbe.gif](demo/ui/qbe.gif))*
+Tab selects a field in the painter; arrows and Space place it. Oversized layouts
+use a scrolling list at runtime when the terminal cannot fit the saved canvas.
 
-## 5 · Design the report the boss wants
+## 6 · Save a useful query
 
-On `orders` (seek with `o`), press **`R`**:
+With customers still selected, press **Q** for Query By Example.
 
-| keys | what happens |
+| Keys | Result |
 |---|---|
-| `Enter`, edit the title, `Enter` | appears on every page |
-| `↓↓`, then `Space` until it says `region` | group bands + subtotals per region |
-| `F2` | preview: page header, ▌ bands, totals (ids are never summed) |
-| `w` | writes `report_orders.txt` for printing/mailing |
-| `p` | sends it to a printer (`lp`, or `$PHOSPHOR_PRINT`) |
-| `Esc`, `F6`, type `orders-by-region`, `Enter` | return to the designer and save by name |
+| `End`, `Enter`, type `> 100`, `Enter` | Filter the last column, balance. |
+| `s`, `s` | Sort descending. |
+| `F2` | Preview Ada, the one matching customer. |
+| `Esc`, `F6`, type `big-spenders`, `Enter`, `Esc` | Return to the design, save it, and return to the table list. |
 
-Use `report orders-by-region` to reopen it later. F6 updates that report;
-F7 Save As keeps the original, and F8 Rename moves it. Existing names are
-protected. Close the designer with Esc before returning to the sidebar.
+At the dot prompt, `run big-spenders` runs the query and `qbe big-spenders` reopens
+its design, including after restart. F6 updates a design; F7 makes a separate copy;
+F8 renames it. Existing names are protected.
 
-Labels too, if you mail things: `L` on customers — three-across, done.
-*(Watch it: [reports.gif](demo/ui/reports.gif))*
+## 7 · Save a grouped report
 
-## 6 · The Applications Generator
+From the table list, press **o**, then **R**.
 
-This is the 1988 magic. Press **`A`**:
-
-| keys | what happens |
+| Keys | Result |
 |---|---|
-| `n` | a new menu item (already selected) |
-| `Enter`, retype `Customers`, `Enter` | its label — first letter becomes the hotkey |
-| `e`, type `customers`, `Enter` | its target (a table to browse) |
-| `n` again → label `Big spenders`, `c` until kind reads `query`, `e` → `big-spenders` | a saved-query item |
-| `n` again → label `Orders by region`, `c` to `report`, `e` → `orders` | a report item |
-| `F2` | the live menu — try the hotkeys |
+| `Enter`, type `Orders by region`, `Enter` | Set the report title. |
+| `Down`, `Down`, `Enter`, type `region`, `Enter` | Set the grouping field explicitly. |
+| `F6`, type `orders-by-region`, `Enter` | Save the named report before previewing. |
+| `F2` | Preview the east group, subtotal, and grand total for one order. |
+| `w` | Write `report_orders-by-region.txt` in the launch folder. |
+| `Esc`, `Esc` | Return through the report designer to the table list. |
 
-Everything you just built — form, query, report, menu — is rows in the
-database. *(Watch it: [apps.gif](demo/ui/apps.gif))*
+The file contains the complete report. Printing with `p` requires a configured
+`lp` command or `PHOSPHOR_PRINT`; printing is optional in this walkthrough.
+For mailing labels, select customers with **c**, press **L**, and **Esc** to return.
 
-## 7 · Ship it
+## 8 · Build the CRM menu
+
+From the table list, press **A**. On a fresh database this opens an empty application
+named `app`. Menu items save as you edit them.
+
+| Keys | Result |
+|---|---|
+| `n`, `Enter`, type `Customers`, `Enter` | Create and label the first item. |
+| `e`, type `customers`, `Enter` | Point its browse action at the customers table. |
+| `r`, type `CRM`, `Enter` | Rename the application itself to CRM. |
+| `n`, `Enter`, type `Big spenders`, `Enter`, `c` | Add a query item. |
+| `e`, type `big-spenders`, `Enter` | Point at the saved query. |
+| `n`, `Enter`, type `Orders by region`, `Enter`, `c`, `c` | Add a report item. |
+| `e`, type `orders-by-region`, `Enter` | Point at the saved report, including its title and grouping. |
+| `F2` | Preview the CRM menu. |
+
+Try **c** for Customers, **Esc** back to the menu; **b** for Big spenders, **Esc**;
+then **o** for the report and **Esc**. Each action should show the data you entered.
+Esc again returns to the application designer with its last selected item intact.
+
+## 9 · Quit and reopen the application
+
+Press **Ctrl-Q**, then run:
 
 ```sh
-phosphor --app crm.db
+./target/release/phosphor --app CRM crm.db
 ```
 
-The ▓▓ CRM ▓▓ menu comes up first. Hotkeys run everything; Esc always
-comes home. Hand the *file* to your team — copy it, mail it, or serve it
-multi-user through [sqld](https://github.com/tursodatabase/libsql) with
-`phosphor http://host:8880` — the application travels inside it either
-way. *(Watch it: [appmode.gif](demo/ui/appmode.gif))*
+The CRM menu opens with all three items. Press **c**, then **Enter** to see a saved
+customer in the CUSTOMER CARD form. The data, form, query, report, and menu are all
+inside `crm.db`. Close phosphor before copying the database to share it.
 
-Ten minutes. No code. dBASE users did this in 1988 and we all somehow
-agreed to forget it was possible. Press `F1` anywhere for the rest of
-the manual — or read it on the web: [MANUAL.md](MANUAL.md).
+For CSV import/export, Lua rules, and remote connections, use F1 or the
+[full manual](MANUAL.md). The optional dbhealth extension has separate setup;
+it is not needed to complete this walkthrough.

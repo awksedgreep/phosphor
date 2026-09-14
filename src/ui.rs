@@ -198,6 +198,7 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
     draw_prompt(f, app, prompt_line);
 
     match &app.overlay {
+        Overlay::SaveDatabase(_) => draw_save_database(f, app),
         Overlay::Help(_) => draw_help(f, app),
         Overlay::Edit(_) => draw_edit(f, app),
         Overlay::Health(_) => draw_health(f, app),
@@ -358,6 +359,41 @@ fn draw_editor_input(f: &mut Frame, app: &App) {
         ])
         .style(app.theme.base()),
         area,
+    );
+}
+
+fn draw_save_database(f: &mut Frame, app: &App) {
+    let Overlay::SaveDatabase(path) = &app.overlay else {
+        return;
+    };
+    let area = centered(dialog_area(f.area()), 72, 13);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(app.theme.base())
+        .border_style(app.theme.bright())
+        .title(" SAVE DATABASE ")
+        .title_bottom(" Enter save · Esc cancel · F1 help ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let lines = vec![
+        Line::raw("Keep this scratch database in a file."),
+        Line::raw("Saved records, tables, and designs travel together."),
+        Line::raw("Future saved changes will go to that file."),
+        Line::raw("Existing files are never replaced."),
+    ];
+    let [description, input] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(2)]).areas(inner);
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        description,
+    );
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::styled("New filename:", app.theme.dim()),
+            Line::from(editing_span(path, inner.width.saturating_sub(1), app.theme)),
+        ]),
+        input,
     );
 }
 
@@ -1349,7 +1385,7 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
                 .then(|| Line::styled(format!("  … {hidden} internal (i)"), th.dim())),
         )
         .collect();
-    let empty = app.tables.is_empty();
+    let empty = visible.is_empty();
     let inner = block.inner(area);
     f.render_widget(block, area);
     draw_rows(
@@ -1365,10 +1401,13 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
             x: area.x + 2,
             y: area.y + 2,
             width: area.width.saturating_sub(4),
-            height: 2,
+            height: 3.min(area.height.saturating_sub(2)),
         };
         f.render_widget(
-            Paragraph::new(Line::styled("no tables yet —\ntry the . prompt", th.dim())),
+            Paragraph::new(vec![
+                Line::styled("No tables yet", th.dim()),
+                Line::styled("C  Create table", th.bright()),
+            ]),
             hint,
         );
     }
@@ -1417,14 +1456,42 @@ fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
     app.visible_cols_width = inner.width;
 
     let Some(g) = &app.grid else {
-        f.render_widget(
-            Paragraph::new(vec![
+        let empty = app.visible_tables().is_empty();
+        let mut lines = vec![Line::raw("")];
+        if app.scratch() {
+            lines.extend([
+                Line::styled("TEMPORARY SCRATCH DATABASE", th.bright()),
+                Line::raw("Work here disappears when you quit."),
+                Line::raw("F9  Save Database to a new file"),
                 Line::raw(""),
-                Line::styled("  Enter on a table to BROWSE", th.dim()),
-                Line::styled("  .  for the dot prompt", th.dim()),
-                Line::styled("  F1 for help", th.dim()),
-                Line::styled("  v  splits a related table onto this screen", th.dim()),
-            ]),
+            ]);
+        } else if empty {
+            lines.extend([
+                Line::styled("Your database is ready.", th.bright()),
+                Line::raw(if app.db.backend() == "embedded" {
+                    "Saved changes are kept in this file."
+                } else {
+                    "Saved changes are kept on the server."
+                }),
+                Line::raw(""),
+            ]);
+        }
+        if empty {
+            lines.extend([
+                Line::styled("C  Create your first table", th.bright()),
+                Line::raw("Name its fields, then F2 builds it."),
+                Line::raw("Next: a adds your first record."),
+            ]);
+        } else {
+            lines.push(Line::raw("Enter on a table to BROWSE"));
+        }
+        lines.extend([
+            Line::raw(""),
+            Line::raw(".  SQL and commands"),
+            Line::raw("F1 Help and the manual"),
+        ]);
+        f.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
         return;
@@ -1680,7 +1747,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             .and_then(|n| n.to_str())
             .unwrap_or(name)
     };
-    let left = format!(" {short_name} [{}]", app.db.backend());
+    let left = if app.scratch() {
+        " SCRATCH · F9 Save Database".to_owned()
+    } else {
+        format!(" {short_name} [{}]", app.db.backend())
+    };
     // Borrowed mid/message (were format!+clone per frame): the spans
     // borrow from `app`, which outlives the frame render.
     // The source name is deliberately omitted: the pane title above
@@ -1902,6 +1973,7 @@ fn draw_edit(f: &mut Frame, app: &mut App) {
                 _ => {
                     let (text, edited) = match &ed.inputs[i] {
                         Some(t) => (note_display(t), true),
+                        None if ed.automatic(i) => ("(automatic)".into(), false),
                         None => (ed.fields[i].1.render(), false),
                     };
                     Span::styled(
@@ -1991,6 +2063,7 @@ fn draw_edit(f: &mut Frame, app: &mut App) {
         } else {
             let (text, edited) = match &ed.inputs[i] {
                 Some(t) => (note_display(t), true),
+                None if ed.automatic(i) => ("(automatic)".into(), false),
                 None => (original.render(), false),
             };
             let style = if selected {

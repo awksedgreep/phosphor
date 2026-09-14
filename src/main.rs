@@ -42,7 +42,8 @@ USAGE
 
     DATABASE     a SQLite/libSQL file (created if missing), or an
                  http(s):// URL of a self-hosted sqld server.
-                 Defaults to an in-memory scratch database.
+                 Defaults to temporary scratch; work disappears on
+                 quit unless you use F9 Save Database in the browser.
 
 OPTIONS
     --app [NAME]   boot into an application menu crafted with the

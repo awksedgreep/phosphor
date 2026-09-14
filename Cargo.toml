@@ -10,7 +10,7 @@ repository = "https://github.com/awksedgreep/phosphor"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 # bundled: one binary, no system sqlite, no macOS "not authorized".
 # load_extension: opt-in loading of libtimeless_ext via PHOSPHOR_EXT.
-rusqlite = { version = "0.37", features = ["bundled", "load_extension", "hooks"] }
+rusqlite = { version = "0.37", features = ["bundled", "load_extension", "hooks", "backup"] }
 # Remote backend: Hrana over HTTP to self-hosted sqld (blocking by
 # design — DESIGN.md "no async runtime in v1").
 ureq = { version = "2", features = ["json"] }

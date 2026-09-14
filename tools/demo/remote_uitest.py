@@ -45,7 +45,7 @@ def main():
     parser.add_argument("--reels", nargs="*", default=["data", "scripting", "forms", "apps", "tableeditor", "kiosk",
                                                      "csvrollback", "sqltext", "rowidentity", "insertidentity", "generated",
                                                      "relations", "reports", "detailcrud", "completeoutput", "builders", "status80",
-                                                     "scrolling", "lookup"])
+                                                     "scrolling", "lookup", "querysyntax", "tutorial"])
     args = parser.parse_args()
     root = Path(tempfile.mkdtemp(prefix="pfr-", dir="/tmp"))
     ui.DB, ui.OUT, ui.WORK = [str(root / n) for n in ("ui.db", "casts", "work")]
@@ -57,7 +57,7 @@ def main():
             continue
         ui.seed()
         with sqlite3.connect(ui.DB) as conn:
-            seed = "\n".join(conn.iterdump())
+            seed = "" if reel.fresh else "\n".join(conn.iterdump())
         directory = root / reel.name
         directory.mkdir()
         with socket.socket() as sock:
@@ -78,9 +78,11 @@ def main():
                     time.sleep(0.1)
             else:
                 raise RuntimeError("sqld did not start")
-            pipeline(url, [{"type": "sequence", "sql": seed}, {"type": "close"}])
+            if seed:
+                pipeline(url, [{"type": "sequence", "sql": seed}, {"type": "close"}])
             before = snapshot(url) if reel.name == "kiosk" else None
             reel.argv = [url if arg == ui.DB else arg for arg in reel.argv]
+            reel.restarts = [[url if arg == ui.DB else arg for arg in argv] if argv else None for argv in reel.restarts]
             errors = reel.run()
             if before is not None and before != snapshot(url):
                 errors.append("read-only kiosk changed remote data/schema")

@@ -118,12 +118,13 @@ class Screen:
 
 
 class Reel:
-    def __init__(self, name, title, argv=None, cols=100, rows=30):
+    def __init__(self, name, title, argv=None, cols=100, rows=30, fresh=False):
         self.name = name
         self.title = title
         self.argv = argv or [BIN, DB]
         self.cols, self.rows = cols, rows
-        self.restarts = 0
+        self.restarts = []
+        self.fresh = fresh
         self.steps = []
         self.expects = []
         self.t = 0.9
@@ -160,21 +161,24 @@ class Reel:
         self.expects.append((round(self.t - 0.05, 3), marker, False))
         return self
 
-    def restart(self):
-        self.restarts += 1
+    def restart(self, argv=None):
+        self.restarts.append(argv)
         return self.key(CTRL_Q, wait=1.1)
 
     def resize(self, cols, rows):
         return self.key((cols, rows), wait=0.6)
 
     def run(self):
+        if self.fresh and DB in self.argv and os.path.exists(DB):
+            os.remove(DB)  # this reel's disposable fixture starts empty
         cast = os.path.join(OUT, f"{self.name}.cast")
         self.key(CTRL_Q, wait=0.0)
         argv = self.argv
         if self.restarts:
+            launches = [argv] + [restart or argv for restart in self.restarts]
             argv = [sys.executable, "-c",
-                    "import subprocess, sys\nfor _ in range(int(sys.argv[1])):\n subprocess.run(sys.argv[2:], check=True)",
-                    str(self.restarts + 1), *argv]
+                    "import json, subprocess, sys\nfor argv in json.loads(sys.argv[1]):\n subprocess.run(argv, check=True)",
+                    json.dumps(launches)]
         record(argv, self.steps, cast, cols=self.cols, rows=self.rows, env=ENV, title=self.title, cwd=WORK)
         events = [
             json.loads(line)
@@ -382,7 +386,7 @@ def reels():
     r.key("]", 0.5).expect_absent('KEY,  "field3"')   # and back down
     r.key(F2, 0.8).expect("BROWSE gadgets").expect("created \"gadgets\"")
     r.key("a", 0.6).expect("NEW gadgets record")
-    r.key("\t", 0.3)                                  # Tab to the next field
+    # NEW starts on label, skipping the automatic id.
     r.type("widget").key(ENTER, 0.6)                  # the form is LIVE: type
     r.expect("inserted rowid 1")
     # Keep typing after the insert: the next Enter UPDATEs, and the
@@ -624,7 +628,7 @@ def reels():
     r.key(".").type("CREATE TABLE gaps(id INTEGER PRIMARY KEY, name TEXT)").key(ENTER, 0.5)
     r.type("INSERT INTO gaps VALUES(1,'first'),(100,'original last')").key(ENTER, 0.5)
     r.key(ESC).key("g").key(ENTER, 0.6).key("a", 0.5)
-    r.type("50").key(ENTER, 0.5).expect("EDIT gaps · 2/3")
+    r.key("\x1b[1;5H").type("50").key(ENTER, 0.5).expect("EDIT gaps · 2/3")
     r.type("inserted").key(ENTER, 0.5).key(F10, 0.5)
     r.key(".").type("SELECT id,name FROM gaps WHERE id >= 50").key(ENTER, 0.6)
     r.expect("2 row(s)").expect("inserted").expect("original last")
@@ -635,7 +639,7 @@ def reels():
     r.key(ENTER, 0.5).type("INSERT INTO derived(name) VALUES('Alice')").key(ENTER, 0.5)
     r.key(ESC).key("d").key(ENTER, 0.6).key(ENTER, 0.5).expect("Alice")
     r.key(TAB).type("Beatrice").key(ENTER, 0.5).expect("Beatrice").expect("ƒ")
-    r.key(F10, 0.5).key("a", 0.5).key(TAB).type("Charlie").key(ENTER, 0.5)
+    r.key(F10, 0.5).key("a", 0.5).type("Charlie").key(ENTER, 0.5)
     r.expect("EDIT derived · 2/2").expect("Charlie")
     r.key(F10, 0.5).key(".").type("SELECT name,size FROM derived").key(ENTER, 0.6)
     r.expect("2 row(s)").expect("Beatrice").expect("Charlie")
@@ -666,7 +670,7 @@ def reels():
     r.key(DOWN).type("updated coax").key(ENTER, 0.7).expect("saved 1 field(s)")
     r.key(PGDN, 0.5).expect("last record").expect("EDIT ychildren · 2/2")
     r.key(F10, 0.5).key("a", 0.5).expect("NEW ychildren record")
-    r.type("4").key(TAB).type("new child").key(F10, 0.7).expect("UNIQUE").expect("NEW ychildren record")
+    r.key("\x1b[1;5H").type("4").key(TAB).type("new child").key(F10, 0.7).expect("UNIQUE").expect("NEW ychildren record")
     r.key(UP).type("0").key(F10, 0.7).expect("inserted rowid 0")
     r.key("x", 0.5).expect("DELETE ychildren rowid 0").key("x", 0.6).expect("row deleted")
     r.key(".").type("SELECT name FROM zparents ORDER BY id").key(ENTER, 0.6).expect("Ada").expect("Grace").expect("2 row(s)")
@@ -758,6 +762,87 @@ def reels():
     r.key(ENTER).expect("PICK").key("/").type("customer 0999").key(ENTER, 0.6)
     r.expect("1 / 1 matches").expect("Customer 0999").key(ENTER).key(F10, 0.7).expect("saved 1 field(s)")
     r.key(".").type("SELECT customer_id,note FROM ylookup_orders").key(ENTER, 0.5).expect("999").expect("retained draft")
+    out.append(r)
+
+    r = Reel("querysyntax", "SQL previews preserve PRAGMA, VALUES, EXPLAIN, comments, and LIMIT", cols=80, rows=24)
+    r.key(".").key("/* schema */ PRAGMA table_info(customers)").key(ENTER, 0.6)
+    r.expect("QUERY").expect("name").expect("TEXT")
+    r.key(".").key("/* limit */ VALUES ('literal limit'),('second') -- tail").key(ENTER, 0.6)
+    r.expect("2 row(s)").expect("literal limit").expect("second")
+    r.key(".").key("EXPLAIN QUERY PLAN SELECT name FROM customers").key(ENTER, 0.6).expect("SCAN customers")
+    r.key(".").key("EXPLAIN SELECT 1").key(ENTER, 0.6).expect("opcode").expect("Init")
+    r.key(".").key("CREATE TABLE preview(n INTEGER); WITH RECURSIVE s(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM s WHERE n<10005) INSERT INTO preview SELECT n FROM s").key(ENTER, 0.8)
+    r.key("/* a limit in a comment */ SELECT n FROM preview -- unchanged").key(ENTER, 0.8)
+    r.expect("capped at 10k rows")
+    r.key(".").key("WITH c AS (SELECT n FROM preview LIMIT 3) SELECT * FROM c").key(ENTER, 0.6).expect("3 row(s)")
+    r.key(".").key("SELECT n FROM preview LIMIT 2 OFFSET 10000").key(ENTER, 0.6)
+    r.expect("2 row(s)").expect("10001").expect("10002").expect_absent("capped")
+    r.key(".").key("SELECT missing_column FROM preview").key(ENTER, 0.6)
+    r.expect("no such column").expect("10001")
+    r.key("VALUES ('recovered')").key(ENTER, 0.6).expect("1 row(s)").expect("recovered")
+    out.append(r)
+
+    saved = os.path.join(WORK, "scratch CRM.db")
+    r = Reel("scratch", "Save a temporary database, retain drafts on failure, and reopen the saved file", argv=[BIN], cols=80, rows=24)
+    r.expect("TEMPORARY SCRATCH DATABASE").expect("disappears when you quit").expect("Create your first table")
+    r.key(".").key("CREATE TABLE kept(id INTEGER PRIMARY KEY,name TEXT); INSERT INTO kept(name) VALUES('Ada')").key(ENTER, 0.6)
+    r.key(ESC).key("k").key(ENTER, 0.6).expect("Ada")
+    r.key(F9).key(os.path.join(WORK, "people-import.csv")).key(ENTER, 0.6).expect("already exists")
+    r.key(ESC).key(F9).key(saved).key(F1).expect("HELP").key(ESC).expect("scratch CRM.db")
+    r.key(F12).expect("STATUS & CONNECTION").key(ESC).expect("scratch CRM.db")
+    r.resize(40, 12).expect("scratch CRM.db").resize(80, 24)
+    r.key(ENTER, 0.8).expect("now working in this file").expect("Ada")
+    r.key("a").type("Grace").key(F10, 0.6).expect("inserted rowid 2")
+    r.restart([BIN, saved])
+    r.expect_absent("TEMPORARY SCRATCH").key("k").key(ENTER, 0.6).expect("Ada").expect("Grace")
+    out.append(r)
+
+    # Literal docs/BUILD-A-CRM.md path: empty database, no prepared catalogs
+    # or records, and a second process that opens the saved application.
+    r = Reel("tutorial", "Build and reopen the CRM from the published guide", cols=80, rows=24, fresh=True)
+    r.expect("Create your first table")
+    r.key("C").key(HOME).type("customers").key(ENTER).key(TAB)
+    r.key(F8).type("name").key(ENTER).key(F5).key(F6)
+    r.key(F8).type("city").key(ENTER)
+    r.key(F8).type("balance").key(ENTER).key(F3).key(F7).type("0").key(ENTER)
+    r.key(F2, 0.7).expect("BROWSE customers")
+    r.key("a").expect("(automatic)").key(F10, 0.6).expect("NEW customers record").expect("NOT NULL")
+    r.type("Ada").key(ENTER, 0.6).expect("inserted rowid 1")
+    r.type("London").key(ENTER).type("120.5").key(ENTER).key(F10)
+    r.key("a").type("Grace").key(ENTER).type("Arlington").key(ENTER).type("80").key(ENTER).key(F10)
+    r.expect("Ada").expect("London").expect("120.5").expect("Grace").expect("Arlington")
+    r.key(ESC).key("C").key(HOME).type("orders").key(ENTER).key(TAB)
+    r.key(F8).type("customer").key(ENTER).key(F5).key(F10).type("customers(name)").key(ENTER)
+    r.key(F8).type("product").key(ENTER)
+    r.key(F8).type("qty").key(ENTER).keys([F3] * 4)
+    r.key(F8).type("amount").key(ENTER).key(F3)
+    r.key(F8).type("region").key(ENTER).key(F2, 0.7).expect("BROWSE orders")
+    r.key("a").key(F7, 0.6).expect("Ada").expect("Grace").key(ENTER).key(TAB)
+    r.type("modem").key(ENTER).type("2").key(ENTER).type("40").key(ENTER).type("east").key(ENTER).key(F10)
+    r.expect("Ada").expect("modem").expect("east")
+    r.key(ESC).key("c").key("F").key(SPACE).key(DOWN).key(ENTER).type("Customer").key(ENTER).key("r").key(F6)
+    r.key(F2).key(UP).key("t").type("CUSTOMER CARD").key(ENTER).key(F6).key(ESC).key(ESC)
+    r.key("Q").key(END).key(ENTER).type("> 100").key(ENTER).key("s").key("s")
+    r.key(F2, 0.6).expect("1 row(s)").expect("Ada").expect_absent("Grace")
+    r.key(ESC).key(F6).type("big-spenders").key(ENTER).key(ESC)
+    r.key("o").key("R").key(ENTER).type("Orders by region").key(ENTER)
+    r.key(DOWN).key(DOWN).key(ENTER).type("region").key(ENTER)
+    r.key(F6).type("orders-by-region").key(ENTER).key(F2, 0.6)
+    r.expect("Orders by region").expect("east").expect("TOTAL (1 rows)")
+    r.key("w", 0.5).expect("wrote report_orders-by-region.txt").key(ESC).key(ESC)
+    r.key("c").key("L", 0.6).expect("Ada").expect("London").key(ESC)
+    r.key("A").key("n").key(ENTER).type("Customers").key(ENTER).key("e").type("customers").key(ENTER)
+    r.key("r").type("CRM").key(ENTER)
+    r.key("n").key(ENTER).type("Big spenders").key(ENTER).key("c").key("e").type("big-spenders").key(ENTER)
+    r.key("n").key(ENTER).type("Orders by region").key(ENTER).key("c").key("c").key("e").type("orders-by-region").key(ENTER)
+    r.key(F2).expect("CRM").expect("Customers").expect("Big spenders").expect("Orders by region")
+    r.key("c", 0.6).expect("BROWSE customers").expect("Ada").key(ESC)
+    r.key("b", 0.6).expect("1 row(s)").expect("Ada").expect_absent("Grace").key(ESC)
+    r.key("o", 0.6).expect("Orders by region").expect("TOTAL (1 rows)").key(ESC).key(ESC)
+    r.expect("APPLICATIONS GENERATOR · CRM")
+    r.restart([BIN, "--app", "CRM", DB])
+    r.expect("CRM").expect("Big spenders").expect("Orders by region")
+    r.key("c", 0.6).key(ENTER).expect("CUSTOMER CARD").expect("Ada").expect("London").expect("120.5")
     out.append(r)
 
     return out

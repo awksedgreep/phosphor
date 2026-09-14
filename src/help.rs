@@ -36,6 +36,11 @@ phosphor is three things in one program:
 
 A few habits worth forming on day one:
 
+  · C creates your first table. F2 builds it; a adds a record.
+  · With no filename, this is a temporary scratch database. Its
+    contents disappear on quit. F9 in the browser saves it to a
+    new file and continues working there. Or start with a filename:
+    phosphor crm.db keeps saved changes in crm.db from the start.
   · Esc always backs out one level. When in doubt, press it.
   · Editing any prefilled value: just TYPE — the first keystroke
     replaces it. Backspace instead to edit it in place.
@@ -128,6 +133,9 @@ In the grid:
     SAVE as you page; a failed rule holds the page.
   · a adds a NEW record with the same form. Fields you leave blank
     take the database's own defaults.
+    The form starts on a data field, skipping automatic IDs,
+    computed fields, and fixed parent links. An automatic ID shows
+    (automatic) until saved. Ctrl-Home lets you enter a specific ID.
   · x deletes the current row — but asks you to press x a second
     time on the same row before anything happens. Any other key
     disarms it.
@@ -162,6 +170,13 @@ talk to a database ever shipped. Type a statement, press Enter.
     grid, like any other browse.
   · Anything else — INSERT, UPDATE, CREATE TABLE — executes and
     reports how many rows were affected.
+
+Run each result-producing statement separately. Leading comments,
+CTEs, PRAGMA, VALUES, EXPLAIN, and your own LIMIT/OFFSET keep their
+SQLite meaning: phosphor does not append a LIMIT to your SQL.
+Interactive results retain at most 10,000 rows, with a visible
+notice when more rows exist. Use exports or reports for complete
+output. Errors keep the previous grid available for reference.
 
 Beyond SQL, the prompt knows a few short commands:
 
@@ -502,7 +517,9 @@ Everything the UI does has a startup flag for the shell:
   phosphor --help              usage;  --version  the build
 
 With no argument phosphor opens an in-memory database — a
-scratchpad for trying SQL.
+scratchpad for trying SQL. It disappears when you quit unless
+you use F9 Save Database from the browser first. Save Database
+asks for a new filename and then keeps working in that file.
 
 --readonly also works without --app. Database writes are blocked
 by the backend, including writes hidden in query SQL. Theme,
@@ -530,6 +547,7 @@ Table list
   ↑↓ move · letters seek · i internals · Enter browse
   PgUp/PgDn page · Home/End first/last table
   C table designer · E table editor · r refresh · q quit
+  F9 Save Database (scratch sessions)
 
 BROWSE grid
   ↑↓←→ / hjkl move · PgUp PgDn page · g G first/last row
@@ -578,6 +596,39 @@ Pager (reports, labels)
 Help
   ←→ topics · ↑↓ PgUp PgDn scroll · Home/End top/bottom · Esc close
   Text wraps to the available width.",
+    },
+    HelpTopic {
+        key: "files",
+        title: "Keeping your work",
+        body: "\
+Start with phosphor crm.db to create or open a lasting database.
+Saving a record or design writes it into that file immediately.
+There is no separate Save Database step for an existing file or
+a remote database.
+
+Starting without a filename opens TEMPORARY SCRATCH. Everything
+in that scratch database disappears when you quit. To keep it:
+
+  1. Save any record or design you are editing, then Esc back to
+     the browser.
+  2. Press F9 for Save Database.
+  3. Type a new filename, such as crm.db, and press Enter.
+
+A relative filename uses the folder where you launched phosphor;
+you can also enter a full path, including spaces. Existing files
+are never replaced. An error keeps scratch open for correction.
+Finish an open SQL transaction with COMMIT or ROLLBACK first.
+DETACH attached databases and move or drop temporary objects first;
+Save Database copies the main database only.
+
+The saved file includes records, table structures, and saved forms,
+queries, reports, menus, scripts, and preferences. Record IDs stay
+the same. After a successful save, the connection switches to the
+file, so later saved changes persist there too. Reopen that file
+next time: phosphor crm.db, or phosphor --app crm.db for its menu.
+
+F1 Help and F12 details preserve the filename being entered.
+Esc cancels the dialog and leaves the scratch database open.",
     },
 ];
 

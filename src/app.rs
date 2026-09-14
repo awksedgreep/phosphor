@@ -40,6 +40,7 @@ pub enum Focus {
 #[allow(clippy::large_enum_variant)]
 pub enum Overlay {
     None,
+    SaveDatabase(String),
     Help(HelpState),
     Edit(EditState),
     Health(HealthView),
@@ -195,6 +196,7 @@ pub struct EditState {
     pub inputs: Vec<Option<String>>,
     /// Picker choices retain their database type, including empty TEXT and BLOB keys.
     pub picked_values: HashMap<usize, (String, PValue)>,
+    pub auto_key: Option<String>,
     pub cursor: usize,
     /// Some(buffer) while a field is being typed into.
     pub editing: Option<String>,
@@ -208,6 +210,14 @@ pub struct EditState {
 }
 
 impl EditState {
+    pub fn automatic(&self, field: usize) -> bool {
+        self.inserting
+            && self.inputs.get(field).is_some_and(Option::is_none)
+            && self
+                .fields
+                .get(field)
+                .is_some_and(|(c, _)| Some(&c.name) == self.auto_key.as_ref())
+    }
     fn value(&self, field: usize) -> PValue {
         match &self.inputs[field] {
             Some(text) => self
@@ -364,6 +374,10 @@ pub struct Prompt {
 /// The command bus. Everything a user (or someday a script) can do.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
+    OpenSaveDatabase,
+    SaveDatabaseChar(char),
+    SaveDatabaseBackspace,
+    SaveDatabaseCommit,
     Quit,
     /// Begin editing the current EDIT-form field with this first char.
     EditType(char),
@@ -1218,6 +1232,10 @@ impl App {
             .collect()
     }
 
+    pub fn scratch(&self) -> bool {
+        self.db.backend() == "embedded" && self.db.name() == ":memory:"
+    }
+
     fn sidebar_seek(&mut self, c: char) {
         let visible = self.visible_tables();
         let n = visible.len();
@@ -1379,6 +1397,15 @@ impl App {
                 Command::Back
             } else {
                 Command::Help
+            });
+        }
+        if matches!(self.overlay, Overlay::SaveDatabase(_)) {
+            return Some(match key.code {
+                Enter => Command::SaveDatabaseCommit,
+                Esc => Command::Back,
+                Backspace => Command::SaveDatabaseBackspace,
+                Char(c) => Command::SaveDatabaseChar(c),
+                _ => return None,
             });
         }
         if let Overlay::Edit(ed) = &self.overlay {
@@ -1712,6 +1739,9 @@ impl App {
         if key.code == F(10) {
             return Some(Command::OpenHealth);
         }
+        if key.code == F(9) {
+            return Some(Command::OpenSaveDatabase);
+        }
         match self.focus {
             Focus::Prompt => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1886,6 +1916,40 @@ impl App {
         let is_delete = inspecting_status || matches!(cmd, Command::DeleteRow);
         let is_drop = inspecting_status || matches!(cmd, Command::DropTable);
         match cmd {
+            Command::OpenSaveDatabase => {
+                if !self.scratch() || self.readonly {
+                    self.say("Save Database is for writable scratch sessions; file databases already keep saved changes");
+                } else if matches!(self.overlay, Overlay::None) {
+                    self.overlay = Overlay::SaveDatabase("crm.db".into());
+                    self.editor_fresh = true;
+                }
+            }
+            Command::SaveDatabaseChar(c) => {
+                if let Overlay::SaveDatabase(path) = &mut self.overlay {
+                    if std::mem::take(&mut self.editor_fresh) {
+                        path.clear();
+                    }
+                    path.push(c);
+                }
+            }
+            Command::SaveDatabaseBackspace => {
+                self.editor_fresh = false;
+                if let Overlay::SaveDatabase(path) = &mut self.overlay {
+                    path.pop();
+                }
+            }
+            Command::SaveDatabaseCommit => {
+                if let Overlay::SaveDatabase(path) = &self.overlay {
+                    let path = path.clone();
+                    match self.db.save_scratch(&path) {
+                        Ok(()) => {
+                            self.overlay = Overlay::None;
+                            self.say(format!("Database saved — now working in this file: {path}"));
+                        }
+                        Err(e) => self.err(e),
+                    }
+                }
+            }
             Command::Quit => self.quit = true,
             Command::EditType(c) => {
                 if matches!(&self.overlay, Overlay::Edit(ed) if ed.editing.is_none()) {
@@ -2585,6 +2649,7 @@ impl App {
             }
             Overlay::ScriptEditor(_) => self.close_script_editor(),
             Overlay::Edit(_)
+            | Overlay::SaveDatabase(_)
             | Overlay::Help(_)
             | Overlay::Health(_)
             | Overlay::Qbe(_)
@@ -2704,6 +2769,7 @@ impl App {
     /// F1: open help on the topic for wherever the user is right now.
     fn open_help(&mut self) {
         let key = match &self.overlay {
+            Overlay::SaveDatabase(_) => "files",
             Overlay::Edit(_) => "browse",
             Overlay::Health(_) => "health",
             Overlay::Qbe(_) => "qbe",
@@ -5223,6 +5289,7 @@ impl App {
             computed,
             inputs: vec![None; n],
             picked_values: HashMap::new(),
+            auto_key: None,
             cursor: keep_cursor,
             editing: None,
             links,
@@ -5691,6 +5758,7 @@ impl App {
             Ok(c) => c,
             Err(e) => return self.err(e),
         };
+        let auto_key = crate::db::automatic_key(self.db.link(), &name, &cols);
         let mut fields: Vec<(ColumnInfo, PValue)> =
             cols.into_iter().map(|c| (c, PValue::Null)).collect();
         if let Some(relation) = &relation {
@@ -5730,11 +5798,20 @@ impl App {
             computed,
             inputs: vec![None; n],
             picked_values: HashMap::new(),
+            auto_key,
             cursor: 0,
             editing: None,
             pickers,
             picker: None,
         });
+        if let Overlay::Edit(ed) = &mut self.overlay {
+            ed.cursor = (0..ed.fields.len())
+                .find(|&i| {
+                    !ed.read_only(i) && !ed.automatic(i) && ed.fields[i].0.dflt_value.is_none()
+                })
+                .or_else(|| (0..ed.fields.len()).find(|&i| !ed.read_only(i) && !ed.automatic(i)))
+                .unwrap_or(0);
+        }
     }
 
     /// 'x' in BROWSE: armed double-press delete of the current row.
@@ -5965,10 +6042,9 @@ impl App {
         let Overlay::Edit(ed) = &self.overlay else {
             return false;
         };
-        ed.required
-            .iter()
-            .enumerate()
-            .all(|(i, req)| !req || ed.read_only(i) || ed.value(i) != PValue::Null)
+        ed.required.iter().enumerate().all(|(i, req)| {
+            !req || ed.read_only(i) || ed.automatic(i) || ed.value(i) != PValue::Null
+        })
     }
 
     /// An open field-editing buffer counts as an edit: fold it into
@@ -5998,7 +6074,7 @@ impl App {
         if !skip_required_check {
             if let Overlay::Edit(ed) = &self.overlay {
                 for (i, req) in ed.required.iter().enumerate() {
-                    if !req || ed.read_only(i) {
+                    if !req || ed.read_only(i) || ed.automatic(i) {
                         continue;
                     }
                     let is_null = ed.value(i) == PValue::Null;
@@ -6451,11 +6527,7 @@ impl App {
             return self.handle_export(&line);
         }
 
-        let head = line
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        let head = crate::sql::head(&line).to_ascii_lowercase();
         if matches!(
             head.as_str(),
             "select" | "with" | "pragma" | "explain" | "values"
@@ -7406,9 +7478,407 @@ pub(crate) fn assert_picker_workflow(db: Box<dyn DbLink>) {
 }
 
 #[cfg(test)]
+pub(crate) fn assert_query_preview_workflow(db: Box<dyn DbLink>) {
+    let mut a = App::new(db, None);
+    a.db.execute("CREATE TABLE preview_rows(n INTEGER); WITH RECURSIVE s(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM s WHERE n<10005) INSERT INTO preview_rows SELECT n FROM s").unwrap();
+    for (sql, count) in [
+        ("PRAGMA table_info(preview_rows)", 1),
+        (
+            "/* metadata */ PRAGMA table_info(preview_rows); -- last comment",
+            1,
+        ),
+        ("VALUES('limit; inside text'),('Ada')", 2),
+        (
+            "-- leading comment\nSELECT n FROM preview_rows LIMIT 2 OFFSET 3; /* tail */",
+            2,
+        ),
+        (
+            "SELECT 'limit' AS word, n FROM preview_rows -- trailing line comment",
+            10000,
+        ),
+        (
+            "SELECT n FROM (SELECT n FROM preview_rows LIMIT 10003)",
+            10000,
+        ),
+        (
+            "WITH \"delete\"(n) AS (SELECT n FROM preview_rows) SELECT n FROM \"delete\"",
+            10000,
+        ),
+        ("SELECT n FROM preview_rows LIMIT 10005 OFFSET 4", 10000),
+        ("SELECT n FROM preview_rows LIMIT 10000", 10000),
+        ("SELECT n FROM preview_rows LIMIT 0", 0),
+        ("SELECT n FROM preview_rows WHERE 0", 0),
+    ] {
+        a.prompt.input = sql.into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        let g = a
+            .grid
+            .as_ref()
+            .unwrap_or_else(|| panic!("{sql}: {:?}", a.status));
+        assert_eq!(g.cache.len(), count, "{sql}: {:?}", a.status);
+        assert!(!a.status.as_ref().unwrap().1, "{sql}: {:?}", a.status);
+    }
+    let duplicate = a.db.query("SELECT 1 AS same, 2 AS same").unwrap();
+    assert_eq!(duplicate.columns, ["same", "same"]);
+    assert_eq!(duplicate.rows[0], [PValue::Int(1), PValue::Int(2)]);
+    assert!(
+        !a.db
+            .query("SELECT n FROM preview_rows LIMIT 10000")
+            .unwrap()
+            .truncated
+    );
+    assert!(
+        a.db.query("SELECT n FROM preview_rows LIMIT 10001")
+            .unwrap()
+            .truncated
+    );
+    assert_eq!(
+        a.db.query("SELECT n FROM preview_rows LIMIT 2 OFFSET 3")
+            .unwrap()
+            .rows[0][0],
+        PValue::Int(4)
+    );
+    for sql in [
+        "EXPLAIN SELECT n FROM preview_rows",
+        "EXPLAIN QUERY PLAN SELECT n FROM preview_rows",
+    ] {
+        a.prompt.input = sql.into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(a.grid.as_ref().unwrap().total > 0, "{sql}: {:?}", a.status);
+        assert!(!a.status.as_ref().unwrap().1);
+    }
+    a.db.query("PRAGMA user_version=7").unwrap();
+    assert_eq!(
+        a.db.query("PRAGMA user_version").unwrap().rows[0][0],
+        PValue::Int(7)
+    );
+    for sql in [
+        "SELECT missing_column FROM preview_rows",
+        "VALUES(1) LIMIT 2",
+        "SELECT abs(-9223372036854775808)",
+        "SELECT 1; DELETE FROM preview_rows",
+    ] {
+        let before = a.grid.as_ref().unwrap().cache.clone();
+        a.prompt.input = sql.into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(a.status.as_ref().unwrap().1, "{sql}");
+        assert_eq!(
+            a.grid.as_ref().unwrap().cache,
+            before,
+            "a failure replaced the last result"
+        );
+        assert_eq!(a.db.count("preview_rows").unwrap(), 10005);
+    }
+    a.db.execute("BEGIN; INSERT INTO preview_rows VALUES(10006)")
+        .unwrap();
+    assert!(
+        a.db.query("WITH x AS (SELECT n FROM preview_rows) SELECT * FROM x")
+            .unwrap()
+            .truncated
+    );
+    assert_eq!(a.db.count("preview_rows").unwrap(), 10006);
+    a.db.execute("ROLLBACK").unwrap();
+    assert_eq!(a.db.count("preview_rows").unwrap(), 10005);
+    // A CTE whose main statement writes must finish every change, even
+    // when RETURNING produces more rows than the interactive preview retains.
+    a.db.execute("CREATE TABLE preview_writes(n INTEGER UNIQUE)")
+        .unwrap();
+    let written = a.db.query("WITH éSELECT$source AS (SELECT n FROM preview_rows) INSERT INTO preview_writes SELECT n FROM éSELECT$source RETURNING n").unwrap();
+    assert!(written.truncated);
+    assert_eq!(written.rows.len(), 10000);
+    assert_eq!(a.db.count("preview_writes").unwrap(), 10005);
+    assert!(a.db.query("WITH source AS (SELECT n FROM preview_rows) INSERT INTO preview_writes SELECT n FROM source RETURNING n").is_err());
+    assert_eq!(a.db.count("preview_writes").unwrap(), 10005);
+}
+
+#[cfg(test)]
+pub(crate) fn assert_first_entry_workflow(db: Box<dyn DbLink>) {
+    let mut a = App::new(db, None);
+    a.db.execute("CREATE TABLE entry_customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, city TEXT, balance REAL DEFAULT 0);
+        CREATE TABLE entry_text(id TEXT PRIMARY KEY NOT NULL, name TEXT);
+        CREATE TABLE entry_desc(id INTEGER PRIMARY KEY DESC NOT NULL, name TEXT);
+        CREATE TABLE entry_composite(id INTEGER, part TEXT, PRIMARY KEY(id,part));
+        CREATE TABLE entry_only(id INTEGER PRIMARY KEY);
+        CREATE TABLE entry_default(id INTEGER PRIMARY KEY, created TEXT DEFAULT 'now', name TEXT NOT NULL, computed TEXT GENERATED ALWAYS AS(name || '!'))").unwrap();
+    a.open_table("entry_customers");
+    a.sync();
+    a.apply(Command::OpenInsert);
+    assert!(matches!(&a.overlay, Overlay::Edit(ed) if ed.cursor==1 && ed.automatic(0)));
+    a.apply(Command::EditSave);
+    assert!(a.status.as_ref().unwrap().1);
+    assert_eq!(a.db.count("entry_customers").unwrap(), 0);
+    for text in ["Ada", "London", "120.5"] {
+        a.apply(Command::EditBegin);
+        for c in text.chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        a.sync();
+    }
+    a.apply(Command::EditSave);
+    assert_eq!(
+        a.db.query("SELECT * FROM entry_customers").unwrap().rows[0],
+        [
+            PValue::Int(1),
+            PValue::Text("Ada".into()),
+            PValue::Text("London".into()),
+            PValue::Real(120.5)
+        ]
+    );
+    a.apply(Command::OpenInsert);
+    a.apply(Command::EditBegin);
+    for c in "Ada".chars() {
+        a.apply(Command::EditChar(c));
+    }
+    a.apply(Command::EditSave);
+    assert!(a.status.as_ref().unwrap().1);
+    assert!(
+        matches!(&a.overlay, Overlay::Edit(ed) if ed.inserting && ed.inputs[1].as_deref()==Some("Ada"))
+    );
+    a.apply(Command::EditBegin);
+    for c in "Grace".chars() {
+        a.apply(Command::EditChar(c));
+    }
+    a.apply(Command::EditSave);
+    a.sync();
+    assert_eq!(a.db.count("entry_customers").unwrap(), 2);
+    assert_eq!(
+        a.db.query("SELECT balance FROM entry_customers WHERE name='Grace'")
+            .unwrap()
+            .rows[0][0],
+        PValue::Real(0.0)
+    );
+    for table in [
+        "entry_text",
+        "entry_desc",
+        "entry_composite",
+        "entry_only",
+        "entry_default",
+    ] {
+        a.open_table(table);
+        a.sync();
+        a.apply(Command::OpenInsert);
+        assert!(
+            matches!(&a.overlay, Overlay::Edit(ed) if ed.cursor == if table=="entry_default" {2} else {0})
+        );
+        assert!(
+            matches!(&a.overlay, Overlay::Edit(ed) if ed.automatic(0) == matches!(table,"entry_only"|"entry_default"))
+        );
+        if table == "entry_only" {
+            a.apply(Command::EditSave);
+            assert_eq!(a.db.count(table).unwrap(), 1);
+        }
+        a.apply(Command::Back);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::EmbeddedDb;
+
+    #[test]
+    fn query_previews_preserve_sql_and_bound_results() {
+        assert_query_preview_workflow(Box::new(EmbeddedDb::open(":memory:").unwrap().0));
+    }
+    #[test]
+    fn remote_query_previews_preserve_sql_and_bound_results() {
+        let server = crate::test_support::HranaFixture::new(false);
+        assert_query_preview_workflow(Box::new(
+            crate::remote::RemoteDb::open(&server.url).unwrap(),
+        ));
+    }
+    #[test]
+    fn new_records_start_on_a_useful_field() {
+        assert_first_entry_workflow(Box::new(EmbeddedDb::open(":memory:").unwrap().0));
+    }
+    #[test]
+    fn remote_new_records_start_on_a_useful_field() {
+        let server = crate::test_support::HranaFixture::new(false);
+        assert_first_entry_workflow(Box::new(
+            crate::remote::RemoteDb::open(&server.url).unwrap(),
+        ));
+    }
+
+    #[test]
+    fn scratch_save_preserves_database_and_continues_in_the_file() {
+        let root = std::env::temp_dir().join(format!(
+            "phosphor-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("our CRM 'ready'.db");
+        let mut a = App::new(Box::new(EmbeddedDb::open(":memory:").unwrap().0), None);
+        let screen = render_at(&mut a, 80, 24);
+        assert!(
+            screen.contains("TEMPORARY SCRATCH DATABASE")
+                && screen.contains("disappears when you quit")
+                && screen.contains("Create your first table")
+        );
+        a.db.execute("CREATE TABLE kept(name TEXT); INSERT INTO kept(rowid,name) VALUES(-5,'Ada'),(0,'Grace'),(100,'Linus'); CREATE INDEX kept_name ON kept(name); CREATE VIEW kept_view AS SELECT * FROM kept; CREATE TABLE audit(name TEXT); CREATE TRIGGER kept_update AFTER UPDATE ON kept BEGIN INSERT INTO audit VALUES(new.name); END;").unwrap();
+        FormSpec::from_columns("kept", a.db.columns("kept").unwrap())
+            .save(a.db.link())
+            .unwrap();
+        appsgen::ensure_app(a.db.link(), "CRM").unwrap();
+        store::pref_set(a.db.link(), "theme", "amber");
+        let schema =
+            a.db.query("SELECT type,name,sql FROM sqlite_schema ORDER BY name")
+                .unwrap()
+                .rows;
+        a.open_table("kept");
+        a.sync();
+        a.apply(Command::OpenSaveDatabase);
+        for c in path.to_str().unwrap().chars() {
+            a.apply(Command::SaveDatabaseChar(c));
+        }
+        a.apply(Command::Help);
+        a.apply(Command::Back);
+        assert!(matches!(&a.overlay, Overlay::SaveDatabase(name) if name==path.to_str().unwrap()));
+        assert!(render_at(&mut a, 40, 12).contains("ready'.db▏"));
+        a.apply(Command::SaveDatabaseCommit);
+        assert!(!a.scratch(), "{:?}", a.status);
+        assert_eq!(a.db.name(), path.to_str().unwrap());
+        assert_eq!(
+            a.db.query("SELECT type,name,sql FROM sqlite_schema ORDER BY name")
+                .unwrap()
+                .rows,
+            schema
+        );
+        assert_eq!(
+            a.db.query("SELECT rowid FROM kept ORDER BY rowid")
+                .unwrap()
+                .rows,
+            vec![
+                vec![PValue::Int(-5)],
+                vec![PValue::Int(0)],
+                vec![PValue::Int(100)]
+            ]
+        );
+        assert!(a.grid.is_some());
+        a.db.execute("UPDATE kept SET name='Ada saved' WHERE rowid=-5")
+            .unwrap();
+        let reopened = EmbeddedDb::open(path.to_str().unwrap()).unwrap().0;
+        assert_eq!(
+            reopened
+                .query("SELECT name FROM kept WHERE rowid=-5")
+                .unwrap()
+                .rows[0][0],
+            PValue::Text("Ada saved".into())
+        );
+        assert_eq!(reopened.count("audit").unwrap(), 1);
+        assert_eq!(
+            store::pref_get(&reopened, "theme").as_deref(),
+            Some("amber")
+        );
+        assert!(FormSpec::load(&reopened, "kept").is_some());
+        assert_eq!(appsgen::list_apps(&reopened), ["CRM"]);
+        drop(reopened);
+        drop(a);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scratch_save_failures_retain_work_and_never_replace_files() {
+        let root = std::env::temp_dir().join(format!(
+            "phosphor-save-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let existing = root.join("existing.db");
+        std::fs::write(&existing, b"keep this file").unwrap();
+        let mut a = App::new(Box::new(EmbeddedDb::open(":memory:").unwrap().0), None);
+        a.db.execute("CREATE TABLE kept(v); INSERT INTO kept VALUES('keep this row')")
+            .unwrap();
+        // URI interpretation must not switch a supposedly saved session to
+        // a second memory database or a different file than we published.
+        for filename in ["", ":memory:", "file::memory:?cache=shared"] {
+            assert!(a.db.save_scratch(filename).is_err());
+            assert!(a.scratch());
+            assert_eq!(a.db.count("kept").unwrap(), 1);
+        }
+        for path in [existing.clone(), existing.join("invalid.db")] {
+            a.overlay = Overlay::SaveDatabase(path.to_str().unwrap().into());
+            a.apply(Command::SaveDatabaseCommit);
+            assert!(a.scratch() && a.status.as_ref().unwrap().1);
+            assert!(
+                matches!(&a.overlay, Overlay::SaveDatabase(name) if name==path.to_str().unwrap())
+            );
+            assert_eq!(a.db.count("kept").unwrap(), 1);
+            assert_eq!(std::fs::read(&existing).unwrap(), b"keep this file");
+        }
+        let target = root.join("after rollback.db");
+        for (create, cleanup) in [
+            ("CREATE TEMP TABLE transient(v)", "DROP TABLE transient"),
+            ("ATTACH ':memory:' AS extra", "DETACH extra"),
+        ] {
+            a.db.execute(create).unwrap();
+            a.overlay = Overlay::SaveDatabase(target.to_str().unwrap().into());
+            a.apply(Command::SaveDatabaseCommit);
+            assert!(a.scratch() && !target.exists());
+            assert!(a.status.as_ref().unwrap().1);
+            a.db.execute(cleanup).unwrap();
+        }
+        a.db.execute("BEGIN; INSERT INTO kept VALUES('uncommitted')")
+            .unwrap();
+        a.overlay = Overlay::SaveDatabase(target.to_str().unwrap().into());
+        a.apply(Command::SaveDatabaseCommit);
+        assert!(a.scratch() && !target.exists());
+        assert_eq!(a.db.count("kept").unwrap(), 2);
+        a.db.execute("ROLLBACK").unwrap();
+        a.apply(Command::Back);
+        assert!(a.scratch());
+        a.overlay = Overlay::SaveDatabase(target.to_str().unwrap().into());
+        a.apply(Command::SaveDatabaseCommit);
+        assert!(!a.scratch());
+        assert_eq!(a.db.count("kept").unwrap(), 1);
+        // A destination created after output preparation still wins the race.
+        let race = root.join("race.db");
+        let (output, file) = crate::output::AtomicOutput::create(&race).unwrap();
+        drop(file);
+        std::fs::write(&race, b"other writer").unwrap();
+        assert!(output.publish_new().is_err());
+        assert_eq!(std::fs::read(&race).unwrap(), b"other writer");
+        drop(a);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_remote_preview_keeps_the_previous_result() {
+        use std::sync::atomic::Ordering;
+        let server = crate::test_support::HranaFixture::new(false);
+        let mut a = App::new(
+            Box::new(crate::remote::RemoteDb::open(&server.url).unwrap()),
+            None,
+        );
+        a.prompt.input = "VALUES('previous')".into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        let before = a.grid.as_ref().unwrap().cache.clone();
+        server.truncate_output.store(true, Ordering::SeqCst);
+        a.prompt.input = "VALUES('incomplete')".into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(a.status.as_ref().unwrap().1);
+        assert_eq!(a.grid.as_ref().unwrap().cache, before);
+        a.prompt.input = "VALUES('recovered')".into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert_eq!(
+            a.grid.as_ref().unwrap().cache[0][0],
+            PValue::Text("recovered".into())
+        );
+    }
 
     fn render_at(a: &mut App, width: u16, height: u16) -> String {
         let mut terminal =
@@ -8922,7 +9392,6 @@ mod tests {
             panic!("insert form did not open")
         };
         assert!(ed.inserting);
-        a.apply(Command::EditMove(1)); // to column b
         a.apply(Command::EditBegin);
         if let Overlay::Edit(ed) = &mut a.overlay {
             ed.editing = Some(String::new());
@@ -9028,7 +9497,6 @@ mod tests {
         a.sync();
         assert_eq!(a.grid.as_ref().unwrap().widths[1], 4, "header-min first");
         a.apply(Command::OpenInsert);
-        a.apply(Command::EditMove(1)); // name
         a.apply(Command::EditBegin);
         for ch in "Alexandria".chars() {
             a.apply(Command::EditChar(ch));
@@ -9065,7 +9533,6 @@ mod tests {
             "form stays in NEW"
         );
         // Typing a value then Enter does insert.
-        a.apply(Command::EditMove(1));
         a.apply(Command::EditBegin);
         for c in "real".chars() {
             a.apply(Command::EditChar(c));
@@ -10674,6 +11141,7 @@ mod tests {
             a.apply(Command::OpenSelected);
             a.sync();
             a.apply(Command::OpenInsert);
+            a.apply(Command::EditFieldEdge(false)); // deliberately supply an identity
             a.apply(Command::EditBegin);
             for c in id.to_string().chars() {
                 a.apply(Command::EditChar(c));
@@ -10719,6 +11187,7 @@ mod tests {
         a.apply(Command::OpenSelected);
         a.sync();
         a.apply(Command::OpenInsert);
+        a.apply(Command::EditFieldEdge(false)); // deliberately supply an identity
         a.apply(Command::EditBegin);
         for c in "50".chars() {
             a.apply(Command::EditChar(c));
@@ -10752,7 +11221,6 @@ mod tests {
         a.apply(Command::OpenSelected);
         a.sync();
         a.apply(Command::OpenInsert);
-        a.apply(Command::EditMove(1));
         a.apply(Command::EditBegin);
         if let Overlay::Edit(ed) = &mut a.overlay {
             ed.editing = Some(String::new());
@@ -10765,7 +11233,7 @@ mod tests {
             panic!()
         };
         assert!(!ed.inserting, "form flipped onto the inserted record");
-        a.apply(Command::EditMove(0));
+        a.apply(Command::EditMove(1)); // return to b after the first save
         a.apply(Command::EditBegin);
         if let Overlay::Edit(ed) = &mut a.overlay {
             ed.editing = Some(String::new());
@@ -10778,6 +11246,12 @@ mod tests {
             a.db.query("SELECT count(*) FROM t WHERE b IN ('once','twice')")
                 .unwrap();
         assert_eq!(q.rows[0][0], PValue::Int(1), "no duplicate insert");
+        assert_eq!(
+            a.db.query("SELECT b FROM t ORDER BY a DESC LIMIT 1")
+                .unwrap()
+                .rows[0][0],
+            PValue::Text("twice".into())
+        );
     }
 
     #[test]
@@ -10890,7 +11364,6 @@ mod tests {
         a.apply(Command::OpenSelected);
         a.sync();
         a.apply(Command::OpenInsert);
-        a.apply(Command::EditMove(1)); // skip the auto pk
         a.apply(Command::EditBegin);
         for c in "Mark".chars() {
             a.apply(Command::EditChar(c));

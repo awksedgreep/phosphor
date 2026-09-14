@@ -153,7 +153,7 @@ impl DbResponse {
 
 /// Work a job performs on the link. FnMut (not FnOnce) so the worker
 /// can invoke it through the box on stable Rust.
-pub type Work = Box<dyn FnMut(&dyn DbLink) -> DbResponse + Send>;
+pub type Work = Box<dyn FnMut(&mut dyn DbLink) -> DbResponse + Send>;
 
 struct Job {
     tag: Token,
@@ -184,10 +184,11 @@ pub fn spawn(link: Box<dyn DbLink>) -> DbHandle {
     std::thread::Builder::new()
         .name("phosphor-db".into())
         .spawn(move || {
+            let mut link = link;
             for job in job_rx {
                 let mut work = job.work;
                 let t0 = std::time::Instant::now();
-                let resp = work(&*link);
+                let resp = work(&mut *link);
                 // The WORK duration, measured on the worker thread.
                 // (Measuring submit-to-arrival on the UI side would
                 // include poll idle time — the "everything takes
@@ -272,6 +273,16 @@ impl DbHandle {
 /// Slice-1 behavior is identical to direct calls; later slices bypass
 /// this façade for hot paths via submit/poll.
 impl DbLink for DbHandle {
+    fn save_scratch(&mut self, path: &str) -> DbResult<()> {
+        let destination = path.to_owned();
+        self.call(Box::new(move |db| {
+            DbResponse::Unit(db.save_scratch(&destination))
+        }))
+        .unit()?;
+        self.display = path.to_owned();
+        Ok(())
+    }
+
     fn readonly(&self) -> bool {
         self.readonly
     }

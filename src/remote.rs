@@ -260,6 +260,155 @@ impl RemoteDb {
         v.pop().ok_or_else(|| "sqld returned no result".into())
     }
 
+    fn read_cursor(
+        &self,
+        sql: &str,
+        cap: Option<usize>,
+        may_stop: bool,
+        mut sink: crate::db::RowSink,
+    ) -> DbResult<usize> {
+        use std::io::BufRead;
+        let mut state = self.stream.lock().unwrap();
+        if state.lost {
+            return Err("remote transaction outcome unknown; reopen and check the database".into());
+        }
+        let previous = state.active.clone();
+        let pipeline_url = previous
+            .as_ref()
+            .map_or(self.pipeline_url.as_str(), |s| &s.url);
+        let cursor_url = format!("{}/cursor", pipeline_url.trim_end_matches("/pipeline"));
+        let mut step = json!({"stmt": {"sql": sql, "want_rows": true}});
+        if previous.is_some() {
+            step["condition"] = json!({"type": "not", "cond": {"type": "is_autocommit"}});
+        }
+        let mut req = self.agent.post(&cursor_url);
+        if let Some(auth) = &self.auth {
+            req = req.set("Authorization", auth);
+        }
+        let mut continuation = None;
+        let mut complete_response = false;
+        let result = (|| {
+            let response = req
+                .send_json(json!({
+                    "baton": previous.as_ref().map(|s| &s.baton),
+                    "batch": {"steps": [step]}
+                }))
+                .map_err(|e| format!("sqld output request: {e}"))?;
+            let mut reader = std::io::BufReader::new(response.into_reader());
+            let mut line = String::new();
+            reader.read_line(&mut line).map_err(|e| e.to_string())?;
+            let header: Json = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+            if let Some(baton) = header["baton"].as_str() {
+                let url = match header["base_url"].as_str() {
+                    Some(base) if base.starts_with("http://") || base.starts_with("https://") => {
+                        format!("{}/v3/pipeline", base.trim_end_matches('/'))
+                    }
+                    Some(_) => return Err("sqld returned an invalid stream URL".into()),
+                    None => pipeline_url.to_owned(),
+                };
+                continuation = Some(Stream {
+                    baton: baton.to_owned(),
+                    url,
+                });
+            } else if previous.is_some() {
+                return Err("sqld closed the transaction stream during output".into());
+            }
+            let (mut started, mut ended, mut width, mut count) = (false, false, 0, 0);
+            let mut error = None;
+            let mut stopped = false;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                    complete_response = true;
+                    break;
+                }
+                let entry: Json = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+                let event = match entry["type"].as_str() {
+                    Some("step_begin") if !started && entry["step"] == 0 => {
+                        started = true;
+                        let columns = entry["cols"]
+                            .as_array()
+                            .ok_or("missing output columns")?
+                            .iter()
+                            .map(|c| {
+                                c["name"]
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .ok_or_else(|| "missing column name".to_owned())
+                            })
+                            .collect::<DbResult<Vec<_>>>()?;
+                        width = columns.len();
+                        Some(crate::db::QueryEvent::Columns(columns))
+                    }
+                    Some("row") if started && !ended => {
+                        let row = entry["row"]
+                            .as_array()
+                            .ok_or("missing output row")?
+                            .iter()
+                            .map(decode)
+                            .collect::<DbResult<Vec<_>>>()?;
+                        if row.len() != width {
+                            return Err("incomplete output row".into());
+                        }
+                        count += 1;
+                        if cap.is_none_or(|cap| count <= cap) {
+                            Some(crate::db::QueryEvent::Row(row))
+                        } else {
+                            None
+                        }
+                    }
+                    Some("step_end") if started && !ended => {
+                        ended = true;
+                        None
+                    }
+                    Some("step_error" | "error") => {
+                        error.get_or_insert_with(|| remote_error(&entry["error"]));
+                        None
+                    }
+                    // sqld adds replication metadata after the result.
+                    Some("replication_index") => None,
+                    _ => return Err("unexpected sqld output response".into()),
+                };
+                // Drain after a disk/SQL failure so a caller-owned stream can
+                // still be used or rolled back once this response completes.
+                if error.is_none() {
+                    if let Some(event) = event {
+                        error = sink(event).err();
+                    }
+                }
+                // An autocommit read owns this cursor. Stop after the lookahead
+                // row and close its stream; never abandon a caller's transaction.
+                if may_stop
+                    && previous.is_none()
+                    && error.is_none()
+                    && cap.is_some_and(|cap| count >= cap)
+                {
+                    stopped = true;
+                    break;
+                }
+            }
+            if let Some(error) = error {
+                return Err(error);
+            }
+            if !ended && !stopped {
+                return Err("output incomplete: server did not finish the SELECT".into());
+            }
+            sink(crate::db::QueryEvent::End)?;
+            Ok(count)
+        })();
+        if previous.is_some() {
+            if let Some(stream) = continuation {
+                state.active = Some(stream);
+            }
+            if !complete_response {
+                state.lost = true;
+            }
+        } else if let Some(stream) = continuation {
+            self.close_stream(&stream);
+        }
+        result
+    }
+
     fn quote(ident: &str) -> String {
         format!("\"{}\"", ident.replace('"', "\"\""))
     }
@@ -390,133 +539,8 @@ fn decode_result(result: &Json) -> DbResult<StmtOut> {
 }
 
 impl DbLink for RemoteDb {
-    fn stream_query(&self, sql: &str, mut sink: crate::db::RowSink) -> DbResult<usize> {
-        use std::io::BufRead;
-        let sql = crate::sql::select_source(sql)?;
-        let mut state = self.stream.lock().unwrap();
-        if state.lost {
-            return Err("remote transaction outcome unknown; reopen and check the database".into());
-        }
-        let previous = state.active.clone();
-        let pipeline_url = previous
-            .as_ref()
-            .map_or(self.pipeline_url.as_str(), |s| &s.url);
-        let cursor_url = format!("{}/cursor", pipeline_url.trim_end_matches("/pipeline"));
-        let mut step = json!({"stmt": {"sql": sql, "want_rows": true}});
-        if previous.is_some() {
-            step["condition"] = json!({"type": "not", "cond": {"type": "is_autocommit"}});
-        }
-        let mut req = self.agent.post(&cursor_url);
-        if let Some(auth) = &self.auth {
-            req = req.set("Authorization", auth);
-        }
-        let mut continuation = None;
-        let mut complete_response = false;
-        let result = (|| {
-            let response = req
-                .send_json(json!({
-                    "baton": previous.as_ref().map(|s| &s.baton),
-                    "batch": {"steps": [step]}
-                }))
-                .map_err(|e| format!("sqld output request: {e}"))?;
-            let mut reader = std::io::BufReader::new(response.into_reader());
-            let mut line = String::new();
-            reader.read_line(&mut line).map_err(|e| e.to_string())?;
-            let header: Json = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-            if let Some(baton) = header["baton"].as_str() {
-                let url = match header["base_url"].as_str() {
-                    Some(base) if base.starts_with("http://") || base.starts_with("https://") => {
-                        format!("{}/v3/pipeline", base.trim_end_matches('/'))
-                    }
-                    Some(_) => return Err("sqld returned an invalid stream URL".into()),
-                    None => pipeline_url.to_owned(),
-                };
-                continuation = Some(Stream {
-                    baton: baton.to_owned(),
-                    url,
-                });
-            } else if previous.is_some() {
-                return Err("sqld closed the transaction stream during output".into());
-            }
-            let (mut started, mut ended, mut width, mut count) = (false, false, 0, 0);
-            let mut error = None;
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-                    complete_response = true;
-                    break;
-                }
-                let entry: Json = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-                let event = match entry["type"].as_str() {
-                    Some("step_begin") if !started && entry["step"] == 0 => {
-                        started = true;
-                        let columns = entry["cols"]
-                            .as_array()
-                            .ok_or("missing output columns")?
-                            .iter()
-                            .map(|c| {
-                                c["name"]
-                                    .as_str()
-                                    .map(str::to_owned)
-                                    .ok_or_else(|| "missing column name".to_owned())
-                            })
-                            .collect::<DbResult<Vec<_>>>()?;
-                        width = columns.len();
-                        Some(crate::db::QueryEvent::Columns(columns))
-                    }
-                    Some("row") if started && !ended => {
-                        let row = entry["row"]
-                            .as_array()
-                            .ok_or("missing output row")?
-                            .iter()
-                            .map(decode)
-                            .collect::<DbResult<Vec<_>>>()?;
-                        if row.len() != width {
-                            return Err("incomplete output row".into());
-                        }
-                        count += 1;
-                        Some(crate::db::QueryEvent::Row(row))
-                    }
-                    Some("step_end") if started && !ended => {
-                        ended = true;
-                        None
-                    }
-                    Some("step_error" | "error") => {
-                        error.get_or_insert_with(|| remote_error(&entry["error"]));
-                        None
-                    }
-                    // sqld adds replication metadata after the result.
-                    Some("replication_index") => None,
-                    _ => return Err("unexpected sqld output response".into()),
-                };
-                // Drain after a disk/SQL failure so a caller-owned stream can
-                // still be used or rolled back once this response completes.
-                if error.is_none() {
-                    if let Some(event) = event {
-                        error = sink(event).err();
-                    }
-                }
-            }
-            if let Some(error) = error {
-                return Err(error);
-            }
-            if !ended {
-                return Err("output incomplete: server did not finish the SELECT".into());
-            }
-            sink(crate::db::QueryEvent::End)?;
-            Ok(count)
-        })();
-        if previous.is_some() {
-            if let Some(stream) = continuation {
-                state.active = Some(stream);
-            }
-            if !complete_response {
-                state.lost = true;
-            }
-        } else if let Some(stream) = continuation {
-            self.close_stream(&stream);
-        }
-        result
+    fn stream_query(&self, sql: &str, sink: crate::db::RowSink) -> DbResult<usize> {
+        self.read_cursor(&crate::sql::select_source(sql)?, None, false, sink)
     }
 
     fn readonly(&self) -> bool {
@@ -674,16 +698,48 @@ impl DbLink for RemoteDb {
 
     fn query(&self, sql: &str) -> DbResult<QueryResult> {
         let start = Instant::now();
-        // Push the cap server-side: without this a bare
-        // `SELECT * FROM big` downloads the whole table over HTTP
-        // before we truncate locally.
-        let capped = crate::db::apply_cap(sql, QUERY_CAP + 1);
-        let out = self.one(&capped, vec![])?;
-        let truncated = out.rows.len() > QUERY_CAP;
-        let mut rows = out.rows;
+        let sql = crate::sql::single_query(sql)?;
+        let may_stop = crate::sql::read_query(sql);
+        if !may_stop && crate::sql::head(sql) != "PRAGMA" {
+            // Statements with RETURNING must finish their write. The ordinary
+            // pipeline also preserves FK enforcement and transaction ownership.
+            let out = self.one(sql, vec![])?;
+            let truncated = out.rows.len() > QUERY_CAP;
+            let mut rows = out.rows;
+            rows.truncate(QUERY_CAP);
+            return Ok(QueryResult {
+                columns: out.cols,
+                rows,
+                truncated,
+                elapsed: start.elapsed(),
+            });
+        }
+        let source = if self.readonly {
+            crate::sql::select_source(sql)?
+        } else {
+            sql.to_owned()
+        };
+        let data = std::sync::Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let output = data.clone();
+        self.read_cursor(
+            &source,
+            Some(QUERY_CAP + 1),
+            may_stop,
+            Box::new(move |event| {
+                let mut data = output.lock().unwrap();
+                match event {
+                    crate::db::QueryEvent::Columns(columns) => data.0 = columns,
+                    crate::db::QueryEvent::Row(row) => data.1.push(row),
+                    crate::db::QueryEvent::End => (),
+                }
+                Ok(())
+            }),
+        )?;
+        let (columns, mut rows) = std::mem::take(&mut *data.lock().unwrap());
+        let truncated = rows.len() > QUERY_CAP;
         rows.truncate(QUERY_CAP);
         Ok(QueryResult {
-            columns: out.cols,
+            columns,
             rows,
             truncated,
             elapsed: start.elapsed(),
@@ -1283,5 +1339,7 @@ mod tests {
         crate::app::assert_related_record_workflow(Box::new(RemoteDb::open(url).unwrap()));
         crate::app::assert_builder_workflow(|| Box::new(RemoteDb::open(url).unwrap()));
         crate::app::assert_picker_workflow(Box::new(RemoteDb::open(url).unwrap()));
+        crate::app::assert_query_preview_workflow(Box::new(RemoteDb::open(url).unwrap()));
+        crate::app::assert_first_entry_workflow(Box::new(RemoteDb::open(url).unwrap()));
     }
 }

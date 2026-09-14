@@ -1,5 +1,5 @@
-//! Publish completed output with one rename, leaving existing files intact
-//! after query, formatting, or write failures.
+//! Publish completed output atomically, leaving existing files intact after
+//! query, formatting, or write failures. New databases never replace a target.
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +57,15 @@ impl AtomicOutput {
 
     pub fn publish(self) -> Result<(), String> {
         std::fs::rename(&self.temporary, &self.target).map_err(|e| e.to_string())
+    }
+
+    pub fn temporary_path(&self) -> &Path {
+        &self.temporary
+    }
+
+    /// Publish a new database without replacing a file or following a symlink.
+    pub fn publish_new(self) -> Result<(), String> {
+        std::fs::hard_link(&self.temporary, &self.target).map_err(|e| e.to_string())
     }
 }
 

@@ -111,6 +111,7 @@ def new_record(s, fields, gap=0.55):
     """'a' then id-first entry: first Enter INSERTs, the rest UPDATE.
     Each field is typed then committed with Enter (Enter is the save key)."""
     s.k("a", 0.7)
+    s.k("\x1b[1;5H", 0.3)  # these legacy chapters deliberately enter IDs
     for f in fields:
         s.type(f, wait=gap)
         s.k(ENTER, gap)
@@ -164,6 +165,7 @@ def ch02_orders(s):
     s.k(F2, 1.4)
     # Hand-enter one order — Enter is the save key all the way through.
     s.k("a", 1.0)
+    s.k("\x1b[1;5H", 0.3)                             # explicit ID-first sequence
     s.k(ENTER, 0.9)                                       # insert (all NULL)
     s.type("1", wait=0.8).k(ENTER, 0.9)                   # customer 1
     s.type("compiler", wait=0.6).k(ENTER, 0.8)

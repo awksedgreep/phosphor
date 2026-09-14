@@ -43,6 +43,93 @@ fn has_sql(sql: &str) -> bool {
     !without_trivia(sql).is_empty()
 }
 
+pub fn head(sql: &str) -> String {
+    without_trivia(sql)
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase()
+}
+
+pub fn single_query(sql: &str) -> DbResult<&str> {
+    let statements = split(sql)?;
+    if statements.len() != 1 {
+        return Err("a query must contain exactly one statement; run statements separately".into());
+    }
+    Ok(statements[0])
+}
+
+/// SELECT/VALUES and EXPLAIN can stop at the preview boundary. For WITH,
+/// find the main statement outside quoted text, comments, and CTE bodies.
+/// Writes with RETURNING must finish, even when their displayed rows are capped.
+pub fn read_query(sql: &str) -> bool {
+    match head(sql).as_str() {
+        "SELECT" | "VALUES" | "EXPLAIN" => return true,
+        "WITH" => (),
+        _ => return false,
+    }
+    let bytes = sql.as_bytes();
+    let (mut i, mut depth) = (0, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' | b'[' => {
+                let quote = if bytes[i] == b'[' { b']' } else { bytes[i] };
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        i += 1;
+                        if quote != b']' && bytes.get(i) == Some(&quote) {
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !(bytes[i - 1] == b'*' && bytes[i] == b'/') {
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len());
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            ch if ch.is_ascii_alphabetic() || ch == b'_' || ch >= 0x80 => {
+                let start = i;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric()
+                        || matches!(bytes[i], b'_' | b'$')
+                        || bytes[i] >= 0x80)
+                {
+                    i += 1;
+                }
+                if depth == 0 {
+                    match sql[start..i].to_ascii_uppercase().as_str() {
+                        "SELECT" | "VALUES" => return true,
+                        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" => return false,
+                        _ => (),
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 /// The server parses this as one SELECT. Preserve the user's own LIMIT and
 /// put the closing parenthesis on a new line after any trailing comment.
 pub fn select_source(sql: &str) -> DbResult<String> {
