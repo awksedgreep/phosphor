@@ -175,11 +175,18 @@ pub fn import_controlled(
         for result in rdr.records() {
             control.check()?;
             let record = result.map_err(|e| format!("import: csv record: {e}"))?;
+            let row_no = inserted + batch.len() as i64 + 1;
             let mut row: Vec<PValue> = Vec::with_capacity(hdr_to_col.len());
-            for (hi, _col_name, decl) in &hdr_to_col {
+            for (hi, col_name, decl) in &hdr_to_col {
                 // Empty field → NULL; NOT NULL constraints still apply.
-                let raw = record.get(*hi).unwrap_or("").trim();
-                row.push(PValue::parse(raw, decl));
+                // No trim: CSV quoting already preserves spaces (#57).
+                let raw = record.get(*hi).unwrap_or("");
+                row.push(match PValue::parse_strict(raw, decl) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(format!("import: row {row_no}: column {col_name:?}: {e}"))
+                    }
+                });
             }
             control.row()?;
             batch.push(row);
@@ -433,6 +440,46 @@ mod tests {
         assert!(error.contains("row 1400"), "{error}");
         assert_eq!(db.count("uniq").unwrap(), 0, "batched import rolled back");
         fs::remove_file(&path2).unwrap();
+    }
+
+    /// #57: a value that does not fit the declared type fails the
+    /// import (naming row and column) instead of quietly landing as
+    /// TEXT, and field whitespace is preserved verbatim.
+    #[test]
+    fn import_enforces_declared_types_and_keeps_whitespace() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(a INTEGER, r REAL, name TEXT)")
+            .unwrap();
+        let path = tmp_path("types");
+        fs::write(&path, "a,r,name\n1,2.5, Ada \n").unwrap();
+        import_csv(&db, "t", &path).unwrap();
+        let q = db.query("SELECT a, r, name FROM t").unwrap();
+        assert_eq!(
+            q.rows[0],
+            vec![
+                PValue::Int(1),
+                PValue::Real(2.5),
+                PValue::Text(" Ada ".into())
+            ],
+            "declared types and field whitespace survive the import"
+        );
+        for (csv, needle) in [
+            ("a,r,name\nabc,,x\n", "not an integer"),
+            ("a,r,name\n12.5,,x\n", "not an integer"),
+            ("a,r,name\n5,oops,x\n", "not a real"),
+        ] {
+            db.execute("DELETE FROM t").unwrap();
+            fs::write(&path, csv).unwrap();
+            let error = import_csv(&db, "t", &path).unwrap_err();
+            assert!(error.contains(needle), "{csv:?}: {error}");
+            assert!(error.contains("row 1"), "{csv:?}: {error}");
+            assert_eq!(
+                db.count("t").unwrap(),
+                0,
+                "{csv:?}: partial import survived"
+            );
+        }
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

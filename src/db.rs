@@ -164,6 +164,41 @@ impl PValue {
         }
         PValue::Text(input.to_owned())
     }
+
+    /// `parse`, strict for INTEGER/REAL declarations: a value that does
+    /// not fit the declared type is an error, not a quiet fall-through
+    /// to Text (CSV import, #57 — "abc" in an INTEGER column used to
+    /// import as text, "12.5" as REAL 12.5). Empty input still means
+    /// NULL; other affinities keep `parse`'s SQLite-coercion behavior.
+    pub fn parse_strict(input: &str, decl_type: &str) -> Result<PValue, String> {
+        if input.is_empty() {
+            return Ok(PValue::Null);
+        }
+        let contains_ci = |hay: &str, needle: &str| {
+            !needle.is_empty()
+                && hay.len() >= needle.len()
+                && hay
+                    .as_bytes()
+                    .windows(needle.len())
+                    .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+        };
+        if contains_ci(decl_type, "INT") {
+            return input
+                .parse::<i64>()
+                .map(PValue::Int)
+                .map_err(|_| format!("{input:?} is not an integer for an {decl_type} column"));
+        }
+        if contains_ci(decl_type, "REAL")
+            || contains_ci(decl_type, "FLOA")
+            || contains_ci(decl_type, "DOUB")
+        {
+            return input
+                .parse::<f64>()
+                .map(PValue::Real)
+                .map_err(|_| format!("{input:?} is not a real for an {decl_type} column"));
+        }
+        Ok(Self::parse(input, decl_type))
+    }
 }
 
 impl rusqlite::ToSql for PValue {
