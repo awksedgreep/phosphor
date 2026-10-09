@@ -6491,7 +6491,8 @@ impl App {
             }
         }
         // Form lifecycle (rule 4): OnValidate may block or set fields.
-        // The Enter path is quiet; F10/paging surface the reason.
+        // The Enter path skips the informational toasts; a blocking
+        // error() is surfaced either way (#69).
         if !self.run_validate_script(skip_required_check) {
             return false;
         }
@@ -6649,19 +6650,23 @@ impl App {
         ) {
             Ok(o) => o,
             Err(e) => {
-                if !quiet {
-                    self.err(format!("{event}: {e}"));
-                }
+                // A script that fails to run is a real error: surface it
+                // even on the quiet Enter path, which only skips the
+                // informational toasts (#69).
+                self.err(format!("{event}: {e}"));
                 return !blocking;
             }
         };
-        if !quiet {
-            for m in &outcome.messages {
+        for m in &outcome.messages {
+            if !quiet {
                 self.say(m.clone());
             }
-            if let Some(e) = &outcome.error {
-                self.err(e.clone());
-            }
+        }
+        // The blocking error is a documented API; it must be surfaced even
+        // when the commit is quiet, or the save blocks with no message
+        // (#69).
+        if let Some(e) = &outcome.error {
+            self.err(e.clone());
         }
         // #62: ui.* effects were silently dropped here; queue them for
         // the command's end-of-pass drain (the commit completes first).
@@ -9964,13 +9969,15 @@ mod tests {
         if let Overlay::Edit(ed) = &mut a.overlay {
             ed.editing = Some(String::new());
         }
-        a.apply(Command::EditCommitField); // Enter: quiet block, no toast
+        a.apply(Command::EditCommitField); // Enter: quiet, but the blocking error still shows
         assert!(
-            !a.status.as_ref().is_some_and(|(_, e)| *e),
-            "quiet path must not toast: {:?}",
+            a.status
+                .as_ref()
+                .is_some_and(|(m, e)| *e && m.contains("need a name")),
+            "the quiet path surfaces the blocking error too (#69): {:?}",
             a.status
         );
-        a.apply(Command::EditSave); // explicit save: loud reason
+        a.apply(Command::EditSave); // explicit save: same reason
         assert!(
             a.status
                 .as_ref()
@@ -9989,6 +9996,51 @@ mod tests {
         a.sync();
         let q = a.db.query("SELECT name FROM people").unwrap();
         assert_eq!(q.rows[0][0], PValue::Text("GRACE".into()));
+    }
+
+    /// #69: the quiet Enter autosave path must still surface a blocking
+    /// OnValidate error() — quiet skips only the informational toasts,
+    /// not the documented blocking API (a blocked save with no message).
+    #[test]
+    fn quiet_enter_path_surfaces_blocking_error() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE accounts(id INTEGER PRIMARY KEY, balance real);
+             INSERT INTO accounts(balance) VALUES (100);",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        let bind = r#"script accounts OnValidate if record.balance ~= nil and record.balance < 0 then error("balance below zero") end"#;
+        for c in bind.chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(
+            !a.status.as_ref().is_some_and(|(_, e)| *e),
+            "bind: {:?}",
+            a.status
+        );
+
+        a.apply(Command::SidebarSeek('a')); // accounts
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // balance
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some("-5".to_owned());
+        }
+        a.apply(Command::EditCommitField); // Enter: quiet autosave
+        assert!(
+            a.status
+                .as_ref()
+                .is_some_and(|(m, e)| *e && m.contains("balance below zero")),
+            "the quiet path must surface the blocking error: {:?}",
+            a.status
+        );
+        let q = a.db.query("SELECT count(*) FROM accounts").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Int(1), "the save must stay blocked");
     }
 
     /// #12: the `edit` command opens the multi-line editor; typing,
