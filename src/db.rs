@@ -128,6 +128,31 @@ impl PValue {
         }
     }
 
+    /// Parse a SQL blob literal (`x'…'` / `X'…'`) back into its bytes.
+    /// `None` when the input is not shaped like a blob literal (the caller
+    /// keeps its normal parsing); `Some(Err)` when it is one but the hex is
+    /// malformed. CSV exports write blobs as this literal (#76).
+    fn parse_blob_literal(input: &str) -> Option<Result<Vec<u8>, String>> {
+        let inner = input
+            .strip_prefix("x'")
+            .or_else(|| input.strip_prefix("X'"))?
+            .strip_suffix('\'')?;
+        if inner.len() % 2 != 0 {
+            return Some(Err(format!("{input:?} is not a valid blob literal")));
+        }
+        let mut out = Vec::with_capacity(inner.len() / 2);
+        for pair in inner.as_bytes().chunks(2) {
+            match std::str::from_utf8(pair)
+                .ok()
+                .and_then(|s| u8::from_str_radix(s, 16).ok())
+            {
+                Some(byte) => out.push(byte),
+                None => return Some(Err(format!("{input:?} is not a valid blob literal"))),
+            }
+        }
+        Some(Ok(out))
+    }
+
     /// Parse an edited text back into a value, guided by the column's
     /// declared type. Empty input means NULL (dBASE would approve).
     pub fn parse(input: &str, decl_type: &str) -> PValue {
@@ -143,6 +168,15 @@ impl PValue {
             hay.as_bytes()
                 .windows(needle.len())
                 .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+        }
+        // BLOB columns: an exported blob literal parses back to bytes so
+        // the column round-trips through CSV; anything else stays TEXT
+        // (#76).
+        if contains_ci(decl_type, "BLOB") {
+            return match Self::parse_blob_literal(input) {
+                Some(Ok(bytes)) => PValue::Blob(bytes),
+                _ => PValue::Text(input.to_owned()),
+            };
         }
         if contains_ci(decl_type, "INT") {
             if let Ok(i) = input.parse::<i64>() {
@@ -186,6 +220,15 @@ impl PValue {
                     .windows(needle.len())
                     .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
         };
+        // BLOB columns: an exported blob literal parses back to bytes so
+        // the column round-trips through CSV; anything else stays TEXT
+        // (#76).
+        if contains_ci(decl_type, "BLOB") {
+            return Ok(match Self::parse_blob_literal(input) {
+                Some(Ok(bytes)) => PValue::Blob(bytes),
+                _ => PValue::Text(input.to_owned()),
+            });
+        }
         if contains_ci(decl_type, "INT") {
             return input
                 .parse::<i64>()

@@ -22,12 +22,16 @@ fn to_csv_string(v: &PValue) -> String {
             }
         }
         PValue::Text(t) => t.clone(),
+        // The SQL blob literal x'…', so a re-import of this file parses
+        // the column back to BLOB instead of TEXT (#76).
         PValue::Blob(b) => {
             use std::fmt::Write as _;
-            let mut s = String::with_capacity(b.len() * 2);
+            let mut s = String::with_capacity(b.len() * 2 + 3);
+            s.push_str("x'");
             for byte in b {
                 let _ = write!(s, "{byte:02x}");
             }
+            s.push('\'');
             s
         }
     }
@@ -314,6 +318,40 @@ mod tests {
         assert!(content.contains("Ada"));
         assert!(content.contains("Grace"));
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&out);
+    }
+
+    /// #76: a BLOB column must survive export→import as a BLOB, not TEXT.
+    /// Export writes the SQL blob literal x'…'; re-importing parses it
+    /// back to the original bytes.
+    #[test]
+    fn blob_column_round_trips_through_csv() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, data BLOB)")
+            .unwrap();
+        db.execute("INSERT INTO t(name, data) VALUES ('Ada', x'0001abcdef00ff')")
+            .unwrap();
+        let out = tmp_path("blob-out");
+        export_csv(&db, "t", &out).unwrap();
+        let content = fs::read_to_string(&out).unwrap();
+        assert!(
+            content.contains("x'0001abcdef00ff'"),
+            "export must write the blob literal, got: {content:?}"
+        );
+
+        db.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, name TEXT, data BLOB)")
+            .unwrap();
+        let msg = import_csv(&db, "u", &out).unwrap();
+        assert!(msg.contains("1 row(s)"), "{msg}");
+        let q = db.query("SELECT name, data FROM u").unwrap();
+        assert_eq!(
+            q.rows[0],
+            vec![
+                PValue::Text("Ada".into()),
+                PValue::Blob(vec![0x00, 0x01, 0xab, 0xcd, 0xef, 0x00, 0xff])
+            ],
+            "a blob column must round-trip through CSV as a BLOB"
+        );
         let _ = fs::remove_file(&out);
     }
 
