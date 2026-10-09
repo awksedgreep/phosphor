@@ -57,16 +57,20 @@ impl PValue {
                 }
             }
             PValue::Text(t) => t.replace('\n', "␤"),
-            PValue::Blob(b) => {
-                use std::fmt::Write as _;
-                let mut head = String::with_capacity(16);
-                for x in b.iter().take(8) {
-                    let _ = write!(head, "{x:02x}");
-                }
-                let ell = if b.len() > 8 { "…" } else { "" };
-                format!("x'{head}{ell}' ({}B)", b.len())
-            }
+            PValue::Blob(b) => Self::blob_render(b),
         }
+    }
+
+    /// `x'head…' (NB)` — the on-screen form for a blob (grid, status,
+    /// and the Lua transcript all agree).
+    pub fn blob_render(b: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut head = String::with_capacity(16);
+        for x in b.iter().take(8) {
+            let _ = write!(head, "{x:02x}");
+        }
+        let ell = if b.len() > 8 { "…" } else { "" };
+        format!("x'{head}{ell}' ({}B)", b.len())
     }
 
     /// Case-insensitive substring match for `find` (ASCII folding —

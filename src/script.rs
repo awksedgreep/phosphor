@@ -125,17 +125,42 @@ pub fn all_scripts(db: &dyn DbLink) -> Vec<(String, String, String)> {
 
 // ── value marshalling ────────────────────────────────────────────────
 
+/// BLOBs cross the boundary as tagged tables: `{__phosphor_blob, data}`.
+/// mlua's `Buffer` is Luau-only (this build is Lua 5.4), so a raw byte
+/// string cannot be told apart from text — an untagged string would be
+/// lossily textified on the way back (#59).
+fn blob_tag(lua: &Lua, b: &[u8]) -> mlua::Result<Value> {
+    let t = lua.create_table()?;
+    t.set("__phosphor_blob", true)?;
+    t.set("data", lua.create_string(b)?)?;
+    Ok(Value::Table(t))
+}
+
+/// The byte payload if `v` is a blob tag table, else `None`.
+fn blob_payload(v: &Value) -> Option<Vec<u8>> {
+    let Value::Table(t) = v else { return None };
+    let tagged = t.raw_get::<bool>("__phosphor_blob").ok()?;
+    if !tagged {
+        return None;
+    }
+    let s: mlua::String = t.raw_get("data").ok()?;
+    Some(s.as_bytes().to_vec())
+}
+
 fn to_lua(lua: &Lua, v: &PValue) -> mlua::Result<Value> {
     Ok(match v {
         PValue::Null => Value::Nil,
         PValue::Int(i) => Value::Integer(*i),
         PValue::Real(f) => Value::Number(*f),
         PValue::Text(t) => Value::String(lua.create_string(t)?),
-        PValue::Blob(b) => Value::String(lua.create_string(b)?),
+        PValue::Blob(b) => blob_tag(lua, b)?,
     })
 }
 
 fn lua_to_string(v: &Value) -> String {
+    if let Some(b) = blob_payload(v) {
+        return PValue::blob_render(&b);
+    }
     match v {
         Value::Nil => "nil".to_owned(),
         Value::Boolean(b) => b.to_string(),
@@ -146,15 +171,28 @@ fn lua_to_string(v: &Value) -> String {
     }
 }
 
-fn from_lua(v: &Value) -> PValue {
-    match v {
+fn from_lua(v: &Value) -> Result<PValue, String> {
+    if let Some(b) = blob_payload(v) {
+        return Ok(PValue::Blob(b));
+    }
+    Ok(match v {
         Value::Nil => PValue::Null,
         Value::Boolean(b) => PValue::Int(*b as i64),
         Value::Integer(i) => PValue::Int(*i),
         Value::Number(n) => PValue::Real(*n),
-        Value::String(s) => PValue::Text(s.to_string_lossy().to_string()),
-        other => PValue::Text(format!("{other:?}")),
-    }
+        Value::String(s) => match std::str::from_utf8(s.as_bytes().as_ref()) {
+            Ok(t) => PValue::Text(t.to_owned()),
+            // Raw bytes from a script literal: keep them exactly rather
+            // than lossily replacing with U+FFFD.
+            Err(_) => PValue::Blob(s.as_bytes().to_vec()),
+        },
+        other => {
+            return Err(format!(
+                "cannot store a Lua {} in a cell: use a string, number, or nil",
+                other.type_name()
+            ))
+        }
+    })
 }
 
 /// One row as a table keyed by column name.
@@ -206,6 +244,15 @@ fn json_to_lua(lua: &Lua, j: &serde_json::Value) -> mlua::Result<Value> {
 
 fn lua_to_json(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
+    if let Some(b) = blob_payload(v) {
+        // Full hex: JSON consumers can round-trip it exactly.
+        use std::fmt::Write as _;
+        let mut hex = String::with_capacity(b.len() * 2);
+        for x in &b {
+            let _ = write!(hex, "{x:02x}");
+        }
+        return J::String(hex);
+    }
     match v {
         Value::Nil => J::Null,
         Value::Boolean(b) => J::Bool(*b),
@@ -571,9 +618,11 @@ pub fn run_form_event(
         lua.load(source).exec()?;
 
         // Write the record table back into `values` (same columns only).
+        // A table/function stored by the script is a hard error here —
+        // it used to become a "table: 0x…" pointer string in the DB (#59).
         for (name, v) in values.iter_mut() {
             let lv: Value = record.get(name.as_str())?;
-            *v = from_lua(&lv);
+            *v = from_lua(&lv).map_err(mlua::Error::RuntimeError)?;
         }
         Ok(())
     });
@@ -833,5 +882,42 @@ mod tests {
         let mut empty = vec![("name".to_owned(), PValue::Null)];
         let out = run_form_event(&db, src, &mut empty, Some("name"), true).unwrap();
         assert_eq!(out.error.as_deref(), Some("name is required"));
+    }
+
+    /// #59: BLOBs round-trip losslessly through a form event. They cross
+    /// the boundary as tagged tables (mlua's Buffer is Luau-only) and are
+    /// never downgraded to U+FFFD text — an echo script must come back
+    /// byte-for-byte, storage class intact.
+    #[test]
+    fn blobs_round_trip_through_form_events() {
+        let bytes: Vec<u8> = vec![0xff, 0xfe, 0x00, 0x10, b'x', b'y', b'z', b'w', b'!'];
+        let mut values = vec![("data".to_owned(), PValue::Blob(bytes.clone()))];
+        let out =
+            run_form_event(&db(), "set('data', get('data'))", &mut values, None, false).unwrap();
+        assert!(out.error.is_none(), "{out:?}");
+        assert_eq!(values[0].1, PValue::Blob(bytes));
+    }
+
+    /// #59: storing a table or function in a cell is a hard error — it
+    /// used to silently write a "table: 0x…" pointer string into the
+    /// database, different garbage on every run.
+    #[test]
+    fn tables_and_functions_cannot_be_stored_in_cells() {
+        let mut values = vec![("name".to_owned(), PValue::Text("a".to_owned()))];
+        let err =
+            run_form_event(&db(), "set('name', {1, 2, 3})", &mut values, None, false).unwrap_err();
+        assert!(err.contains("table"), "{err}");
+        assert_eq!(values[0].1, PValue::Text("a".to_owned()));
+
+        let mut fnv = vec![("name".to_owned(), PValue::Text("a".to_owned()))];
+        let err = run_form_event(
+            &db(),
+            "set('name', function() return 1 end)",
+            &mut fnv,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("function"), "{err}");
     }
 }
