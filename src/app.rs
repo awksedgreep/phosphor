@@ -9440,6 +9440,50 @@ mod tests {
         assert_eq!(a.status.as_ref().unwrap().0, "ok (batch)");
     }
 
+    /// #67: the renderer must report the detail pane's real height back
+    /// to DetailState::visible_rows (like the master panel does for
+    /// app.visible_rows) — it stayed at the 12 set at open, so detail
+    /// jumps placed the cursor off the pane's window.
+    #[test]
+    fn detail_visible_rows_is_reported_by_the_renderer() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE parent(name TEXT PRIMARY KEY);
+             INSERT INTO parent VALUES ('p');
+             CREATE TABLE child(id INTEGER PRIMARY KEY, parent_name TEXT REFERENCES parent(name));
+             WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<100)
+             INSERT INTO child SELECT n, 'p' FROM seq",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.open_table("parent");
+        a.sync();
+        a.apply(Command::ToggleSplit);
+        a.sync();
+        assert_eq!(
+            a.detail.as_ref().unwrap().visible_rows,
+            12,
+            "the value set at open"
+        );
+        // 120x30: the pane is side-by-side (main width 96 >= 76), inner
+        // height 26, minus header = 25 — not the 12 from open.
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                crate::ui::draw(f, &mut a);
+            })
+            .unwrap();
+        assert_eq!(a.detail.as_ref().unwrap().visible_rows, 25);
+        // A bottom jump now lands the cursor on the pane's bottom edge.
+        a.apply(Command::Focus(Focus::Detail));
+        a.apply(Command::GridBottom);
+        a.sync();
+        let g = &a.detail.as_ref().unwrap().grid;
+        assert_eq!(g.cur_row, 99);
+        assert_eq!(g.row_off, 75, "99 - 25 + 1, not the stale 12-row math");
+    }
+
     /// #66: the horizontal scroll-window width sum must not overflow
     /// u16 on a very wide table (debug panic, release wrap) — 900
     /// columns at width 80 sum to 72,900 > u16::MAX.

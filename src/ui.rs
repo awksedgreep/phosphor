@@ -1680,6 +1680,11 @@ fn draw_detail_panel(
     let inner = block.inner(area);
     f.render_widget(block, area);
     let visible = inner.height.saturating_sub(1).max(1) as i64; // minus header
+                                                                // #67: report the pane's real height back (the master panel does
+                                                                // the same for app.visible_rows) — detail_move/reload row_off math
+                                                                // used the 12 set at open. Written before the empty-columns early
+                                                                // return so a fresh pane still reports.
+    state.visible_rows = visible;
 
     if state.grid.columns.is_empty() {
         f.render_widget(Paragraph::new(Line::styled("…", th.dim())), inner);
