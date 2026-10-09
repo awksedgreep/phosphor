@@ -620,11 +620,11 @@ enum PendingOp {
         preview: bool,
     },
     Picker,
-    /// Refresh: total + window into the live grid, then re-seek.
+    /// Refresh: total + window into the live grid. The cursor is kept
+    /// on arrival (re-clamped, re-paged if it left the window) — a
+    /// submit-time capture would clobber moves made in flight (#58).
     Refill {
         name: String,
-        row: i64,
-        col: usize,
         want_start: i64,
     },
     /// Scroll window: installs into the live grid when still wanted.
@@ -1164,15 +1164,7 @@ impl App {
                     Err(e) => self.err(e),
                 }
             }
-            (
-                PendingOp::Refill {
-                    name,
-                    row,
-                    col,
-                    want_start,
-                },
-                DbResponse::Window(r),
-            ) => match r {
+            (PendingOp::Refill { name, want_start }, DbResponse::Window(r)) => match r {
                 Ok((page, total)) => {
                     let current = matches!(
                         &self.grid,
@@ -1187,10 +1179,15 @@ impl App {
                         g.bump_render();
                         g.rowids = page.rowids;
                         g.cache_start = want_start;
-                        g.cur_col = col.min(g.columns.len().saturating_sub(1));
+                        g.cur_col = g.cur_col.min(g.columns.len().saturating_sub(1));
                         g.grow_widths();
                     }
                     self.last_ms = Some(took.as_secs_f64() * 1000.0);
+                    // #58: the user may have moved the cursor while the
+                    // refill was in flight: keep it (re-clamped, re-paged
+                    // via ensure_cache if it left the installed window)
+                    // instead of snapping back to the submit-time row.
+                    let row = self.grid.as_ref().map_or(0, |g| g.cur_row);
                     self.grid_jump(row);
                     self.try_pending_edit();
                 }
@@ -2893,33 +2890,22 @@ impl App {
         // the grid re-seeks when the window arrives.
         let target = match &self.grid {
             Some(g) => match &g.source {
-                GridSource::Table { name, .. } => Some((
-                    name.clone(),
-                    g.cur_row,
-                    g.cur_col,
-                    g.cache_start,
-                    (g.cache.len() as i64).max(1),
-                )),
+                GridSource::Table { name, .. } => {
+                    Some((name.clone(), g.cache_start, (g.cache.len() as i64).max(1)))
+                }
                 _ => None,
             },
             None => None,
         };
-        if let Some((name, row, col, want_start, limit)) = target {
+        if let Some((name, want_start, limit)) = target {
             let job_name = name.clone();
             let submitted = self.db.submit(Box::new(move |db| {
                 DbResponse::Window(db.open_window(&job_name, want_start, limit))
             }));
             match submitted {
                 Some(tag) => {
-                    self.pending.insert(
-                        tag,
-                        PendingOp::Refill {
-                            name,
-                            row,
-                            col,
-                            want_start,
-                        },
-                    );
+                    self.pending
+                        .insert(tag, PendingOp::Refill { name, want_start });
                 }
                 None => self.err("database worker is gone"),
             }
@@ -8995,6 +8981,30 @@ mod tests {
         assert!(g.row(499).is_some(), "cache must follow the cursor");
         a.apply(Command::GridTop);
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 0);
+    }
+
+    /// #58: cursor moves made while an F5 refill is in flight survive
+    /// the arrival — the old code snapped the cursor back to the row
+    /// captured at submit time, silently clobbering the moves.
+    #[test]
+    fn refresh_keeps_a_cursor_that_moved_while_in_flight() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::Refresh);
+        // The refill is queued on the worker; the user moves on.
+        a.apply(Command::GridMove { dr: 5, dc: 0 });
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 5);
+        a.sync();
+        assert_eq!(
+            a.grid.as_ref().unwrap().cur_row,
+            5,
+            "F5 must not clobber an in-flight cursor move"
+        );
+        // A plain F5 with no movement still settles on the cursor.
+        a.apply(Command::Refresh);
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 5);
     }
 
     #[test]
