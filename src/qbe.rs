@@ -97,6 +97,14 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// A bare filter Rust parses as a FINITE f64 is emitted as an unquoted
+/// number. Non-finite spellings (nan, inf, infinity) and overflowing
+/// exponents (1e999) parse in Rust but are not SQL literals — unquoting
+/// them would generate `col = nan` and a "no such column" error (#73).
+fn is_finite_number(f: &str) -> bool {
+    matches!(f.parse::<f64>(), Ok(v) if v.is_finite())
+}
+
 /// Does the fragment already start with a SQL operator/keyword?
 /// Allocation-free: single-char ops by byte, keywords by ASCII-folded
 /// prefix compare (no to_lowercase temporary per filter per frame).
@@ -216,7 +224,7 @@ impl QbeSpec {
                 let col = colref(&c.name);
                 if starts_with_op(f) {
                     format!("{col} {f}")
-                } else if f.parse::<f64>().is_ok() {
+                } else if is_finite_number(f) {
                     format!("{col} = {f}")
                 } else {
                     format!("{col} = {}", store::q(f))
@@ -427,6 +435,32 @@ mod tests {
         let mut s = spec();
         s.cols[0].filter = "42".into();
         assert!(s.sql().contains(r#""id" = 42"#));
+    }
+
+    /// #73: non-finite spellings (nan/inf/infinity) and overflowing
+    /// exponents (1e999) parse as f64 in Rust but are not SQL literals, so
+    /// they must be quoted — unquoting them would generate a "no such
+    /// column" error. Finite values still unquote.
+    #[test]
+    fn non_finite_filters_are_quoted_not_broken_sql() {
+        for bad in ["nan", "inf", "-inf", "infinity", "1e999"] {
+            let mut s = spec();
+            s.cols[2].filter = bad.into(); // amt (REAL)
+            let sql = s.sql();
+            assert!(
+                sql.contains(&format!("\"amt\" = '{bad}'")),
+                "{bad:?} must be quoted, got: {sql}"
+            );
+        }
+        for good in ["42", "1.5", "1e10", "-3"] {
+            let mut s = spec();
+            s.cols[2].filter = good.into();
+            assert!(
+                s.sql().contains(&format!("\"amt\" = {good}")),
+                "{good:?} must unquote, got: {}",
+                s.sql()
+            );
+        }
     }
 
     /// #16: declared FKs become cycleable joins in both directions, and
