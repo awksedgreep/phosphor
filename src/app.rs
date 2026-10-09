@@ -4800,16 +4800,25 @@ impl App {
                     self.apply(Command::SidebarClick(idx));
                 } else if Self::contains(self.hit.master, col, row) {
                     let r = self.hit.master.unwrap();
-                    self.apply(Command::GridClick {
-                        row: self.grid.as_ref().map_or(0, |g| g.row_off) + (row - r.y - 1) as i64,
-                    });
+                    // The pane's first row is the column header: a click
+                    // on it is a no-op, and `row - r.y - 1` would
+                    // underflow the u16 there (debug panic, release wrap
+                    // to the last row).
+                    if row > r.y {
+                        self.apply(Command::GridClick {
+                            row: self.grid.as_ref().map_or(0, |g| g.row_off)
+                                + i64::from(row - r.y - 1),
+                        });
+                    }
                 } else if Self::contains(self.hit.detail, col, row) {
                     self.apply(Command::Focus(Focus::Detail));
                     let r = self.hit.detail.unwrap();
                     let off = self.detail.as_ref().map_or(0, |d| d.grid.row_off);
-                    self.apply(Command::GridClick {
-                        row: off + (row - r.y - 1) as i64,
-                    });
+                    if row > r.y {
+                        self.apply(Command::GridClick {
+                            row: off + i64::from(row - r.y - 1),
+                        });
+                    }
                 } else if Self::contains(self.hit.prompt, col, row) {
                     self.apply(Command::Focus(Focus::Prompt));
                 }
@@ -10262,6 +10271,64 @@ beta');",
             28,
         );
         assert_eq!(a.focus, Focus::Prompt);
+    }
+
+    /// #50: a click on the pane's column-header row is a no-op. The old
+    /// `row - r.y - 1` underflowed the u16 there (debug panic; release
+    /// wrap selected the LAST row and opened EDIT on it).
+    #[test]
+    fn mouse_click_on_the_grid_header_is_a_noop() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO people(name) VALUES ('Ada'), ('Grace'), ('Katherine');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        use ratatui::crossterm::event::MouseEventKind as K;
+        use ratatui::layout::Rect;
+        // Pane content starts at y=1: that row IS the header; y=2 is
+        // the first data row.
+        a.hit.master = Some(Rect {
+            x: 25,
+            y: 1,
+            width: 40,
+            height: 20,
+        });
+        a.on_mouse(
+            &K::Down(ratatui::crossterm::event::MouseButton::Left),
+            30,
+            1,
+        );
+        assert_eq!(
+            a.grid.as_ref().unwrap().cur_row,
+            0,
+            "header click moves nothing"
+        );
+        assert!(
+            matches!(a.overlay, Overlay::None),
+            "header click opens nothing"
+        );
+        // Data-row clicks still land on the right row.
+        a.on_mouse(
+            &K::Down(ratatui::crossterm::event::MouseButton::Left),
+            30,
+            2,
+        );
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 0);
+        assert!(
+            matches!(a.overlay, Overlay::Edit(_)),
+            "cursor-row click edits"
+        );
+        a.apply(Command::Back);
+        a.on_mouse(
+            &K::Down(ratatui::crossterm::event::MouseButton::Left),
+            30,
+            4,
+        );
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 2);
     }
 
     /// Slice C: a split choice is remembered in _phosphor_prefs and
