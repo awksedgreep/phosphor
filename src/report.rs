@@ -359,7 +359,10 @@ pub fn render_controlled(
     let mut line_on_page = usize::MAX; // force header on first line
 
     let mut emit = |lines: &mut Vec<String>, s: String| {
-        if line_on_page >= PAGE_LINES {
+        // Break one line early: the "page N" footer is appended to the
+        // page that just filled, so reserving its slot keeps every page
+        // within the PAGE_LINES physical budget (#72).
+        if line_on_page >= PAGE_LINES - 1 {
             if page > 0 {
                 lines.push(format!(
                     "{}page {page}",
@@ -706,6 +709,56 @@ mod tests {
             "CJK line misaligns the columns:\n{}",
             lines.join("\n")
         );
+    }
+
+    /// #72: a page's physical lines (header + content + "page N" footer)
+    /// must stay within PAGE_LINES. The footer used to be appended to an
+    /// already-full 55-line page, pushing it to 56.
+    #[test]
+    fn page_footer_stays_within_the_page_budget() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(n INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        let vals: Vec<String> = (1..=120).map(|i| format!("({i}, 'row{i}')")).collect();
+        db.execute(&format!("INSERT INTO t(n, v) VALUES {}", vals.join(",")))
+            .unwrap();
+        let spec = ReportSpec {
+            name: "t".into(),
+            title: "T".into(),
+            source: "t".into(),
+            group_by: None,
+        };
+        let lines = render(&db, &spec).unwrap();
+        // Split into pages on the form-feed line; each page (header +
+        // content + footer) must fit the budget.
+        let mut pages: Vec<Vec<&String>> = Vec::new();
+        let mut cur = Vec::new();
+        for l in &lines {
+            if l.as_str() == "\u{c}" {
+                pages.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(l);
+            }
+        }
+        if !cur.is_empty() {
+            pages.push(cur);
+        }
+        assert!(
+            pages.len() >= 2,
+            "expected multiple pages, got {}:\n{}",
+            pages.len(),
+            lines.join("\n")
+        );
+        for (i, p) in pages.iter().enumerate() {
+            let shown = p.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n");
+            assert!(
+                p.len() <= PAGE_LINES,
+                "page {} has {} lines (budget {}):\n{shown}",
+                i + 1,
+                p.len(),
+                PAGE_LINES
+            );
+        }
     }
 
     #[test]
