@@ -298,6 +298,32 @@ fn sql_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Stable saturating u64 → i64: `as i64` truncates the top bit and wraps
+/// negative once seconds pass i64::MAX (≈ year 2262).
+fn saturating_i64(secs: u64) -> i64 {
+    if secs > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        secs as i64
+    }
+}
+
+/// Seconds since the Unix epoch as an i64, without the u64→i64 truncation
+/// that wraps negative at/after 2262, and without silently yielding 0 for a
+/// pre-1970 clock (#79). Post-2262 saturates to i64::MAX; pre-1970 is a real
+/// negative offset.
+fn unix_secs(now: std::time::SystemTime) -> i64 {
+    match now.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => saturating_i64(d.as_secs()),
+        Err(_) => -saturating_i64(
+            std::time::UNIX_EPOCH
+                .duration_since(now)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        ),
+    }
+}
+
 /// A fresh sandbox with only in-memory libraries and the resource caps.
 fn engine() -> mlua::Result<Lua> {
     // mlua's ALL_SAFE means safe for Rust, not isolated from the host:
@@ -584,12 +610,7 @@ macro_rules! install_host {
         )?;
         $lua.globals().set(
             "now",
-            $scope.create_function(|_, ()| {
-                Ok(std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0))
-            })?,
+            $scope.create_function(|_, ()| Ok(unix_secs(std::time::SystemTime::now())))?,
         )?;
         $lua.globals().set(
             "assert",
@@ -749,6 +770,48 @@ mod tests {
         db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
         db
+    }
+
+    /// #79: the epoch-seconds cast must not wrap negative at/after 2262 or
+    /// silently yield 0 for a pre-1970 clock.
+    #[test]
+    fn unix_secs_handles_extreme_clocks() {
+        use std::time::{Duration, UNIX_EPOCH};
+        // Normal post-epoch time passes through unchanged.
+        let t = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(unix_secs(t), 1_700_000_000);
+        // At the 2262 boundary (i64::MAX seconds, the largest time a
+        // SystemTime can hold): returns i64::MAX, never wraps negative.
+        // (Past i64::MAX is covered by saturating_i64_clamps_at_max.)
+        let at_max = UNIX_EPOCH + Duration::from_secs(i64::MAX as u64);
+        assert_eq!(unix_secs(at_max), i64::MAX);
+        // Pre-1970 clock: a real negative offset, not a silent 0.
+        let pre = UNIX_EPOCH - Duration::from_secs(100);
+        assert_eq!(unix_secs(pre), -100);
+    }
+
+    /// #79: the saturating cast itself must not wrap for huge inputs.
+    #[test]
+    fn saturating_i64_clamps_at_max() {
+        assert_eq!(saturating_i64(0), 0);
+        assert_eq!(saturating_i64(i64::MAX as u64), i64::MAX);
+        // Past i64::MAX: clamp, never wrap negative.
+        assert_eq!(saturating_i64(i64::MAX as u64 + 1), i64::MAX);
+        assert_eq!(saturating_i64(u64::MAX), i64::MAX);
+    }
+
+    /// #79: the Lua `now()` global returns real epoch seconds (the binding
+    /// is wired to the saturating path), not a truncated or zero value.
+    #[test]
+    fn now_returns_epoch_seconds() {
+        let db = db();
+        let out = run(&db, "say(now())").unwrap();
+        let n: i64 = out.messages.join("\n").trim().parse().unwrap();
+        // Any modern system clock is well past 2020-01-01 (1577836800).
+        assert!(
+            n > 1_577_836_800,
+            "now() should be post-2020 epoch seconds, got {n}"
+        );
     }
 
     #[test]
