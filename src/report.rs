@@ -93,6 +93,61 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
+/// Per-column running total. Integers accumulate in a checked i128 (exact —
+/// no 2^53 precision cliff, no float rounding on subtotals) and reals in
+/// f64; a column is a quantity only if it holds at least one Int or Real, so
+/// an all-NULL column is not one (#70).
+#[derive(Clone, Copy, Default)]
+struct ColTotals {
+    int: i128,
+    real: f64,
+    has_int: bool,
+    has_real: bool,
+    /// The i128 sum overflowed (astronomically unlikely); the column has
+    /// since been carried in f64.
+    overflow: bool,
+}
+
+impl ColTotals {
+    fn add(&mut self, v: &PValue) {
+        match v {
+            PValue::Int(n) => {
+                self.has_int = true;
+                if self.overflow {
+                    self.real += *n as f64;
+                } else if let Some(s) = self.int.checked_add(*n as i128) {
+                    self.int = s;
+                } else {
+                    // i128 overflow: carry the running total in f64.
+                    self.real += self.int as f64 + *n as f64;
+                    self.int = 0;
+                    self.overflow = true;
+                    self.has_real = true;
+                }
+            }
+            PValue::Real(f) => {
+                self.has_real = true;
+                self.real += f;
+            }
+            _ => {}
+        }
+    }
+
+    fn is_numeric(&self) -> bool {
+        self.has_int || self.has_real
+    }
+
+    /// The total as printed: an exact integer when the column is pure
+    /// integer, otherwise a float.
+    fn render(&self) -> String {
+        if self.has_real || self.overflow {
+            fmt_num(self.int as f64 + self.real)
+        } else {
+            self.int.to_string()
+        }
+    }
+}
+
 fn pad(s: &str, w: usize) -> String {
     let count = s.chars().count();
     let mut out: String = s.chars().take(w).collect();
@@ -161,16 +216,22 @@ pub fn render_controlled(
     // (was two full passes). Non-numeric cells mark the column; numeric
     // cells accumulate — exclusions below zero out anything disqualified.
     let mut numeric = vec![!rows.is_empty(); ncols];
-    let mut grand = vec![0f64; ncols];
+    let mut grand: Vec<ColTotals> = vec![ColTotals::default(); ncols];
     for row in &rows {
         control.check()?;
         for (i, v) in row.iter().enumerate() {
             match v {
-                PValue::Int(n) => grand[i] += *n as f64,
-                PValue::Real(f) => grand[i] += f,
+                PValue::Int(_) | PValue::Real(_) => grand[i].add(v),
                 PValue::Null => {}
                 _ => numeric[i] = false,
             }
+        }
+    }
+    // A column of nothing but NULLs has no numeric data: it is not a
+    // quantity, so its TOTAL and subtotals print blank, not 0 (#70).
+    for i in 0..ncols {
+        if !grand[i].is_numeric() {
+            numeric[i] = false;
         }
     }
     // Grouping by a plain column: that column is a key, not a quantity.
@@ -207,7 +268,7 @@ pub fn render_controlled(
     }
     for (i, n) in numeric.iter().enumerate() {
         if !n {
-            grand[i] = 0.0;
+            grand[i] = ColTotals::default();
         }
     }
 
@@ -230,7 +291,7 @@ pub fn render_controlled(
     // amounts has a 6-digit total — found by test).
     for (i, w) in widths.iter_mut().enumerate() {
         if numeric[i] {
-            *w = (*w).max(fmt_num(grand[i]).chars().count());
+            *w = (*w).max(grand[i].render().chars().count());
         }
         *w = (*w).clamp(3, 26);
     }
@@ -250,7 +311,7 @@ pub fn render_controlled(
         .join(" ");
     let rule = "─".repeat(header_line.chars().count().min(PAGE_WIDTH));
 
-    let totals_line = |label: &str, sums: &[f64], count: usize| -> Vec<String> {
+    let totals_line = |label: &str, sums: &[ColTotals], count: usize| -> Vec<String> {
         // One reserved String instead of Vec<String> + join per group.
         let mut cells = String::with_capacity(ncols * 8);
         for i in 0..ncols {
@@ -258,7 +319,7 @@ pub fn render_controlled(
                 cells.push(' ');
             }
             cells.push_str(&if numeric[i] {
-                rpad(&fmt_num(sums[i]), widths[i])
+                rpad(&sums[i].render(), widths[i])
             } else {
                 " ".repeat(widths[i])
             });
@@ -289,7 +350,7 @@ pub fn render_controlled(
         line_on_page += 1;
     };
 
-    let mut group_sums = vec![0f64; ncols];
+    let mut group_sums: Vec<ColTotals> = vec![ColTotals::default(); ncols];
     let mut group_n = 0usize;
     let mut current_group: Option<String> = None;
     // The band caption: the real column name when grouping by one, else
@@ -317,7 +378,7 @@ pub fn render_controlled(
                 }
                 emit(&mut out, format!("▌ {label} = {g}"));
                 current_group = Some(g.to_owned());
-                group_sums.fill(0.0);
+                group_sums.fill(ColTotals::default());
                 group_n = 0;
             }
         }
@@ -331,11 +392,7 @@ pub fn render_controlled(
         emit(&mut out, line);
         for (i, v) in row.iter().enumerate() {
             if numeric[i] {
-                match v {
-                    PValue::Int(n) => group_sums[i] += *n as f64,
-                    PValue::Real(f) => group_sums[i] += f,
-                    _ => {}
-                }
+                group_sums[i].add(v);
             }
         }
         group_n += 1;
@@ -529,6 +586,65 @@ mod tests {
         assert!(text.contains("TOTAL (4 rows)"));
         // The amount column still totals across the expression groups.
         assert!(text.contains("200"));
+    }
+
+    /// #70: a column of nothing but NULLs is not a quantity — its TOTAL
+    /// cell prints blank, not 0.
+    #[test]
+    fn all_null_column_does_not_total_zero() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(note TEXT, qty INTEGER);
+             INSERT INTO t(note, qty) VALUES (NULL, 1), (NULL, 2);",
+        )
+        .unwrap();
+        let spec = ReportSpec {
+            name: "t".into(),
+            title: "T".into(),
+            source: "t".into(),
+            group_by: None,
+        };
+        let lines = render(&db, &spec).unwrap();
+        // The last line is the TOTAL cells row: the all-NULL note column
+        // (first) must be blank, so the first non-space char is the qty
+        // total, not a phantom 0.
+        let last = lines.last().unwrap();
+        let first = last.chars().find(|c| !c.is_whitespace());
+        assert_eq!(
+            first,
+            Some('3'),
+            "the all-NULL column must not print 0: {last:?}"
+        );
+    }
+
+    /// #70: integer columns accumulate in a checked i128, so a sum beyond
+    /// 2^53 stays exact (a snowflake ticket id is not a float).
+    #[test]
+    fn integer_column_sums_are_exact_past_2_pow_53() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        // 2^53 + 1 rounds to 2^53 in f64, so the f64 sum of (2^53+1, 2)
+        // is 2^53+2; the exact i128 sum is 2^53+3.
+        let big = 9_007_199_254_740_993i64;
+        db.execute(&format!(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, ticket INTEGER);
+             INSERT INTO t(ticket) VALUES ({big}), (2);"
+        ))
+        .unwrap();
+        let spec = ReportSpec {
+            name: "t".into(),
+            title: "T".into(),
+            source: "t".into(),
+            group_by: None,
+        };
+        let lines = render(&db, &spec).unwrap();
+        let text = lines.join("\n");
+        let exact = (big as i128 + 2).to_string(); // 9007199254740995
+        assert!(text.contains(&exact), "exact i128 total missing:\n{text}");
+        // The f64 accumulation would have printed 9007199254740994 instead.
+        assert!(
+            !text.contains("9007199254740994"),
+            "float rounding leaked:\n{text}"
+        );
     }
 
     #[test]
