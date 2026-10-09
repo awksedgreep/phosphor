@@ -2069,7 +2069,14 @@ impl App {
                 if matches!(&self.overlay, Overlay::Edit(ed) if ed.editing.is_none()) {
                     self.apply(Command::EditBegin); // fresh: 1st char replaces
                 }
-                self.apply(Command::EditChar(c));
+                if matches!(&self.overlay, Overlay::ScriptEditor(_)) {
+                    // EditBegin routed this field to the note editor
+                    // (multi-line / BLOB value): the char lands in the
+                    // note, not the one-line form buffer.
+                    self.apply(Command::ScriptChar(c));
+                } else {
+                    self.apply(Command::EditChar(c));
+                }
             }
             Command::CreateRefs => {
                 self.editor_fresh = true;
@@ -2379,15 +2386,21 @@ impl App {
                 }
             }
             Command::EditBegin => {
-                // A value already carrying newlines can't be edited in a
-                // one-line buffer: Enter opens the note editor instead.
-                let multiline = matches!(&self.overlay, Overlay::Edit(ed)
-                    if ed
-                        .inputs
-                        .get(ed.cursor)
-                        .and_then(|t| t.as_deref())
-                        .is_some_and(|t| t.contains('\n')));
-                if multiline {
+                // The field's CURRENT value picks the editing surface:
+                // multi-line text and BLOBs can't live in a one-line
+                // buffer — its prefill is a rendered form (␤ for
+                // newlines, hex for blobs) and committing that render
+                // would overwrite the stored value. Enter routes them to
+                // the note editor, where cancel (Esc) is always free.
+                let to_memo = match &self.overlay {
+                    Overlay::Edit(ed) => match ed.value(ed.cursor) {
+                        PValue::Text(t) => t.contains('\n'),
+                        PValue::Blob(_) => true,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if to_memo {
                     return self.open_memo_editor();
                 }
                 if let Overlay::Edit(ed) = &mut self.overlay {
@@ -7599,12 +7612,25 @@ pub(crate) fn assert_picker_workflow(db: Box<dyn DbLink>) {
         a.apply(Command::PickerCommit);
         if !matches!(value, PValue::Text(text) if text.contains('\n')) {
             a.apply(Command::EditBegin);
-            a.apply(Command::EditChar('x'));
-            a.apply(Command::Back);
-            assert!(matches!(&a.overlay, Overlay::Edit(ed) if &ed.value(1) == value));
-            a.apply(Command::EditBegin);
-            a.apply(Command::EditInspectMove(0));
-            assert!(matches!(&a.overlay, Overlay::Edit(ed) if &ed.value(1) == value));
+            if matches!(&a.overlay, Overlay::ScriptEditor(_)) {
+                // BLOB keys open the note editor — a one-line buffer
+                // can't hold binary (its prefill would be a hex render).
+                // Typing goes to the note; Esc cancels without touching
+                // the picked value.
+                a.apply(Command::ScriptChar('x'));
+                a.apply(Command::Back);
+                assert!(matches!(&a.overlay, Overlay::Edit(ed) if &ed.value(1) == value));
+                a.apply(Command::EditBegin);
+                a.apply(Command::Back);
+                assert!(matches!(&a.overlay, Overlay::Edit(ed) if &ed.value(1) == value));
+            } else {
+                a.apply(Command::EditChar('x'));
+                a.apply(Command::Back);
+                assert!(matches!(&a.overlay, Overlay::Edit(ed) if &ed.value(1) == value));
+                a.apply(Command::EditBegin);
+                a.apply(Command::EditInspectMove(0));
+                assert!(matches!(&a.overlay, Overlay::Edit(ed) if &ed.value(1) == value));
+            }
         }
         a.apply(Command::EditSave);
         a.sync();
@@ -9223,6 +9249,94 @@ mod tests {
         assert_eq!(
             q.rows[0][0],
             PValue::Text("first draft\nsecond line".into())
+        );
+    }
+
+    /// #49: an UNTOUCHED multi-line value must route to the note editor
+    /// on Enter — the old guard checked the typed buffer, so the
+    /// one-line prefill (render with ␤) was committed over the value.
+    #[test]
+    fn edit_begin_routes_untouched_multiline_to_memo_editor() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, note TEXT);
+             INSERT INTO notes(note) VALUES ('line one
+line two');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // id -> note
+        a.apply(Command::EditBegin);
+        assert!(
+            matches!(&a.overlay, Overlay::ScriptEditor(st)
+                if matches!(st.target, ScriptTarget::Memo { .. })),
+            "Enter on an untouched multi-line value opens the note editor"
+        );
+        a.apply(Command::Back); // cancel the note
+        a.apply(Command::EditSave);
+        a.sync();
+        let q = a.db.query("SELECT note FROM notes").unwrap();
+        assert_eq!(
+            q.rows[0][0],
+            PValue::Text("line one\nline two".into()),
+            "newlines survive an untouched commit"
+        );
+    }
+
+    /// #49: an untouched BLOB must not be prefillable into the one-line
+    /// buffer — committing its `x'…' (nB)` render would store TEXT.
+    #[test]
+    fn edit_begin_keeps_untouched_blobs_out_of_the_one_line_buffer() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE bin(id INTEGER PRIMARY KEY, data BLOB);
+             INSERT INTO bin(data) VALUES (x'000102ff');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // id -> data
+        a.apply(Command::EditBegin);
+        assert!(
+            matches!(&a.overlay, Overlay::ScriptEditor(st)
+                if matches!(st.target, ScriptTarget::Memo { .. })),
+            "Enter on a BLOB opens the note editor, not a one-line buffer"
+        );
+        a.apply(Command::Back);
+        a.apply(Command::EditSave);
+        a.sync();
+        let q = a.db.query("SELECT typeof(data), data FROM bin").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Text("blob".into()));
+        assert_eq!(q.rows[0][1], PValue::Blob(vec![0, 1, 2, 255]));
+    }
+
+    /// #49: typing into an untouched multi-line field opens the note
+    /// editor AND keeps the first character (it used to be dropped).
+    #[test]
+    fn edit_type_into_multiline_field_lands_in_the_note() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, note TEXT);
+             INSERT INTO notes(note) VALUES ('alpha
+beta');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1)); // id -> note
+        a.apply(Command::EditType('!'));
+        assert!(
+            matches!(&a.overlay, Overlay::ScriptEditor(st)
+                if matches!(st.target, ScriptTarget::Memo { .. })
+                    && st.text() == "alpha\nbeta!"),
+            "the first char lands in the note at the caret"
         );
     }
 
