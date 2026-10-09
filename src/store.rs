@@ -24,6 +24,18 @@ impl DesignSave {
     }
 }
 
+/// Does a design with this name exist in the table? Used to verify a
+/// `save_design` write by name rather than by `sqlite3_changes`, which also
+/// counts trigger side effects (#74).
+fn design_exists(db: &dyn DbLink, table: &str, name: &str) -> bool {
+    db.query(&format!(
+        "SELECT 1 FROM {table} WHERE name = {} LIMIT 1",
+        q(name)
+    ))
+    .map(|r| !r.rows.is_empty())
+    .unwrap_or(false)
+}
+
 /// Named designer writes never silently replace another design. Renames
 /// update application-menu references in the same savepoint, including
 /// when the caller already owns a transaction.
@@ -70,13 +82,22 @@ pub fn save_design(
                     .join(", ")
             )
         };
-        let (changed, _) = db.execute_params(&sql, &values).map_err(|e| {
+        let is_update = update.is_some();
+        db.execute_params(&sql, &values).map_err(|e| {
             if e.contains("UNIQUE constraint failed") {
                 format!("{kind} {name:?} already exists; choose another name or reopen it and use F6 Save")
             } else { e }
         })?;
-        if changed != 1 {
-            return Err("the saved design no longer exists; use F7 Save As to create it".into());
+        // Verify the write by name, not by the change count: sqlite3_changes
+        // also counts trigger side effects, so a save under an audit trigger
+        // on the design table would read changed != 1 and fail spuriously
+        // (#74). Selecting the row we just wrote is the real check.
+        if !design_exists(db, table, name) {
+            return Err(if is_update {
+                "the saved design no longer exists; use F7 Save As to create it".into()
+            } else {
+                format!("saving {kind} {name:?} did not take; reopen the designer and try again")
+            });
         }
         if let Some(old) = update.filter(|old| *old != name) {
             db.execute_params(
@@ -145,15 +166,18 @@ pub fn pref_set(db: &dyn DbLink, key: &str, value: &str) {
     );
 }
 
+/// A stored preference, including an explicitly cleared (empty) value —
+/// `Some("")` round-trips and stays distinguishable from a missing key
+/// (`None`) (#74).
 pub fn pref_get(db: &dyn DbLink, key: &str) -> Option<String> {
     lookup(db, "_phosphor_prefs", "key", key, &["value"])
         .map(|r| r.into_iter().next().unwrap_or_default())
-        .filter(|v| !v.is_empty())
 }
 
 /// `pref_get` for two keys in ONE query — callers that need both (grid
 /// pane prefs riding a worker job) avoid one round trip per key. Same
-/// semantics: missing table or empty value = None.
+/// semantics as `pref_get`: a stored value (even an empty one) is `Some`,
+/// a missing key is `None`.
 pub fn pref_get_pair(db: &dyn DbLink, a: &str, b: &str) -> (Option<String>, Option<String>) {
     let mut out = (None, None);
     let list = format!("{}, {}", q(a), q(b));
@@ -166,9 +190,6 @@ pub fn pref_get_pair(db: &dyn DbLink, a: &str, b: &str) -> (Option<String>, Opti
             else {
                 continue;
             };
-            if v.is_empty() {
-                continue;
-            }
             if k == a {
                 out.0 = Some(v);
             } else if k == b {
@@ -291,5 +312,78 @@ mod tests {
             (Some(r#"{"sku":30}"#.into()), Some("1".into()))
         );
         assert_eq!(pref_get_pair(&db, "theme", "width:notes"), (None, None));
+    }
+
+    /// #74: an explicitly cleared (empty) preference round-trips as
+    /// Some("") and stays distinguishable from a missing key (None).
+    #[test]
+    fn pref_empty_value_round_trips() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        assert_eq!(pref_get(&db, "cleared"), None, "missing key is None");
+        pref_set(&db, "cleared", "");
+        assert_eq!(
+            pref_get(&db, "cleared"),
+            Some("".into()),
+            "an empty value round-trips as Some(\"\")"
+        );
+        pref_set(&db, "theme", "amber");
+        assert_eq!(pref_get(&db, "theme"), Some("amber".into()));
+        assert_eq!(
+            pref_get_pair(&db, "cleared", "missing"),
+            (Some("".into()), None),
+            "pref_get_pair matches: empty is Some, missing is None"
+        );
+    }
+
+    /// #74: a save succeeds under an audit trigger on the design table —
+    /// the write is verified by name, not by sqlite3_changes (which counts
+    /// the trigger's side effects and would read changed != 1).
+    #[test]
+    fn save_design_succeeds_under_an_audit_trigger() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        ensure(&db).unwrap();
+        db.execute(
+            "CREATE TABLE audit_log(id INTEGER PRIMARY KEY, note TEXT);
+             CREATE TRIGGER qbe_audit_ins AFTER INSERT ON _phosphor_queries
+               BEGIN INSERT INTO audit_log(note) VALUES ('insert'); END;
+             CREATE TRIGGER qbe_audit_upd AFTER UPDATE ON _phosphor_queries
+               BEGIN INSERT INTO audit_log(note) VALUES ('update'); END;",
+        )
+        .unwrap();
+        let cols = |sql: &str| {
+            vec![
+                ("table_ref", "t".to_owned()),
+                ("qbe_json", "{}".to_owned()),
+                ("sql_text", sql.to_owned()),
+            ]
+        };
+        // Fresh save (INSERT path).
+        let res = save_design(
+            &db,
+            "_phosphor_queries",
+            "query",
+            "myq",
+            None,
+            DesignSave::Save,
+            &cols("SELECT 1"),
+        );
+        assert!(res.is_ok(), "insert save under trigger failed: {res:?}");
+        // Overwrite save (UPDATE path).
+        let res = save_design(
+            &db,
+            "_phosphor_queries",
+            "query",
+            "myq",
+            Some("myq"),
+            DesignSave::Save,
+            &cols("SELECT 2"),
+        );
+        assert!(res.is_ok(), "update save under trigger failed: {res:?}");
+        // The trigger really fired, proving the change count was inflated.
+        let n = db.query("SELECT count(*) FROM audit_log").unwrap().rows[0][0].clone();
+        assert!(
+            !matches!(n, PValue::Int(0)),
+            "trigger should have fired: {n:?}"
+        );
     }
 }
