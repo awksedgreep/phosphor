@@ -6926,11 +6926,16 @@ impl App {
         {
             return;
         }
-        let lower = sql.to_ascii_lowercase();
-        if ["create", "alter", "drop", "vacuum"]
-            .iter()
-            .any(|k| lower.contains(k))
-        {
+        // Classify each statement by its LEADING token: the old
+        // substring check took `UPDATE notes SET text='drop the plan'`
+        // for DDL and did a cursor-resetting reopen (#64).
+        let ddl = crate::sql::split(sql).iter().flatten().any(|stmt| {
+            matches!(
+                crate::sql::head(stmt).as_str(),
+                "CREATE" | "ALTER" | "DROP" | "VACUUM"
+            )
+        });
+        if ddl {
             self.open_table(&name);
         } else {
             self.refresh_grid_keep_position();
@@ -9422,6 +9427,40 @@ mod tests {
         a.apply(Command::PromptRun);
         a.sync();
         assert_eq!(a.status.as_ref().unwrap().0, "ok (batch)");
+    }
+
+    /// #64: DML whose literals contain 'drop'/'create'/etc. must not
+    /// take the DDL path (cursor-resetting full reopen). The statement
+    /// is classified by its leading token, per statement in a batch.
+    #[test]
+    fn dml_with_ddl_keywords_in_literals_keeps_the_cursor() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        for _ in 0..5 {
+            a.apply(Command::GridMove { dr: 1, dc: 0 });
+        }
+        assert_eq!(a.grid.as_ref().unwrap().cur_row, 5);
+        a.prompt.input = "UPDATE t SET b = 'drop the create plan' WHERE a = 1".into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert_eq!(a.status.as_ref().unwrap().0, "ok, 1 row(s) affected");
+        assert_eq!(
+            a.grid.as_ref().unwrap().cur_row,
+            5,
+            "DML must take the keep-position path, not a reopen"
+        );
+        assert_eq!(a.grid.as_ref().unwrap().total, 500);
+        // Real DDL still reopens (cursor reset to the top).
+        a.apply(Command::GridMove { dr: 3, dc: 0 });
+        a.prompt.input = "ALTER TABLE t ADD COLUMN c TEXT".into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert_eq!(
+            a.grid.as_ref().unwrap().cur_row,
+            0,
+            "ALTER must still take the reopen path"
+        );
     }
 
     /// #54: lifecycle-script bindings are cached (negatives included),
