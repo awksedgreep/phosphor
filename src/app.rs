@@ -3042,25 +3042,14 @@ impl App {
     /// report, sparklines, and dot. Pure function of the link, so the
     /// UI thread never blocks on its (up to 4) round-trips.
     fn fetch_health_console(db: &dyn DbLink) -> DbResult<crate::worker::HealthData> {
-        let view: String = db
-            .query(
-                "SELECT name FROM sqlite_master \
-                 WHERE type = 'view' AND name LIKE '%\\_report' ESCAPE '\\' \
-                 ORDER BY name LIMIT 1",
-            )
-            .ok()
-            .and_then(|q| q.rows.into_iter().next())
-            .and_then(|r| r.into_iter().next())
-            .and_then(|v| match v {
-                PValue::Text(t) => Some(t),
-                _ => None,
-            })
-            .filter(|v| v.ends_with("_report"))
-            .ok_or_else(|| {
-                "no dbhealth here — needs the timeless extension and \
-                 CREATE VIRTUAL TABLE dbhealth USING timeless_health"
-                    .to_owned()
-            })?;
+        // The view is identified by dbhealth_report_view (prefers the
+        // documented dbhealth_report so a competing user view can't shadow
+        // it, #80).
+        let view: String = crate::db::dbhealth_report_view(db).ok_or_else(|| {
+            "no dbhealth here — needs the timeless extension and \
+              CREATE VIRTUAL TABLE dbhealth USING timeless_health"
+                .to_owned()
+        })?;
         let base = view.strip_suffix("_report").unwrap_or(&view).to_owned();
         let report = db
             .query(&format!(

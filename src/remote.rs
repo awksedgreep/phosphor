@@ -942,23 +942,13 @@ impl DbLink for RemoteDb {
     }
 
     fn health(&self) -> Option<String> {
-        let view = self
-            .one(
-                "SELECT name FROM sqlite_master \
-                 WHERE type = 'view' AND name LIKE '%\\_report' ESCAPE '\\' \
-                 ORDER BY name LIMIT 1",
-                vec![],
-            )
-            .ok()?
-            .rows
-            .into_iter()
-            .next()?;
-        let PValue::Text(view) = &view[0] else {
-            return None;
-        };
+        // The view is identified by dbhealth_report_view (prefers the
+        // documented dbhealth_report so a competing user view can't shadow
+        // it, #80).
+        let view = crate::db::dbhealth_report_view(self)?;
         let out = self
             .one(
-                &format!("SELECT status FROM {} LIMIT 1", Self::quote(view)),
+                &format!("SELECT status FROM {} LIMIT 1", Self::quote(&view)),
                 vec![],
             )
             .ok()?;

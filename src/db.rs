@@ -305,6 +305,52 @@ pub struct QueryResult {
 /// stays interactive; the grid says so when it bites.
 pub const QUERY_CAP: usize = 10_000;
 
+/// The dbhealth report view: the view the status dot, the F10 console, and
+/// the vacuum advisor read. Prefers the documented dbhealth_report, then any
+/// other *_report view that actually carries a status column (a custom-named
+/// vtab), so a competing user view (e.g. crm_report) can no longer shadow the
+/// health (#80).
+pub(crate) fn dbhealth_report_view(db: &dyn DbLink) -> Option<String> {
+    let views: Vec<String> = match db.query(
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'view' AND name LIKE '%\\_report' ESCAPE '\\' \
+         ORDER BY name",
+    ) {
+        Ok(q) => q
+            .rows
+            .iter()
+            .filter_map(|r| match r.first() {
+                Some(PValue::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if views.is_empty() {
+        return None;
+    }
+    // The vtab the docs tell users to create, when it carries the status
+    // column the dot reads.
+    if has_status_column(db, "dbhealth_report") {
+        return Some("dbhealth_report".to_owned());
+    }
+    // Else the first *_report view (alphabetical) with a status column: a
+    // custom-named vtab still works, and a user view without one can't
+    // shadow the health.
+    views.into_iter().find(|v| has_status_column(db, v))
+}
+
+/// True when the view has a column named status (the one the health dot
+/// reads); false when the view is missing or the probe fails.
+fn has_status_column(db: &dyn DbLink, view: &str) -> bool {
+    db.query(&format!(
+        "SELECT 1 FROM pragma_table_info(\"{}\") WHERE name = 'status' LIMIT 1",
+        view.replace('"', "\"\"")
+    ))
+    .map(|q| !q.rows.is_empty())
+    .unwrap_or(false)
+}
+
 pub trait DbLink: Send {
     /// Install only around a cancellable read job, then clear before the
     /// next job. Backends without a VM hook check at streamed row boundaries.
@@ -1373,18 +1419,10 @@ impl DbLink for EmbeddedDb {
     }
 
     fn health(&self) -> Option<String> {
-        // Worst-first ordering is part of the dbhealth_report contract.
-        // Single sqlite_master probe (was count(*) + pick = 2 trips).
-        let view: String = self
-            .conn
-            .query_row(
-                "SELECT name FROM sqlite_master \
-                 WHERE type = 'view' AND name LIKE '%\\_report' ESCAPE '\\' \
-                 ORDER BY name LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .ok()?;
+        // The view is identified by dbhealth_report_view (prefers the
+        // documented dbhealth_report so a competing user view can't shadow
+        // it, #80); worst-first ordering is part of its contract.
+        let view = dbhealth_report_view(self)?;
         self.conn
             .query_row(
                 &format!("SELECT status FROM {} LIMIT 1", Self::quote(&view)),
@@ -1443,6 +1481,42 @@ impl DbLink for EmbeddedDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #80: the dbhealth report view must be the real one, not the
+    /// alphabetically first *_report view.
+    #[test]
+    fn dbhealth_report_view_prefers_the_real_health_view() {
+        // A user view that sorts before dbhealth_report and has NO status
+        // column must not shadow the health dot.
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE VIEW crm_report AS SELECT 'x' AS label")
+            .unwrap();
+        db.execute("CREATE VIEW dbhealth_report AS SELECT 'ok' AS status")
+            .unwrap();
+        assert_eq!(
+            dbhealth_report_view(&db),
+            Some("dbhealth_report".to_owned()),
+            "dbhealth_report must win over the alphabetically-first crm_report"
+        );
+
+        // A custom-named vtab (myhealth_report) with a status column is
+        // found when dbhealth_report is absent, despite a competing view.
+        let (db2, _) = EmbeddedDb::open(":memory:").unwrap();
+        db2.execute("CREATE VIEW a_report AS SELECT 1 AS n")
+            .unwrap();
+        db2.execute("CREATE VIEW myhealth_report AS SELECT 'warn' AS status")
+            .unwrap();
+        assert_eq!(
+            dbhealth_report_view(&db2),
+            Some("myhealth_report".to_owned())
+        );
+
+        // No *_report view carries a status column: None (dot stays off).
+        let (db3, _) = EmbeddedDb::open(":memory:").unwrap();
+        db3.execute("CREATE VIEW z_report AS SELECT 1 AS n")
+            .unwrap();
+        assert_eq!(dbhealth_report_view(&db3), None);
+    }
 
     #[test]
     fn complete_outputs_include_rows_beyond_the_preview_cap() {

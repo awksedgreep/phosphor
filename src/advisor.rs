@@ -90,18 +90,9 @@ pub fn advise(db: &dyn DbLink) -> DbResult<Vec<String>> {
 /// Look for the dbhealth report and return a VACUUM suggestion when a
 /// bloat-ish check is present.
 fn vacuum_advice(db: &dyn DbLink) -> Option<String> {
-    let view: String = db
-        .query(
-            "SELECT name FROM sqlite_master WHERE type = 'view' \
-             AND name LIKE '%\\_report' ESCAPE '\\' ORDER BY name LIMIT 1",
-        )
-        .ok()
-        .and_then(|q| q.rows.into_iter().next())
-        .and_then(|r| r.into_iter().next())
-        .and_then(|v| match v {
-            PValue::Text(t) => Some(t),
-            _ => None,
-        })?;
+    // The view is identified by dbhealth_report_view (prefers the documented
+    // dbhealth_report so a competing user view can't shadow it, #80).
+    let view: String = crate::db::dbhealth_report_view(db)?;
     let q = db
         .query(&format!(
             "SELECT \"check\", status, advice FROM \"{}\"",
