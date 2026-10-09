@@ -4,6 +4,7 @@
 
 use crate::db::{DbLink, DbResult, PValue};
 use crate::store;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const PAGE_LINES: usize = 55;
 const PAGE_WIDTH: usize = 100;
@@ -148,26 +149,51 @@ impl ColTotals {
     }
 }
 
+/// Left-justify in `w` DISPLAY cells, not chars: a CJK glyph occupies two
+/// terminal cells but is one char, so char-based padding misaligns columns
+/// (#71). Truncation reserves one cell for the ellipsis.
 fn pad(s: &str, w: usize) -> String {
-    let count = s.chars().count();
-    let mut out: String = s.chars().take(w).collect();
-    if count > w && w > 0 {
-        out.pop();
-        out.push('…');
+    let truncated = s.width() > w;
+    // Reserve one cell for the ellipsis when we will truncate.
+    let budget = if truncated { w.saturating_sub(1) } else { w };
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if used + cw > budget {
+            break;
+        }
+        out.push(c);
+        used += cw;
     }
-    for _ in count.min(w)..w {
+    if truncated && w > 0 {
+        out.push('…');
+        used += '…'.width().unwrap_or(1);
+    }
+    for _ in used..w {
         out.push(' ');
     }
     out
 }
 
+/// Right-justify in `w` DISPLAY cells (numeric columns). Truncates from the
+/// right to fit the width, matching the char-based original (#71).
 fn rpad(s: &str, w: usize) -> String {
-    let len = s.chars().count().min(w);
+    let mut content = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if used + cw > w {
+            break;
+        }
+        content.push(c);
+        used += cw;
+    }
     let mut out = String::with_capacity(w);
-    for _ in len..w {
+    for _ in used..w {
         out.push(' ');
     }
-    out.extend(s.chars().take(w));
+    out.push_str(&content);
     out
 }
 
@@ -276,13 +302,14 @@ pub fn render_controlled(
     // (was: a widths pass re-rendering every cell + a detail pass
     // rendering them all again).
     let mut rendered: Vec<Vec<String>> = Vec::with_capacity(rows.len());
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
+    // Display width, not char count: CJK glyphs are two cells wide (#71).
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.width()).collect();
     for row in &rows {
         control.check()?;
         let mut r = Vec::with_capacity(ncols);
         for (i, v) in row.iter().enumerate() {
             let s = v.render();
-            widths[i] = widths[i].max(s.chars().count());
+            widths[i] = widths[i].max(s.width());
             r.push(s);
         }
         rendered.push(r);
@@ -291,7 +318,7 @@ pub fn render_controlled(
     // amounts has a 6-digit total — found by test).
     for (i, w) in widths.iter_mut().enumerate() {
         if numeric[i] {
-            *w = (*w).max(grand[i].render().chars().count());
+            *w = (*w).max(grand[i].render().width());
         }
         *w = (*w).clamp(3, 26);
     }
@@ -309,7 +336,7 @@ pub fn render_controlled(
         .map(|(i, c)| pad(c, widths[i]))
         .collect::<Vec<_>>()
         .join(" ");
-    let rule = "─".repeat(header_line.chars().count().min(PAGE_WIDTH));
+    let rule = "─".repeat(header_line.width().min(PAGE_WIDTH));
 
     let totals_line = |label: &str, sums: &[ColTotals], count: usize| -> Vec<String> {
         // One reserved String instead of Vec<String> + join per group.
@@ -644,6 +671,40 @@ mod tests {
         assert!(
             !text.contains("9007199254740994"),
             "float rounding leaked:\n{text}"
+        );
+    }
+
+    /// #71: CJK cells are two display cells wide. The report measures and
+    /// pads by display width (like the grid), so every detail line keeps
+    /// the same width and the columns stay aligned in the terminal.
+    #[test]
+    fn cjk_cells_keep_report_columns_aligned() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(name TEXT, note TEXT);
+             INSERT INTO t(name, note)
+               VALUES ('ada', 'hi'), ('中文名字', '好'), ('grace', 'hello');",
+        )
+        .unwrap();
+        let spec = ReportSpec {
+            name: "t".into(),
+            title: "CJK".into(),
+            source: "t".into(),
+            group_by: None,
+        };
+        let lines = render(&db, &spec).unwrap();
+        // The three detail lines (each holds one name) must share one
+        // display width — a char-based pad would let the CJK line overrun.
+        let detail: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("ada") || l.contains("grace") || l.contains('中'))
+            .collect();
+        assert_eq!(detail.len(), 3, "detail lines:\n{}", lines.join("\n"));
+        let w0 = detail[0].width();
+        assert!(
+            detail.iter().all(|l| l.width() == w0),
+            "CJK line misaligns the columns:\n{}",
+            lines.join("\n")
         );
     }
 
