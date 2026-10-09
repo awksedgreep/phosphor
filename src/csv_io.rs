@@ -33,6 +33,79 @@ fn to_csv_string(v: &PValue) -> String {
     }
 }
 
+/// Bind parameters per multi-row INSERT: well under SQLite's variable
+/// limit even for wide tables, and every flush is ONE round-trip
+/// regardless of backend (#53: a 10k-row import used to be 10k
+/// round-trips).
+const BATCH_PARAMS: usize = 2000;
+
+fn q_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Multi-row `INSERT … VALUES (…),(…)`. On a batch failure the rows are
+/// retried singly (still inside the doomed transaction) so the error
+/// names the first offending row, as the per-row path used to.
+fn insert_rows_batch(
+    db: &dyn DbLink,
+    table: &str,
+    cols: &[(usize, String, String)],
+    rows: &[Vec<PValue>],
+    base: i64,
+) -> DbResult<()> {
+    let names: Vec<&str> = cols.iter().map(|(_, n, _)| n.as_str()).collect();
+    let changes = |row: &Vec<PValue>| {
+        names
+            .iter()
+            .cloned()
+            .zip(row.iter().cloned())
+            .map(|(c, v)| (c.to_owned(), v))
+            .collect::<Vec<_>>()
+    };
+    if rows.len() == 1 {
+        return db
+            .insert_row(table, &changes(&rows[0]))
+            .map(|_| ())
+            .map_err(|e| format!("import: row {}: {e}", base + 1));
+    }
+    let mut marks: Vec<String> = Vec::with_capacity(rows.len());
+    let mut mark: i64 = 0;
+    for _row in rows {
+        let mut list = String::new();
+        for (i, _) in cols.iter().enumerate() {
+            if i > 0 {
+                list.push(',');
+            }
+            mark += 1;
+            use std::fmt::Write as _;
+            let _ = write!(list, "?{mark}");
+        }
+        marks.push(format!("({list})"));
+    }
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES {}",
+        q_ident(table),
+        names
+            .iter()
+            .map(|n| q_ident(n))
+            .collect::<Vec<_>>()
+            .join(", "),
+        marks.join(", ")
+    );
+    let params: Vec<PValue> = rows.iter().flat_map(|r| r.iter().cloned()).collect();
+    match db.execute_params(&sql, &params) {
+        Ok(_) => Ok(()),
+        Err(batch_err) => {
+            for (i, row) in rows.iter().enumerate() {
+                if let Err(row_err) = db.insert_row(table, &changes(row)) {
+                    return Err(format!("import: row {}: {row_err}", base + i as i64 + 1));
+                }
+            }
+            Err(format!("import: batch: {batch_err}"))
+        }
+    }
+}
+
 /// `import <table> <path>` — headered CSV into an existing table.
 ///
 /// * Header names must match column names (case-insensitive).
@@ -40,7 +113,21 @@ fn to_csv_string(v: &PValue) -> String {
 /// * Missing columns → omitted (DB default/NULL).
 /// * Empty field → `PValue::Null` (via `PValue::parse`).
 /// * Wrapped in `BEGIN`/`COMMIT` for speed; on error `ROLLBACK`.
+#[cfg(test)]
 pub fn import_csv(db: &dyn DbLink, table: &str, path: &str) -> DbResult<String> {
+    import_controlled(db, table, path, &crate::operation::Control::default())
+}
+
+/// `import_csv` with cooperative cancellation + row progress, for the
+/// async prompt path (#53): the UI showed a frozen screen for minutes
+/// on large remote imports.
+pub fn import_controlled(
+    db: &dyn DbLink,
+    table: &str,
+    path: &str,
+    control: &crate::operation::Control,
+) -> DbResult<String> {
+    control.check()?;
     let p = Path::new(path);
     let file = File::open(p).map_err(|e| format!("import: cannot open {path:?}: {e}"))?;
     let mut rdr = csv::Reader::from_reader(BufReader::new(file));
@@ -84,17 +171,27 @@ pub fn import_csv(db: &dyn DbLink, table: &str, path: &str) -> DbResult<String> 
         .map_err(|e| format!("import: begin: {e}"))?;
     let result = (|| {
         let mut inserted: i64 = 0;
+        let mut batch: Vec<Vec<PValue>> = Vec::new();
         for result in rdr.records() {
+            control.check()?;
             let record = result.map_err(|e| format!("import: csv record: {e}"))?;
-            let mut changes: Vec<(String, PValue)> = Vec::with_capacity(hdr_to_col.len());
-            for (hi, col_name, decl) in &hdr_to_col {
+            let mut row: Vec<PValue> = Vec::with_capacity(hdr_to_col.len());
+            for (hi, _col_name, decl) in &hdr_to_col {
                 // Empty field → NULL; NOT NULL constraints still apply.
                 let raw = record.get(*hi).unwrap_or("").trim();
-                changes.push((col_name.clone(), PValue::parse(raw, decl)));
+                row.push(PValue::parse(raw, decl));
             }
-            db.insert_row(table, &changes)
-                .map_err(|e| format!("import: row {}: {e}", inserted + 1))?;
-            inserted += 1;
+            control.row()?;
+            batch.push(row);
+            if batch.len() * hdr_to_col.len().max(1) >= BATCH_PARAMS {
+                insert_rows_batch(db, table, &hdr_to_col, &batch, inserted)?;
+                inserted += batch.len() as i64;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            insert_rows_batch(db, table, &hdr_to_col, &batch, inserted)?;
+            inserted += batch.len() as i64;
         }
         db.commit_transaction()
             .map_err(|e| format!("import: commit: {e}"))?;
@@ -282,6 +379,60 @@ mod tests {
         assert!(import_csv(&db, "t", &path).unwrap_err().contains("omit it"));
         fs::remove_file(path).unwrap();
         assert_eq!(db.count("t").unwrap(), 1);
+    }
+
+    /// #53: wide-enough files flush as multi-row INSERTs (1500 rows x
+    /// 3 cols = 4500 bind params spans three batches), progress counts
+    /// every row, and a constraint hit in a later batch still names
+    /// its row.
+    #[test]
+    fn import_batches_multirow_and_names_the_offending_row() {
+        use crate::operation::Control;
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE bulk(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)")
+            .unwrap();
+        let path = tmp_path("bulk");
+        {
+            let mut w = csv::Writer::from_path(&path).unwrap();
+            w.write_record(["a", "b", "c"]).unwrap();
+            for i in 0..1500 {
+                w.write_record([i.to_string(), (i * 2).to_string(), (i * 3).to_string()])
+                    .unwrap();
+            }
+            w.flush().unwrap();
+        }
+        let control = Control::default();
+        let msg = import_controlled(&db, "bulk", &path, &control).unwrap();
+        assert!(msg.contains("1500 row(s)"), "{msg}");
+        assert_eq!(control.rows(), 1500, "progress counts every CSV row");
+        assert_eq!(db.count("bulk").unwrap(), 1500);
+        let q = db
+            .query("SELECT a, b, c FROM bulk WHERE id = 1500")
+            .unwrap();
+        assert_eq!(
+            q.rows[0],
+            vec![PValue::Int(1499), PValue::Int(2998), PValue::Int(4497)]
+        );
+        fs::remove_file(&path).unwrap();
+
+        // Duplicate b at row 1400 (third batch) — the error names it
+        // and the whole import rolls back.
+        db.execute("CREATE TABLE uniq(a INTEGER, b INTEGER UNIQUE)")
+            .unwrap();
+        let path2 = tmp_path("bulk-err");
+        {
+            let mut w = csv::Writer::from_path(&path2).unwrap();
+            w.write_record(["a", "b"]).unwrap();
+            for i in 0..1500 {
+                let b = if i == 1399 { 4 } else { i }; // dup of row 5's b
+                w.write_record([i.to_string(), b.to_string()]).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        let error = import_controlled(&db, "uniq", &path2, &Control::default()).unwrap_err();
+        assert!(error.contains("row 1400"), "{error}");
+        assert_eq!(db.count("uniq").unwrap(), 0, "batched import rolled back");
+        fs::remove_file(&path2).unwrap();
     }
 
     #[test]

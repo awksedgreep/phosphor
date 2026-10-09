@@ -577,6 +577,9 @@ pub enum Command {
 enum PendingOp {
     Output {
         preview: bool,
+        /// The job wrote rows (CSV import): refresh tables/health/grid
+        /// on arrival, like the old synchronous path did.
+        refresh: bool,
     },
     /// Table open: build + swap in a fresh grid on arrival.
     Open {
@@ -933,7 +936,7 @@ impl App {
             return;
         };
         match (op, resp) {
-            (PendingOp::Output { preview }, DbResponse::Output(result)) => {
+            (PendingOp::Output { preview, refresh }, DbResponse::Output(result)) => {
                 if !matches!(&self.overlay, Overlay::Busy(b) if b.tag == tag) {
                     return;
                 }
@@ -972,7 +975,16 @@ impl App {
                         });
                         self.say("ready · w writes a file · Esc returns");
                     }
-                    Ok(crate::operation::Output::Message(message)) => self.say(message),
+                    Ok(crate::operation::Output::Message(message)) => {
+                        if refresh {
+                            // The import committed rows: same refreshes
+                            // the old synchronous path did afterwards.
+                            self.reload_tables();
+                            self.refresh_health();
+                            self.refresh_grid_after_sql("insert");
+                        }
+                        self.say(message);
+                    }
                     Err(error) => self.err(error),
                 }
             }
@@ -3300,7 +3312,7 @@ impl App {
         let Some(table) = self.target_table(table) else {
             return self.err("labels: no table selected (labels <table>)");
         };
-        self.start_output("Preparing labels", false, move |db, control| {
+        self.start_output("Preparing labels", false, false, move |db, control| {
             Ok(crate::operation::Output::Pager {
                 title: format!("LABELS · {table}"),
                 lines: report::labels_controlled(db, &table, control)?,
@@ -3309,7 +3321,7 @@ impl App {
         });
     }
 
-    fn start_output<F>(&mut self, label: &str, preview: bool, mut work: F)
+    fn start_output<F>(&mut self, label: &str, preview: bool, refresh: bool, mut work: F)
     where
         F: FnMut(
                 &mut dyn DbLink,
@@ -3337,13 +3349,14 @@ impl App {
             started: std::time::Instant::now(),
             progress: (0, 0),
         });
-        self.pending.insert(tag, PendingOp::Output { preview });
+        self.pending
+            .insert(tag, PendingOp::Output { preview, refresh });
         self.say(format!("{label} · Esc cancel · F1 help"));
     }
 
     fn start_report(&mut self, spec: Option<ReportSpec>, name: String) {
         let preview = matches!(self.overlay, Overlay::Report(_) | Overlay::AppMenu(_));
-        self.start_output("Preparing report", preview, move |db, control| {
+        self.start_output("Preparing report", preview, false, move |db, control| {
             let spec = spec.clone().unwrap_or_else(|| {
                 ReportSpec::load(db, &name).unwrap_or_else(|| ReportSpec::for_table(&name))
             });
@@ -6778,15 +6791,15 @@ impl App {
             self.err("usage: import <table> <path>  — e.g. import customers ./data.csv");
             return;
         }
-        match crate::csv_io::import_csv(self.db.link(), table, path) {
-            Ok(msg) => {
-                self.reload_tables();
-                self.refresh_health();
-                self.refresh_grid_after_sql("insert"); // DML: refill
-                self.say(msg);
-            }
-            Err(e) => self.err(e),
-        }
+        // #53: imports run as a cancellable job with row progress — the
+        // synchronous path froze the UI for one worker round-trip per
+        // CSV row (minutes over sqld). The grid refresh rides the
+        // PendingOp.
+        let (table, path) = (table.to_owned(), path.to_owned());
+        self.start_output("Importing CSV", false, true, move |db, control| {
+            crate::csv_io::import_controlled(db, &table, &path, control)
+                .map(crate::operation::Output::Message)
+        });
     }
 
     fn handle_export(&mut self, line: &str) {
@@ -6808,7 +6821,7 @@ impl App {
             return;
         }
         let (source, path) = (source.to_owned(), path.to_owned());
-        self.start_output("Exporting CSV", false, move |db, control| {
+        self.start_output("Exporting CSV", false, false, move |db, control| {
             crate::csv_io::export_controlled(db, &source, &path, control)
                 .map(crate::operation::Output::Message)
         });
@@ -7901,7 +7914,7 @@ mod tests {
         a.open_report(Some("t".into()));
         let (started, ready) = std::sync::mpsc::channel();
         let (release, wait) = std::sync::mpsc::channel();
-        a.start_output("Preparing report", true, move |db, control| {
+        a.start_output("Preparing report", true, false, move |db, control| {
             started.send(()).unwrap();
             wait.recv().unwrap();
             Ok(crate::operation::Output::Pager {
@@ -7949,7 +7962,7 @@ mod tests {
         // A cancellation request must not hide a real connection failure.
         let (release, wait) = std::sync::mpsc::channel();
         let (started, ready) = std::sync::mpsc::channel();
-        a.start_output("Preparing report", true, move |_, _| {
+        a.start_output("Preparing report", true, false, move |_, _| {
             started.send(()).unwrap();
             wait.recv().unwrap();
             Err("interrupted; remote transaction outcome unknown".into())
@@ -7971,7 +7984,7 @@ mod tests {
         let mut a = app();
         a.open_report(Some("t".into()));
         let (release, wait) = std::sync::mpsc::channel();
-        a.start_output("Preparing report", true, move |_, _| {
+        a.start_output("Preparing report", true, false, move |_, _| {
             wait.recv().unwrap();
             panic!("intentional worker failure");
         });
@@ -8003,7 +8016,7 @@ mod tests {
         a.open_table("t"); // its continuation includes synchronous preferences
         let (release, wait) = std::sync::mpsc::channel();
         let (started, ready) = std::sync::mpsc::channel();
-        a.start_output("Preparing labels", false, move |_, _| {
+        a.start_output("Preparing labels", false, false, move |_, _| {
             started.send(()).unwrap();
             wait.recv().unwrap();
             Ok(crate::operation::Output::Message("done".into()))

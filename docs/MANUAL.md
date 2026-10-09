@@ -641,7 +641,8 @@ work is pending. An idle screen keeps the longer sleep and only
 redraws when something changes. Backend timings in the status bar
 measure database work, not the whole input-to-display interval.
 
-Record and schema writes, imports, script execution, printer calls,
-and some metadata loads still wait synchronously. These operations
-do not use this cancellation screen.
+Record and schema writes, script execution, printer calls, and some
+metadata loads still wait synchronously. These operations do not use
+this cancellation screen. CSV imports do: they show row progress and
+roll back their own transaction on cancellation.
 ```
