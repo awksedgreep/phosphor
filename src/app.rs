@@ -4803,9 +4803,14 @@ impl App {
         if g.cur_row >= g.row_off + visible {
             g.row_off = g.cur_row - visible + 1;
         }
+        // usize: a 2,000-column table with wide manual widths overflows
+        // u16 in the sum (debug panic, release wrap, #66).
         while g.col_off < g.cur_col {
-            let used: u16 = g.widths[g.col_off..=g.cur_col].iter().map(|w| w + 1).sum();
-            if used <= self.visible_cols_width / 2 {
+            let used: usize = g.widths[g.col_off..=g.cur_col]
+                .iter()
+                .map(|w| usize::from(*w) + 1)
+                .sum();
+            if used <= usize::from(self.visible_cols_width) / 2 {
                 break;
             }
             g.col_off += 1;
@@ -4999,10 +5004,15 @@ impl App {
             g.col_off = g.frozen;
         }
         let frozen = g.frozen.min(g.columns.len());
-        let frozen_w: u16 = g.widths[..frozen].iter().map(|w| w + 1).sum();
+        // usize sums: a very wide table overflows u16 (debug panic,
+        // release wrap in the stop condition — #66).
+        let frozen_w: usize = g.widths[..frozen].iter().map(|w| usize::from(*w) + 1).sum();
         while g.col_off < g.cur_col {
-            let used: u16 = g.widths[g.col_off..=g.cur_col].iter().map(|w| w + 1).sum();
-            if used + frozen_w <= self.visible_cols_width {
+            let used: usize = g.widths[g.col_off..=g.cur_col]
+                .iter()
+                .map(|w| usize::from(*w) + 1)
+                .sum();
+            if used + frozen_w <= usize::from(self.visible_cols_width) {
                 break;
             }
             g.col_off += 1;
@@ -9428,6 +9438,35 @@ mod tests {
         a.apply(Command::PromptRun);
         a.sync();
         assert_eq!(a.status.as_ref().unwrap().0, "ok (batch)");
+    }
+
+    /// #66: the horizontal scroll-window width sum must not overflow
+    /// u16 on a very wide table (debug panic, release wrap) — 900
+    /// columns at width 80 sum to 72,900 > u16::MAX.
+    #[test]
+    fn wide_table_scroll_window_math_does_not_overflow_u16() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        let cols: Vec<String> = (0..900).map(|i| format!("c{i:03}")).collect();
+        db.execute(&format!(
+            "CREATE TABLE wide({}); INSERT INTO wide DEFAULT VALUES",
+            cols.join(", ")
+        ))
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().columns.len(), 900);
+        if let Some(g) = a.grid.as_mut() {
+            for w in g.widths.iter_mut() {
+                *w = 80;
+            }
+        }
+        // Viewport fits exactly two width-80 columns.
+        a.visible_cols_width = 200;
+        a.apply(Command::GridMove { dr: 0, dc: 850 });
+        let g = a.grid.as_ref().unwrap();
+        assert_eq!(g.cur_col, 850);
+        assert_eq!(g.col_off, 849, "window slid to fit; no overflow panic");
     }
 
     /// #65: dot-prompt dispatch matches the first whitespace-delimited
