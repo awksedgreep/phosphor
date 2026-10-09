@@ -634,10 +634,11 @@ Esc cancels the dialog and leaves the scratch database open.",
         key: "operations",
         title: "Progress & cancellation",
         body: "\
-Reports, labels, and CSV exports run in the database worker.
-Their progress screen shows rows read and elapsed seconds.
-F1 Help, F12 details, resizing, and Ctrl-Q remain responsive.
-Other database actions wait until this operation finishes.
+Reports, labels, CSV exports, and SQL statements from the dot
+prompt run in the database worker. Their progress screen shows
+rows read and elapsed seconds. F1 Help, F12 details, resizing,
+and Ctrl-Q remain responsive. Other database actions wait until
+this operation finishes.
 
 Esc requests cancellation. Your previous screen and design stay
 available after the worker acknowledges it. A cancelled export
@@ -655,10 +656,13 @@ work is pending. An idle screen keeps the longer sleep and only
 redraws when something changes. Backend timings in the status bar
 measure database work, not the whole input-to-display interval.
 
-Record and schema writes, script execution, printer calls, and some
-metadata loads still wait synchronously. These operations do not use
-this cancellation screen. CSV imports do: they show row progress and
-roll back their own transaction on cancellation.",
+Record writes (form saves), script execution, printer calls, and
+some metadata loads still wait synchronously. These operations do
+not use this cancellation screen. Prompt SQL writes do: an embedded
+write stops mid-statement (statements already executed inside a
+multi-statement batch remain), and a remote request must respond
+first. CSV imports do: they show row progress and roll back their
+own transaction on cancellation.",
     },
 ];
 

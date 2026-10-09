@@ -577,9 +577,10 @@ pub enum Command {
 enum PendingOp {
     Output {
         preview: bool,
-        /// The job wrote rows (CSV import): refresh tables/health/grid
-        /// on arrival, like the old synchronous path did.
-        refresh: bool,
+        /// The job wrote to the database: refresh tables/health/grid on
+        /// arrival with this statement (its keywords decide how the
+        /// live grid re-fills), like the old synchronous paths did.
+        refresh: Option<String>,
     },
     /// Table open: build + swap in a fresh grid on arrival.
     Open {
@@ -719,6 +720,19 @@ pub struct App {
     /// back across records reuses them instead of re-querying.
     /// Cleared on writes (counts/previews may change) and capped.
     pane_cache: HashMap<(String, String, String), LinkPane>,
+    /// Bound form lifecycle scripts, (table_lc, event) → source, with
+    /// the unbound (None) pairs cached too: without this every field
+    /// commit and save pays a get_script round-trip per event even on
+    /// tables with no scripts at all (#54). Cleared on reload_tables
+    /// (scripts may arrive via SQL or another user) and on local
+    /// set/clear.
+    script_cache: HashMap<(String, String), Option<String>>,
+    /// Telemetry probe: Some(false) = no *_report view in this database,
+    /// so refresh_health skips the health() round-trips entirely (#54).
+    /// Cleared on reload_tables — DDL or another user may create the
+    /// view. OpenHealth and the sample console query directly and are
+    /// unaffected.
+    health_probe: Option<bool>,
     /// Outstanding async worker jobs by token (finish_db routes answers).
     pending: HashMap<crate::worker::Token, PendingOp>,
     deferred: Vec<(crate::worker::Token, std::time::Duration, DbResponse)>,
@@ -793,6 +807,8 @@ impl App {
             links_cache: HashMap::new(),
             fks_cache: HashMap::new(),
             pane_cache: HashMap::new(),
+            script_cache: HashMap::new(),
+            health_probe: None,
             pending: HashMap::new(),
             deferred: Vec::new(),
             pending_page: None,
@@ -803,7 +819,10 @@ impl App {
             status_seq: 0,
         };
         app.reload_tables();
-        app.health = app.db.health();
+        let h = app.db.health();
+        app.health_probe = Some(h.is_some());
+        app.health_cache = Some((h.clone(), std::time::Instant::now()));
+        app.health = h;
         // Restore persisted appearance (read-only path: a database with
         // no prefs table simply keeps the defaults).
         if let Some(t) = store::pref_get(app.db.link(), "theme").and_then(|n| Theme::by_name(&n)) {
@@ -976,12 +995,13 @@ impl App {
                         self.say("ready · w writes a file · Esc returns");
                     }
                     Ok(crate::operation::Output::Message(message)) => {
-                        if refresh {
-                            // The import committed rows: same refreshes
-                            // the old synchronous path did afterwards.
+                        if let Some(sql) = refresh {
+                            // The job committed a write: same refreshes
+                            // the old synchronous path did afterwards,
+                            // now that the UI thread is free again.
                             self.reload_tables();
                             self.refresh_health();
-                            self.refresh_grid_after_sql("insert");
+                            self.refresh_grid_after_sql(&sql);
                         }
                         self.say(message);
                     }
@@ -1384,7 +1404,9 @@ impl App {
         self.links_cache.clear();
         self.fks_cache.clear();
         self.pane_cache.clear();
+        self.script_cache.clear();
         self.health_cache = None;
+        self.health_probe = None;
         // A dropped/renamed browsed table would leave a zombie grid
         // (stale title + cached rows, quiet "no such table" refills):
         // close it and send the user back to the sidebar (issue #10).
@@ -1418,7 +1440,13 @@ impl App {
 
     /// Advisory dot for opens/refreshes: cached value when fresh,
     /// one re-query otherwise. Console/sample paths query directly.
+    /// #54: a database known to carry no telemetry pays zero
+    /// round-trips here until the schema reloads (a *_report view may
+    /// appear); writes only DML, so invalidate_health keeps the probe.
     fn refresh_health(&mut self) {
+        if self.health_probe == Some(false) {
+            return;
+        }
         let fresh = self
             .health_cache
             .as_ref()
@@ -1430,6 +1458,7 @@ impl App {
             return;
         }
         let h = self.db.health();
+        self.health_probe = Some(h.is_some());
         self.health_cache = Some((h.clone(), std::time::Instant::now()));
         self.health = h;
     }
@@ -3312,7 +3341,7 @@ impl App {
         let Some(table) = self.target_table(table) else {
             return self.err("labels: no table selected (labels <table>)");
         };
-        self.start_output("Preparing labels", false, false, move |db, control| {
+        self.start_output("Preparing labels", false, None, move |db, control| {
             Ok(crate::operation::Output::Pager {
                 title: format!("LABELS · {table}"),
                 lines: report::labels_controlled(db, &table, control)?,
@@ -3321,7 +3350,7 @@ impl App {
         });
     }
 
-    fn start_output<F>(&mut self, label: &str, preview: bool, refresh: bool, mut work: F)
+    fn start_output<F>(&mut self, label: &str, preview: bool, refresh: Option<String>, mut work: F)
     where
         F: FnMut(
                 &mut dyn DbLink,
@@ -3356,7 +3385,7 @@ impl App {
 
     fn start_report(&mut self, spec: Option<ReportSpec>, name: String) {
         let preview = matches!(self.overlay, Overlay::Report(_) | Overlay::AppMenu(_));
-        self.start_output("Preparing report", preview, false, move |db, control| {
+        self.start_output("Preparing report", preview, None, move |db, control| {
             let spec = spec.clone().unwrap_or_else(|| {
                 ReportSpec::load(db, &name).unwrap_or_else(|| ReportSpec::for_table(&name))
             });
@@ -3983,19 +4012,22 @@ impl App {
                 if self.readonly {
                     self.err("read-only mode: this action writes SQL");
                 } else {
-                    match self.db.execute(&item.action_ref) {
-                        Ok((n, elapsed)) => {
-                            self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
-                            self.reload_tables();
-                            let sql = item.action_ref.clone();
-                            self.refresh_grid_after_sql(&sql);
-                            self.say(match n {
+                    // #54: a menu SQL action is a write: run it as a
+                    // cancellable job, refreshed on arrival, like the
+                    // dot prompt does.
+                    let sql = item.action_ref.clone();
+                    self.start_output(
+                        "Running statement",
+                        false,
+                        Some(sql.clone()),
+                        move |db, _control| {
+                            let (n, _elapsed) = db.execute(&sql)?;
+                            Ok(crate::operation::Output::Message(match n {
                                 -1 => "ok".to_owned(),
                                 n => format!("ok, {n} row(s) affected"),
-                            });
-                        }
-                        Err(e) => self.err(e),
-                    }
+                            }))
+                        },
+                    );
                 }
             }
             ActionKind::Script => {
@@ -6416,6 +6448,26 @@ impl App {
         Some((ed.table.clone(), ed.inserting, field, values))
     }
 
+    /// A form's lifecycle script, cached: unbound tables are the common
+    /// case, and get_script there is pure round-trip cost on every
+    /// field commit and save (#54). Negatives are cached too.
+    fn script_for(&mut self, table: &str, event: &str) -> Option<String> {
+        let key = (table.to_ascii_lowercase(), event.to_owned());
+        if let Some(src) = self.script_cache.get(&key) {
+            return src.clone();
+        }
+        let src = crate::script::get_script(self.db.link(), table, event);
+        self.script_cache.insert(key, src.clone());
+        src
+    }
+
+    /// Record a local set/clear so the cache never serves a stale
+    /// binding (reload_tables clears everything else).
+    fn script_cache_put(&mut self, table: &str, event: &str, source: Option<String>) {
+        self.script_cache
+            .insert((table.to_ascii_lowercase(), event.to_owned()), source);
+    }
+
     /// Run `OnValidate` (if bound). Returns false to block the save.
     fn run_validate_script(&mut self, quiet: bool) -> bool {
         self.run_edit_script("OnValidate", quiet, true)
@@ -6427,7 +6479,7 @@ impl App {
         let Some((table, inserting, field, mut values)) = self.edit_values() else {
             return true;
         };
-        let Some(src) = crate::script::get_script(self.db.link(), &table, event) else {
+        let Some(src) = self.script_for(&table, event) else {
             return true;
         };
         let outcome = match crate::script::run_form_event(
@@ -6479,7 +6531,7 @@ impl App {
         let Some((table, inserting, field, mut values)) = self.edit_values() else {
             return Ok(Vec::new());
         };
-        let Some(src) = crate::script::get_script(self.db.link(), &table, "OnSave") else {
+        let Some(src) = self.script_for(&table, "OnSave") else {
             return Ok(Vec::new());
         };
         let outcome = crate::script::run_form_event(
@@ -6728,19 +6780,23 @@ impl App {
         } else if self.readonly {
             self.err("read-only mode: only SELECT is allowed");
         } else {
-            match self.db.execute(&line) {
-                Ok((n, elapsed)) => {
-                    self.last_ms = Some(elapsed.as_secs_f64() * 1000.0);
-                    self.reload_tables();
-                    self.refresh_health();
-                    self.refresh_grid_after_sql(&line);
-                    self.say(match n {
+            // #54: writes run as a cancellable job — a VACUUM or a big
+            // UPDATE must not freeze the UI (SELECTs already run this
+            // way), and the post-write refreshes ride the PendingOp
+            // instead of blocking behind the execute.
+            let line = line.to_owned();
+            self.start_output(
+                "Running statement",
+                false,
+                Some(line.clone()),
+                move |db, _control| {
+                    let (n, _elapsed) = db.execute(&line)?;
+                    Ok(crate::operation::Output::Message(match n {
                         -1 => "ok (batch)".to_owned(),
                         n => format!("ok, {n} row(s) affected"),
-                    });
-                }
-                Err(e) => self.err(e),
-            }
+                    }))
+                },
+            );
         }
     }
 
@@ -6796,10 +6852,15 @@ impl App {
         // CSV row (minutes over sqld). The grid refresh rides the
         // PendingOp.
         let (table, path) = (table.to_owned(), path.to_owned());
-        self.start_output("Importing CSV", false, true, move |db, control| {
-            crate::csv_io::import_controlled(db, &table, &path, control)
-                .map(crate::operation::Output::Message)
-        });
+        self.start_output(
+            "Importing CSV",
+            false,
+            Some("insert".into()),
+            move |db, control| {
+                crate::csv_io::import_controlled(db, &table, &path, control)
+                    .map(crate::operation::Output::Message)
+            },
+        );
     }
 
     fn handle_export(&mut self, line: &str) {
@@ -6821,7 +6882,7 @@ impl App {
             return;
         }
         let (source, path) = (source.to_owned(), path.to_owned());
-        self.start_output("Exporting CSV", false, false, move |db, control| {
+        self.start_output("Exporting CSV", false, None, move |db, control| {
             crate::csv_io::export_controlled(db, &source, &path, control)
                 .map(crate::operation::Output::Message)
         });
@@ -6846,15 +6907,21 @@ impl App {
         };
         if source.is_empty() {
             return match crate::script::clear_script(self.db.link(), table, ev) {
-                Ok(()) => self.say(format!("cleared {table} {ev}")),
+                Ok(()) => {
+                    self.script_cache_put(table, ev, None);
+                    self.say(format!("cleared {table} {ev}"))
+                }
                 Err(e) => self.err(e),
             };
         }
         match crate::script::set_script(self.db.link(), table, ev, source) {
-            Ok(()) => self.say(format!(
-                "saved {table} {ev} ({} chars) — see: scripts {table}",
-                source.chars().count()
-            )),
+            Ok(()) => {
+                self.script_cache_put(table, ev, Some(source.to_owned()));
+                self.say(format!(
+                    "saved {table} {ev} ({} chars) — see: scripts {table}",
+                    source.chars().count()
+                ))
+            }
             Err(e) => self.err(e),
         }
     }
@@ -6938,7 +7005,7 @@ impl App {
         let Some(ev) = crate::script::normalize_event(&event) else {
             return self.err("events: OnValidate, OnSave, OnChange");
         };
-        let src = crate::script::get_script(self.db.link(), &table, ev).unwrap_or_default();
+        let src = self.script_for(&table, ev).unwrap_or_default();
         self.script_return_app = None;
         self.overlay = Overlay::ScriptEditor(ScriptState::new(
             ScriptTarget::Form {
@@ -7093,6 +7160,15 @@ impl App {
             Overlay::ScriptEditor(st) => (st.text(), st.target.clone()),
             _ => return,
         };
+        // The local binding change, for the script cache (the Memo
+        // branch below consumes `target`): table, event, new source.
+        let form_update = match &target {
+            ScriptTarget::Form { table, event } => {
+                let source = (!text.trim().is_empty()).then(|| text.clone());
+                Some((table.clone(), event.clone(), source))
+            }
+            _ => None,
+        };
         // A note: fold the text back into the parked EDIT form and stop
         // there — the record is written by the form's own F10, not here.
         if let ScriptTarget::Memo { field, label } = target {
@@ -7128,6 +7204,9 @@ impl App {
         };
         match result {
             Ok(()) => {
+                if let Some((table, event, source)) = form_update {
+                    self.script_cache_put(&table, &event, source);
+                }
                 self.say(note);
                 self.close_script_editor();
             }
@@ -7914,7 +7993,7 @@ mod tests {
         a.open_report(Some("t".into()));
         let (started, ready) = std::sync::mpsc::channel();
         let (release, wait) = std::sync::mpsc::channel();
-        a.start_output("Preparing report", true, false, move |db, control| {
+        a.start_output("Preparing report", true, None, move |db, control| {
             started.send(()).unwrap();
             wait.recv().unwrap();
             Ok(crate::operation::Output::Pager {
@@ -7962,7 +8041,7 @@ mod tests {
         // A cancellation request must not hide a real connection failure.
         let (release, wait) = std::sync::mpsc::channel();
         let (started, ready) = std::sync::mpsc::channel();
-        a.start_output("Preparing report", true, false, move |_, _| {
+        a.start_output("Preparing report", true, None, move |_, _| {
             started.send(()).unwrap();
             wait.recv().unwrap();
             Err("interrupted; remote transaction outcome unknown".into())
@@ -7984,7 +8063,7 @@ mod tests {
         let mut a = app();
         a.open_report(Some("t".into()));
         let (release, wait) = std::sync::mpsc::channel();
-        a.start_output("Preparing report", true, false, move |_, _| {
+        a.start_output("Preparing report", true, None, move |_, _| {
             wait.recv().unwrap();
             panic!("intentional worker failure");
         });
@@ -8016,7 +8095,7 @@ mod tests {
         a.open_table("t"); // its continuation includes synchronous preferences
         let (release, wait) = std::sync::mpsc::channel();
         let (started, ready) = std::sync::mpsc::channel();
-        a.start_output("Preparing labels", false, false, move |_, _| {
+        a.start_output("Preparing labels", false, None, move |_, _| {
             started.send(()).unwrap();
             wait.recv().unwrap();
             Ok(crate::operation::Output::Message("done".into()))
@@ -9063,6 +9142,111 @@ mod tests {
         a.invalidate_health();
         a.refresh_health();
         assert_eq!(a.health, None);
+    }
+
+    /// #54: a database without a *_report view is probed once at open;
+    /// refresh_health then pays zero round-trips (the probe is only
+    /// cleared on a schema reload, where DDL may create the view).
+    #[test]
+    fn health_probe_skips_round_trips_without_telemetry() {
+        let mut a = app();
+        assert_eq!(a.health_probe, Some(false), "probe ran at open");
+        assert_eq!(a.health, None);
+        a.invalidate_health();
+        a.refresh_health();
+        assert!(
+            a.health_cache.is_none(),
+            "no telemetry: the refresh must not query (and not cache)"
+        );
+        assert_eq!(a.health, None);
+        // A schema reload re-probes: the view may have appeared.
+        a.db.execute("CREATE VIEW t_report AS SELECT 'ok' AS status;")
+            .unwrap();
+        a.reload_tables();
+        assert_eq!(a.health_probe, None, "reload clears the probe");
+        a.invalidate_health();
+        a.refresh_health();
+        assert_eq!(a.health, Some("ok".into()));
+        assert_eq!(a.health_probe, Some(true));
+    }
+
+    /// #54: prompt writes run as a cancellable job — the Busy screen is
+    /// up before the statement executes (the UI thread never blocked on
+    /// it), and the post-write refreshes happen on arrival.
+    #[test]
+    fn prompt_write_runs_as_a_job_and_refreshes_on_arrival() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().total, 500);
+        a.prompt.input = "INSERT INTO t(b) VALUES('late')".into();
+        a.apply(Command::PromptRun);
+        assert!(
+            matches!(a.overlay, Overlay::Busy(_)),
+            "the write must be a job, not a blocked UI thread"
+        );
+        a.sync();
+        assert_eq!(a.status.as_ref().unwrap().0, "ok, 1 row(s) affected");
+        assert!(!a.status.as_ref().unwrap().1, "{:?}", a.status);
+        assert_eq!(
+            a.grid.as_ref().unwrap().total,
+            501,
+            "the live grid refreshed on arrival"
+        );
+        // DDL reopens the live grid (new columns); the table list
+        // reloads on arrival.
+        a.prompt.input = "ALTER TABLE t ADD COLUMN c TEXT".into();
+        a.apply(Command::PromptRun);
+        assert!(matches!(a.overlay, Overlay::Busy(_)));
+        a.sync();
+        assert_eq!(a.status.as_ref().unwrap().0, "ok, 0 row(s) affected");
+        assert!(a.grid.as_ref().unwrap().columns.contains(&"c".into()));
+        a.prompt.input = "CREATE TABLE prompt_made(x)".into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(a
+            .tables
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case("prompt_made")));
+        // Multi-statement input: the count is unknown (batch).
+        a.prompt.input = "CREATE TABLE p3(x); INSERT INTO p3 VALUES(1)".into();
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert_eq!(a.status.as_ref().unwrap().0, "ok (batch)");
+    }
+
+    /// #54: lifecycle-script bindings are cached (negatives included),
+    /// so an unbound table's field commits and saves cost no
+    /// get_script round-trips. Local set/clear track the cache; a
+    /// schema reload clears it.
+    #[test]
+    fn script_cache_avoids_get_script_round_trips() {
+        let mut a = app();
+        assert_eq!(a.script_for("t", "OnSave"), None);
+        assert_eq!(a.script_cache.len(), 1, "the negative is cached");
+        assert_eq!(a.script_for("t", "OnSave"), None);
+        assert_eq!(a.script_cache.len(), 1, "second lookup must not re-query");
+        // Bind through the prompt: the cache tracks the binding.
+        let bind = r#"script t OnSave -- stored by the prompt"#;
+        for c in bind.chars() {
+            a.apply(Command::PromptChar(c));
+        }
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(
+            !a.status.as_ref().is_some_and(|(_, e)| *e),
+            "bind: {:?}",
+            a.status
+        );
+        assert!(a.script_for("t", "OnSave").is_some());
+        // A schema reload (any DDL write) drops the binding cache.
+        a.reload_tables();
+        assert!(a.script_cache.is_empty());
+        // Set/clear keep the cache in step.
+        a.script_cache_put("t", "OnSave", Some("-- x".into()));
+        assert!(a.script_for("t", "OnSave").is_some());
+        a.script_cache_put("t", "OnSave", None);
+        assert_eq!(a.script_for("t", "OnSave"), None);
     }
 
     /// A health response arriving after the user moved on is dropped,
