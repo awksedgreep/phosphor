@@ -1496,7 +1496,7 @@ fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
     app.visible_cols_width = inner.width;
 
     let Some(g) = app.grid.as_mut() else {
-        let empty = app.visible_tables().is_empty();
+        let empty = app.visible_count() == 0;
         let mut lines = vec![Line::raw("")];
         if app.scratch() {
             lines.extend([

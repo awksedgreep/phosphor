@@ -693,6 +693,10 @@ pub struct App {
     query_preview: Option<crate::worker::Token>,
     pub design_name_action: store::DesignSave,
     pub tables: Vec<TableInfo>,
+    /// Indices into `tables` the sidebar shows, honoring `show_internals`
+    /// (#77). Cached and rebuilt only when `tables` or the toggle change,
+    /// so per-keystroke navigation never re-filters the catalog.
+    pub visible: Vec<usize>,
     pub sidebar_idx: usize,
     pub grid: Option<Grid>,
     /// Bumped on every grid-target change at SUBMIT time (#68). The
@@ -817,6 +821,7 @@ impl App {
             design_name_action: store::DesignSave::Save,
             status_details: None,
             tables: Vec::new(),
+            visible: Vec::new(),
             sidebar_idx: 0,
             grid: None,
             grid_epoch: 0,
@@ -1410,11 +1415,34 @@ impl App {
                     .any(|s| n.ends_with(s)))
     }
 
+    /// Rebuild the `visible` index cache from `tables` + the internals
+    /// toggle. Call whenever either changes (#77).
+    pub fn refresh_visible(&mut self) {
+        self.visible = self
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| self.show_internals || !Self::is_internal(t))
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    /// How many tables the sidebar shows, honoring the internals toggle,
+    /// with no per-call allocation (#77).
+    pub fn visible_count(&self) -> usize {
+        self.visible.len()
+    }
+
+    /// The i-th visible table, by visible index (#77).
+    pub fn visible_at(&self, i: usize) -> Option<&TableInfo> {
+        self.visible.get(i).and_then(|&idx| self.tables.get(idx))
+    }
+
     /// The tables the sidebar shows, honoring the internals toggle.
     pub fn visible_tables(&self) -> Vec<&TableInfo> {
-        self.tables
+        self.visible
             .iter()
-            .filter(|t| self.show_internals || !Self::is_internal(t))
+            .filter_map(|&idx| self.tables.get(idx))
             .collect()
     }
 
@@ -1423,17 +1451,15 @@ impl App {
     }
 
     fn sidebar_seek(&mut self, c: char) {
-        let visible = self.visible_tables();
-        let n = visible.len();
+        let n = self.visible_count();
         if n == 0 {
             return;
         }
         for step in 1..=n {
             let idx = (self.sidebar_idx + step) % n;
-            if visible[idx]
-                .name
-                .chars()
-                .next()
+            if self
+                .visible_at(idx)
+                .and_then(|t| t.name.chars().next())
                 .is_some_and(|f| f.eq_ignore_ascii_case(&c))
             {
                 self.sidebar_idx = idx;
@@ -1446,9 +1472,8 @@ impl App {
         match self.db.tables() {
             Ok(t) => {
                 self.tables = t;
-                self.sidebar_idx = self
-                    .sidebar_idx
-                    .min(self.visible_tables().len().saturating_sub(1));
+                self.refresh_visible();
+                self.sidebar_idx = self.sidebar_idx.min(self.visible_count().saturating_sub(1));
             }
             Err(e) => self.err(e),
         }
@@ -2329,7 +2354,7 @@ impl App {
             }
             Command::Refresh => self.refresh(),
             Command::SidebarMove(d) => {
-                let n = self.visible_tables().len() as i64;
+                let n = self.visible_count() as i64;
                 if n > 0 {
                     self.sidebar_idx = (self.sidebar_idx as i64 + d).rem_euclid(n) as usize;
                 }
@@ -2351,7 +2376,7 @@ impl App {
             }
             Command::OpenTableEditor => self.open_table_editor(),
             Command::SidebarClick(idx) => {
-                let n = self.visible_tables().len();
+                let n = self.visible_count();
                 if idx < n {
                     if self.sidebar_idx == idx && self.focus == Focus::Sidebar {
                         self.open_selected(); // same row clicked again: open
@@ -2637,12 +2662,12 @@ impl App {
             Command::SidebarPage(d) => {
                 self.sidebar_idx = (self.sidebar_idx as i64)
                     .saturating_add(d.saturating_mul(self.viewports.sidebar.rows.max(1) as i64))
-                    .clamp(0, self.visible_tables().len().saturating_sub(1) as i64)
+                    .clamp(0, self.visible_count().saturating_sub(1) as i64)
                     as usize;
             }
             Command::SidebarEdge(end) => {
                 self.sidebar_idx = if end {
-                    self.visible_tables().len().saturating_sub(1)
+                    self.visible_count().saturating_sub(1)
                 } else {
                     0
                 }
@@ -2751,6 +2776,7 @@ impl App {
             Command::DropTable => self.drop_table(),
             Command::ToggleInternals => {
                 self.show_internals = !self.show_internals;
+                self.refresh_visible();
                 self.sidebar_idx = 0;
                 self.say(if self.show_internals {
                     "internal tables shown (i to hide)"
@@ -3240,10 +3266,7 @@ impl App {
                 source: GridSource::Table { name, .. },
                 ..
             }) if self.focus == Focus::Grid => Some(name.clone()),
-            _ => self
-                .visible_tables()
-                .get(self.sidebar_idx)
-                .map(|t| t.name.clone()),
+            _ => self.visible_at(self.sidebar_idx).map(|t| t.name.clone()),
         })
     }
 
@@ -3276,7 +3299,7 @@ impl App {
                     );
                 }
             },
-            None => match self.visible_tables().get(self.sidebar_idx) {
+            None => match self.visible_at(self.sidebar_idx) {
                 Some(t) => t.name.clone(),
                 None => return self.say("no table selected"),
             },
@@ -4511,7 +4534,7 @@ impl App {
     }
 
     fn open_selected(&mut self) {
-        if let Some(t) = self.visible_tables().get(self.sidebar_idx) {
+        if let Some(t) = self.visible_at(self.sidebar_idx) {
             let name = t.name.clone();
             self.open_table(&name);
         }
@@ -11794,6 +11817,56 @@ beta');",
         a.apply(Command::ToggleInternals);
         let all: Vec<String> = a.visible_tables().iter().map(|t| t.name.clone()).collect();
         assert!(all.iter().any(|n| n == "_phosphor_apps"), "{all:?}");
+    }
+
+    /// #77: the cached `visible` index must stay in sync with `tables` and
+    /// the internals toggle, so `visible_count`/`visible_at` agree with
+    /// `visible_tables` after init, a toggle, and a reload.
+    #[test]
+    fn visible_index_cache_stays_in_sync() {
+        let mut a = app();
+        a.db
+            .execute("CREATE TABLE alpha(x); CREATE TABLE t_chunks(x); CREATE TABLE _phosphor_apps(id INTEGER); CREATE TABLE beta(x)")
+            .unwrap();
+        a.apply(Command::Refresh);
+        // Internals hidden: the cache agrees with the filtered list.
+        assert_eq!(a.visible_count(), a.visible_tables().len());
+        assert!(
+            a.visible_count() < a.tables.len(),
+            "internals hidden by default"
+        );
+        for i in 0..a.visible_count() {
+            assert_eq!(
+                a.visible_at(i).map(|t| t.name.clone()),
+                Some(a.visible_tables()[i].name.clone()),
+                "index {i} diverged"
+            );
+        }
+        // Toggling internals re-syncs the cache (now everything shows).
+        a.apply(Command::ToggleInternals);
+        assert_eq!(a.visible_count(), a.tables.len(), "all tables visible");
+        for i in 0..a.visible_count() {
+            assert_eq!(
+                a.visible_at(i).map(|t| t.name.clone()),
+                Some(a.visible_tables()[i].name.clone())
+            );
+        }
+        // Hide internals again, then a reload adds a table: cache re-syncs.
+        a.apply(Command::ToggleInternals);
+        a.db.execute("CREATE TABLE gamma(x)").unwrap();
+        a.apply(Command::Refresh);
+        assert_eq!(a.visible_count(), a.visible_tables().len());
+        assert!(a.visible_count() < a.tables.len(), "internals hidden again");
+        for i in 0..a.visible_count() {
+            assert_eq!(
+                a.visible_at(i).map(|t| t.name.clone()),
+                Some(a.visible_tables()[i].name.clone())
+            );
+        }
+        assert!(
+            a.visible_at(a.visible_count()).is_none(),
+            "past-the-end is None"
+        );
     }
 
     /// #7: an app can be named/renamed with `r`; items survive the rename.
