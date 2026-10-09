@@ -6274,11 +6274,22 @@ impl App {
     /// Tab at the prompt: complete the last token against table names
     /// and prompt commands. Borrows candidates (no per-Tab Vec<String>).
     fn prompt_complete(&mut self) {
-        let (head, token) = match self.prompt.input.rfind(char::is_whitespace) {
-            Some(i) => (
-                self.prompt.input[..=i].to_owned(),
-                self.prompt.input[i + 1..].to_owned(),
-            ),
+        // Slice at the whitespace char's END boundary: a pasted U+00A0
+        // or CJK U+3000 is multi-byte, and `rfind`'s start-byte index
+        // would cut it in half (char-boundary panic on Tab, #63).
+        let (head, token) = match self
+            .prompt
+            .input
+            .char_indices()
+            .rfind(|&(_, c)| c.is_whitespace())
+        {
+            Some((i, c)) => {
+                let end = i + c.len_utf8();
+                (
+                    self.prompt.input[..end].to_owned(),
+                    self.prompt.input[end..].to_owned(),
+                )
+            }
             None => (String::new(), self.prompt.input.clone()),
         };
         if token.is_empty() {
@@ -6959,9 +6970,11 @@ impl App {
 
     fn handle_export(&mut self, line: &str) {
         let rest = strip_csv_keyword(line["export".len()..].trim());
-        let idx = rest.rfind(char::is_whitespace);
+        // Same char-boundary care as prompt_complete (#63): the
+        // separator may be a multi-byte U+00A0/U+3000.
+        let idx = rest.char_indices().rfind(|&(_, c)| c.is_whitespace());
         let (raw_source, raw_path) = match idx {
-            Some(i) => (rest[..i].trim(), rest[i + 1..].trim()),
+            Some((i, c)) => (rest[..i].trim(), rest[i + c.len_utf8()..].trim()),
             None => {
                 self.err(
                     "usage: export <table|SELECT> <path>  — e.g. export customers ./out.csv or export \"select * from customers\" ./out.csv",
@@ -11088,6 +11101,33 @@ beta');",
         }
         a.apply(Command::PromptDeleteWord);
         assert_eq!(a.prompt.input, "select one ");
+    }
+
+    /// #63: a multi-byte whitespace (U+00A0 pasted from a web page,
+    /// U+3000 from a CJK IME) as the token separator used to panic Tab
+    /// with "byte index is not a char boundary"; export parsing shared
+    /// the bug. The split happens at the char's END boundary.
+    #[test]
+    fn prompt_tab_and_export_split_on_multibyte_whitespace() {
+        let mut a = app();
+        a.prompt.input = "hea\u{a0}ta".into();
+        a.prompt.cursor = a.prompt.input.len();
+        a.apply(Command::PromptComplete);
+        assert_eq!(a.prompt.input, "hea\u{a0}tables");
+
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE t(n INTEGER); INSERT INTO t VALUES (1)")
+            .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        let file = crate::test_support::TestDb::new();
+        a.prompt.input = format!("export t\u{3000}{}", file.path());
+        a.apply(Command::PromptRun);
+        a.sync();
+        assert!(a
+            .status
+            .as_ref()
+            .is_some_and(|(m, e)| !e && m.contains("exported 1 row")));
+        assert!(!std::fs::read(file.path()).unwrap().is_empty());
     }
 
     #[test]
