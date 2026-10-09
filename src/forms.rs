@@ -263,8 +263,12 @@ pub fn apply_mask(mask: &str, input: &str) -> String {
     out
 }
 
-/// True when `value` satisfies every mask slot and literal. An empty mask
-/// is always valid; an empty value is valid too (NULL, unless required).
+/// True when `value` satisfies every mask slot and literal, with no
+/// characters left over — a value longer than the mask never fits (#56:
+/// the typing path is masked, so a script's `set(c, v)` must not be
+/// able to smuggle a longer value past the mask on commit). An empty
+/// mask is always valid; an empty value is valid too (NULL, unless
+/// required).
 pub fn mask_ok(mask: &str, value: &str) -> bool {
     if mask.is_empty() || value.is_empty() {
         return true;
@@ -280,7 +284,7 @@ pub fn mask_ok(mask: &str, value: &str) -> bool {
             return false;
         }
     }
-    true
+    it.next().is_none()
 }
 
 /// List designer state (labels, include, required, order, mask).
@@ -434,6 +438,10 @@ mod tests {
         assert!(mask_ok("999-99-9999", "123-45-6789"));
         assert!(!mask_ok("999-99-9999", "123-45-678"));
         assert!(!mask_ok("999-99-9999", "12a-45-6789"));
+        assert!(
+            !mask_ok("999", "1234"),
+            "a value longer than the mask never fits"
+        );
         assert!(mask_ok("", "anything"));
         assert!(mask_ok("999", ""), "empty is NULL, allowed unless required");
     }

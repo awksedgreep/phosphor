@@ -6210,6 +6210,21 @@ impl App {
     fn fold_editing_buffer(&mut self) {
         if let Overlay::Edit(ed) = &mut self.overlay {
             if let Some(buf) = ed.editing.take() {
+                // #56: a PICTURE buffer that re-masks to exactly the
+                // field's current value is a no-op. Folding it would
+                // dirty the record — and for a stored value that
+                // outgrows the mask, it would save the truncation the
+                // mask forced on the prefill (123456789012 → 1234).
+                let mask = ed.masks.get(ed.cursor).cloned().unwrap_or_default();
+                if !mask.is_empty() {
+                    let base = match &ed.value(ed.cursor) {
+                        PValue::Null => String::new(),
+                        v => v.render(),
+                    };
+                    if apply_mask(&mask, &base) == buf {
+                        return;
+                    }
+                }
                 if !self.editor_fresh {
                     ed.picked_values.remove(&ed.cursor);
                 }
@@ -9707,6 +9722,52 @@ beta');",
             "status: {:?}",
             a.status
         );
+    }
+
+    /// #56: a PICTURE field whose stored value outgrows the mask must
+    /// survive an open-and-commit with no typing — the mask truncates
+    /// the prefill, and folding that truncation used to save it. A real
+    /// edit must still save.
+    #[test]
+    fn picture_mask_keeps_an_untouched_value_longer_than_the_mask() {
+        let mut a = app();
+        a.apply(Command::OpenForm(Some("t".into())));
+        a.apply(Command::DesignerMove(1));
+        a.apply(Command::DesignerEditMask);
+        for c in "9999".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        a.apply(Command::DesignerSave);
+        a.apply(Command::Back);
+        // A value longer than the mask — what a script or import writes.
+        a.db.execute("UPDATE t SET b = '123456789012' WHERE a = 1")
+            .unwrap();
+
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin); // prefill is '1234' — the mask's view
+        a.apply(Command::EditCommitField); // Enter, no typing at all
+        a.apply(Command::EditSave);
+        let q = a.db.query("SELECT b FROM t WHERE a = 1").unwrap();
+        assert_eq!(
+            q.rows[0][0],
+            PValue::Text("123456789012".into()),
+            "an untouched over-long value must survive, not be truncated"
+        );
+
+        // A deliberate edit still saves the new masked value.
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        for c in "4321".chars() {
+            a.apply(Command::EditChar(c));
+        }
+        a.apply(Command::EditCommitField);
+        let q = a.db.query("SELECT b FROM t WHERE a = 1").unwrap();
+        assert_eq!(q.rows[0][0], PValue::Text("4321".into()));
     }
 
     #[test]
