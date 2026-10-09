@@ -706,6 +706,11 @@ pub struct App {
     pub visible_cols_width: u16,
     /// Armed delete: (table, rowid) — second 'x' on the same row fires.
     pending_delete: Option<(String, i64)>,
+    /// `ui.*` effects queued by form lifecycle scripts (OnValidate/
+    /// OnChange/OnSave). Queued, not applied inline, so the commit that
+    /// triggered them completes first — applying ui.browse mid-commit
+    /// would close the edit and drop the pending write (#62).
+    pending_script_effects: Vec<crate::script::Effect>,
     /// Armed table drop: the TABLE EDITOR table watching for a second 'D'.
     drop_table_armed: Option<String>,
     /// Last automatic health sample (the console is LIVE while open).
@@ -818,6 +823,7 @@ impl App {
             visible_rows: 20,
             visible_cols_width: 80,
             pending_delete: None,
+            pending_script_effects: Vec::new(),
             drop_table_armed: None,
             last_find: None,
             show_internals: false,
@@ -2549,6 +2555,8 @@ impl App {
                     // per required field.
                     self.commit_edit_inner(true);
                 }
+                // #62: lifecycle ui.* effects fire once the pass is done.
+                self.drain_script_effects();
             }
             Command::EditSave => self.edit_save(),
             Command::PromptChar(c) => {
@@ -4071,6 +4079,15 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Apply the `ui.*` effects the last lifecycle-script pass queued
+    /// (see `pending_script_effects`); a no-op when nothing was queued.
+    fn drain_script_effects(&mut self) {
+        if !self.pending_script_effects.is_empty() {
+            let effects = std::mem::take(&mut self.pending_script_effects);
+            self.apply_script_effects(&effects);
         }
     }
 
@@ -5845,6 +5862,7 @@ impl App {
             return self.say(if d < 0 { "first record" } else { "last record" });
         }
         if dirty && !self.commit_edit() {
+            self.drain_script_effects(); // #62: even a blocked commit ran scripts
             return; // validation or db error: stay on this record
         }
         if related {
@@ -5852,6 +5870,8 @@ impl App {
         } else {
             self.build_edit_for(target);
         }
+        // #62: lifecycle ui.* effects fire once the flip has settled.
+        self.drain_script_effects();
     }
 
     /// Apply the saved form for `table` (order/labels/hide/required) to
@@ -6310,6 +6330,8 @@ impl App {
         if self.commit_edit() {
             self.overlay = Overlay::None;
         }
+        // #62: lifecycle ui.* effects fire once the save has settled.
+        self.drain_script_effects();
     }
 
     /// Quietly true when every required field of the open EDIT has a
@@ -6572,6 +6594,9 @@ impl App {
                 self.err(e.clone());
             }
         }
+        // #62: ui.* effects were silently dropped here; queue them for
+        // the command's end-of-pass drain (the commit completes first).
+        self.pending_script_effects.extend(outcome.effects);
         if blocking && outcome.error.is_some() {
             return false;
         }
@@ -6611,6 +6636,8 @@ impl App {
         if let Some(e) = outcome.error {
             return Err(e);
         }
+        // #62: queue for the command's end-of-pass drain.
+        self.pending_script_effects.extend(outcome.effects);
         Ok(outcome.messages)
     }
 
@@ -9040,6 +9067,45 @@ mod tests {
         a.apply(Command::Refresh);
         a.sync();
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 5);
+    }
+
+    /// #62: ui.* effects queued by form lifecycle scripts were silently
+    /// dropped — run_edit_script/run_save_script never read
+    /// outcome.effects. An OnSave that ui.browse()s must navigate after
+    /// the save settles.
+    #[test]
+    fn lifecycle_script_ui_effects_are_applied() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+             CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT);
+             INSERT INTO t(b) VALUES ('row1');
+             INSERT INTO t2(b) VALUES ('other');",
+        )
+        .unwrap();
+        crate::script::set_script(&db, "t", "OnSave", "ui.browse('t2')").unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.apply(Command::OpenEdit);
+        a.apply(Command::EditMove(1));
+        a.apply(Command::EditBegin);
+        if let Overlay::Edit(ed) = &mut a.overlay {
+            ed.editing = Some("edited".into());
+        }
+        a.apply(Command::EditSave);
+        a.sync();
+        // The save committed ...
+        assert_eq!(
+            a.db.query("SELECT b FROM t").unwrap().rows[0][0],
+            PValue::Text("edited".into())
+        );
+        // ... AND the OnSave effect navigated to t2.
+        let g = a.grid.as_ref().unwrap();
+        let GridSource::Table { name, .. } = &g.source else {
+            panic!("grid left the table view");
+        };
+        assert_eq!(name, "t2");
     }
 
     /// #61: x must not silently no-op when the cursor is outside the
