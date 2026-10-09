@@ -322,7 +322,26 @@ pub struct Grid {
     /// 1988 "freeze": this many leading columns stay put while the rest
     /// scroll right (`f` toggles; persisted per table).
     pub frozen: usize,
+    /// Rendered padded cell strings per cached row: entry i covers
+    /// `cache_start + i` as (gen, rendered cols, cells, is_null). The
+    /// draw reuses a fresh entry on cursor/mouse/worker frames instead
+    /// of re-render and re-padding every visible cell (#52);
+    /// `bump_render` invalidates all of them when row data or column
+    /// widths change.
+    pub render: Vec<Option<RenderedRow>>,
+    /// Padded header cells: (gen, rendered cols, cells) — the column
+    /// window is part of the key (a resize scrolls it without a data
+    /// change, so gen alone is not enough).
+    pub header_cells: Option<RenderedHeader>,
+    pub render_gen: u64,
 }
+
+/// One rendered grid row: (generation, rendered columns, padded cells,
+/// null flags). `generation != Grid.render_gen` or a column mismatch
+/// means the draw must re-render the row.
+pub type RenderedRow = (u64, Vec<usize>, Vec<String>, Vec<bool>);
+/// One rendered header: (generation, rendered columns, padded cells).
+pub type RenderedHeader = (u64, Vec<usize>, Vec<String>);
 
 impl Grid {
     pub fn row(&self, abs: i64) -> Option<&Vec<PValue>> {
@@ -335,6 +354,14 @@ impl Grid {
     /// is right.
     fn compute_widths(&mut self) {
         self.widths = self.fitted_widths();
+        self.bump_render();
+    }
+
+    /// Invalidate the rendered-cell cache: row data or column widths
+    /// changed, so the next frame re-renders and the frames after that
+    /// borrow from the cache (#52).
+    pub fn bump_render(&mut self) {
+        self.render_gen = self.render_gen.wrapping_add(1);
     }
 
     fn fitted_widths(&self) -> Vec<u16> {
@@ -371,6 +398,7 @@ impl Grid {
         for (w, f) in self.widths.iter_mut().zip(fresh) {
             *w = (*w).max(f);
         }
+        self.bump_render();
     }
 }
 
@@ -1053,6 +1081,9 @@ impl App {
                         widths: Vec::new(),
                         manual: HashMap::new(),
                         frozen: 0,
+                        render: Vec::new(),
+                        header_cells: None,
+                        render_gen: 0,
                     };
                     // User-set widths and freezes come back ("my screen
                     // comes back tomorrow").
@@ -1105,6 +1136,9 @@ impl App {
                             widths: Vec::new(),
                             manual: HashMap::new(),
                             frozen: 0,
+                            render: Vec::new(),
+                            header_cells: None,
+                            render_gen: 0,
                         };
                         grid.compute_widths();
                         self.grid = Some(grid);
@@ -1150,6 +1184,7 @@ impl App {
                     if let Some(g) = &mut self.grid {
                         g.total = total;
                         g.cache = page.rows;
+                        g.bump_render();
                         g.rowids = page.rowids;
                         g.cache_start = want_start;
                         g.cur_col = col.min(g.columns.len().saturating_sub(1));
@@ -1177,6 +1212,7 @@ impl App {
                     }
                     if let Some(g) = &mut self.grid {
                         g.cache = page.rows;
+                        g.bump_render();
                         g.rowids = page.rowids;
                         g.cache_start = want_start;
                         g.grow_widths();
@@ -1312,6 +1348,7 @@ impl App {
                     g.columns = d.columns;
                     g.total = d.total;
                     g.cache = d.rows;
+                    g.bump_render();
                     g.cache_start = start;
                     g.rowids = d.rowids;
                     g.cur_row = g.cur_row.clamp(0, g.total.saturating_sub(1).max(0));
@@ -4545,6 +4582,9 @@ impl App {
             widths: Vec::new(),
             manual: HashMap::new(),
             frozen: 0,
+            render: Vec::new(),
+            header_cells: None,
+            render_gen: 0,
         };
         self.detail = Some(DetailState {
             grid,
@@ -4714,6 +4754,7 @@ impl App {
             self.pending_detail = None;
             let g = &mut self.detail.as_mut().unwrap().grid;
             g.cache.clear();
+            g.bump_render();
             g.rowids = None;
             g.total = 0;
             g.cur_row = 0;
@@ -5205,6 +5246,7 @@ impl App {
         g.total = data.total;
         g.rowids = data.rowids;
         g.cache = data.rows;
+        g.bump_render();
         g.cache_start = start;
         g.cur_row = row;
         g.row_off = (row - d.visible_rows.max(1) + 1).max(0);
@@ -5350,6 +5392,7 @@ impl App {
         g.cur_row = position;
         g.cache_start = position;
         g.cache = vec![row];
+        g.bump_render();
         g.rowids = Some(vec![new_rowid]);
         g.row_off = row_off;
         if let Some((page, at)) = context {
@@ -5357,6 +5400,7 @@ impl App {
             g.total = g.total.max(at + 1);
             g.cache_start = start;
             g.cache = page.rows;
+            g.bump_render();
             g.rowids = page.rowids;
         }
         let position = g.cur_row;
@@ -5402,6 +5446,7 @@ impl App {
             Some(index) => g.cache_start + index as i64,
             None => {
                 g.cache = vec![row.clone()];
+                g.bump_render();
                 g.rowids = Some(vec![rowid]);
                 g.cache_start = position;
                 position
@@ -6094,6 +6139,7 @@ impl App {
                 if let Some(g) = &mut self.grid {
                     g.total = total;
                     g.cache = page.rows;
+                    g.bump_render();
                     g.rowids = page.rowids;
                     g.cache_start = want_start;
                     g.cur_col = col.min(g.columns.len().saturating_sub(1));
@@ -7264,6 +7310,7 @@ fn resize_one(g: &mut Grid, d: i64) -> Option<(String, u16)> {
         *w = new;
     }
     g.manual.insert(name.clone(), new);
+    g.bump_render();
     Some((name, new))
 }
 
@@ -9247,6 +9294,113 @@ mod tests {
         assert!(a.script_for("t", "OnSave").is_some());
         a.script_cache_put("t", "OnSave", None);
         assert_eq!(a.script_for("t", "OnSave"), None);
+    }
+
+    /// #52: grid cells render once per data change and are borrowed on
+    /// every later frame: a cursor frame repaints the identical text
+    /// (style tracks the cursor, text does not move), and a data change
+    /// invalidates the cache so the next frame shows the new values.
+    #[test]
+    fn grid_render_cache_borrows_between_data_changes() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        fn symbols(a: &mut App, t: &mut Terminal<TestBackend>) -> String {
+            t.draw(|f| {
+                crate::ui::draw(f, a);
+            })
+            .unwrap();
+            let b = t.backend().buffer();
+            b.content
+                .chunks(b.area.width as usize)
+                .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        // The inverse-video cursor run (fg = the theme bg), restricted
+        // to the master pane (x >= 24) so the sidebar's selected-row
+        // marker is never mistaken for it. A cursor cell may span
+        // several graphemes (each buffer cell holds one).
+        fn cursor_symbol(a: &App, t: &Terminal<TestBackend>) -> String {
+            let b = t.backend().buffer();
+            let w = b.area.width as usize;
+            for row in b.content.chunks(w) {
+                let Some(start) = row
+                    .iter()
+                    .skip(24)
+                    .position(|c| c.style().fg == Some(a.theme.bg))
+                else {
+                    continue;
+                };
+                let mut out = String::new();
+                for c in row.iter().skip(24 + start) {
+                    if c.style().fg == Some(a.theme.bg) {
+                        out.push_str(c.symbol());
+                    } else {
+                        break;
+                    }
+                }
+                return out.trim_end().to_owned();
+            }
+            panic!("no cursor cell in buffer");
+        }
+        // The master pane's text (x >= 24, above the prompt line) —
+        // the status bar legitimately reports the cursor position.
+        fn pane(t: &Terminal<TestBackend>) -> String {
+            let b = t.backend().buffer();
+            b.content
+                .chunks(b.area.width as usize)
+                .take(22)
+                .map(|row| row.iter().skip(24).map(|c| c.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let first = symbols(&mut a, &mut terminal);
+        assert!(first.contains("row1"), "grid rendered:\n{first}");
+        let before = pane(&terminal);
+        assert_eq!(cursor_symbol(&a, &terminal), "1", "cursor on the first row");
+        // A cursor frame: identical pane text (borrowed from the render
+        // cache), cursor style on the next row.
+        let gen = a.grid.as_ref().unwrap().render_gen;
+        a.apply(Command::GridMove { dr: 1, dc: 0 });
+        a.sync();
+        symbols(&mut a, &mut terminal);
+        assert_eq!(
+            pane(&terminal),
+            before,
+            "cursor frame repaints the same text"
+        );
+        assert_eq!(
+            cursor_symbol(&a, &terminal),
+            "2",
+            "cursor moved down one row"
+        );
+        let g = a.grid.as_ref().unwrap();
+        assert_eq!(g.render_gen, gen, "a cursor frame must not re-render");
+        assert!(g.render.iter().flatten().count() > 0, "rows are cached");
+        // A data change invalidates the cache: the next frame re-renders.
+        a.db.execute("UPDATE t SET b='changed' WHERE a=1").unwrap();
+        a.refresh_grid_keep_position();
+        a.sync();
+        assert!(symbols(&mut a, &mut terminal).contains("changed"));
+        let g = a.grid.as_ref().unwrap();
+        assert!(
+            g.render[0]
+                .as_ref()
+                .is_some_and(|(g2, _, _, _)| *g2 == g.render_gen),
+            "the refreshed row re-rendered at the new generation"
+        );
+        // A NULL cell renders its ∅ marker through the same cache.
+        a.db.execute("INSERT INTO t(a, b) VALUES(999, NULL)")
+            .unwrap();
+        a.refresh_grid_keep_position();
+        a.sync();
+        a.apply(Command::GridBottom);
+        a.sync();
+        assert!(symbols(&mut a, &mut terminal).contains('∅'));
+        assert_eq!(cursor_symbol(&a, &terminal), "999");
     }
 
     /// A health response arriving after the user moved on is dropped,

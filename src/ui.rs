@@ -192,8 +192,13 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
     draw_sidebar(f, app, sidebar);
     draw_main(f, app, master_area);
     if let (Some(d_area), Some(_)) = (detail_area, &app.detail) {
-        let state = app.detail.as_ref().expect("split checked");
-        draw_detail_panel(f, app, state, d_area);
+        // Snapshot what the panel reads from App BEFORE taking the
+        // mutable detail borrow (its render cache lives in the grid).
+        let th = app.theme;
+        let focused = app.focus == Focus::Detail && matches!(app.overlay, Overlay::None);
+        let readonly = app.db.link().readonly();
+        let state = app.detail.as_mut().expect("split checked");
+        draw_detail_panel(f, state, d_area, th, focused, readonly);
     }
     draw_prompt(f, app, prompt_line);
 
@@ -1490,7 +1495,7 @@ fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
     app.visible_rows = inner.height.saturating_sub(1).max(1) as i64; // minus header
     app.visible_cols_width = inner.width;
 
-    let Some(g) = &app.grid else {
+    let Some(g) = app.grid.as_mut() else {
         let empty = app.visible_tables().is_empty();
         let mut lines = vec![Line::raw("")];
         if app.scratch() {
@@ -1552,46 +1557,101 @@ fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
         cols.push(c);
     }
 
-    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
-    let header = Line::from(
-        cols.iter()
-            .map(|&c| Span::styled(pad(&g.columns[c], g.widths[c]), th.bright()))
-            .collect::<Vec<_>>(),
-    );
-    lines.push(header);
-
+    // #52: render each visible row once per data/width change (keyed by
+    // render_gen); cursor, mouse, and worker frames borrow the cached
+    // padded cells — no per-cell Strings, no unicode width scans.
     let visible = app.visible_rows;
+    let mut idxs: Vec<Option<usize>> = Vec::with_capacity(visible as usize);
     for vis in 0..visible {
         let abs = g.row_off + vis;
         if abs >= g.total {
             break;
         }
-        let spans: Vec<Span> = match g.row(abs) {
-            Some(row) => cols
-                .iter()
-                .map(|&c| {
-                    let text = row.get(c).map(PValue::render).unwrap_or_default();
-                    let style = if abs == g.cur_row && c == g.cur_col {
-                        th.cursor()
-                    } else if abs == g.cur_row {
-                        th.bright()
-                    } else if matches!(row.get(c), Some(PValue::Null)) {
-                        th.dim()
-                    } else {
-                        th.base()
-                    };
-                    Span::styled(pad(&text, g.widths[c]), style)
-                })
-                .collect(),
-            None => vec![Span::styled("…", th.dim())],
+        idxs.push(abs.checked_sub(g.cache_start).map(|i| i as usize));
+    }
+    g.render.resize(
+        idxs.iter().flatten().copied().max().map_or(0, |m| m + 1),
+        None,
+    );
+    if !g
+        .header_cells
+        .as_ref()
+        .is_some_and(|(gen, c2, _)| *gen == g.render_gen && *c2 == cols)
+    {
+        let cells = cols
+            .iter()
+            .map(|&c| pad(&g.columns[c], g.widths[c]))
+            .collect();
+        g.header_cells = Some((g.render_gen, cols.clone(), cells));
+    }
+    for &idx in idxs.iter().flatten() {
+        if g.render[idx]
+            .as_ref()
+            .is_some_and(|(gen, c2, _, _)| *gen == g.render_gen && *c2 == cols)
+        {
+            continue; // fresh: data and column window unchanged
+        }
+        let Some(row) = g.row(g.cache_start + idx as i64) else {
+            continue;
+        };
+        let mut cells = Vec::with_capacity(cols.len());
+        let mut nulls = Vec::with_capacity(cols.len());
+        for &c in &cols {
+            let v = row.get(c);
+            nulls.push(matches!(v, Some(PValue::Null)));
+            cells.push(pad(&v.map(PValue::render).unwrap_or_default(), g.widths[c]));
+        }
+        g.render[idx] = Some((g.render_gen, cols.clone(), cells, nulls));
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(idxs.len() + 1);
+    if let Some((_, _, cells)) = g.header_cells.as_ref() {
+        lines.push(Line::from(
+            cols.iter()
+                .enumerate()
+                .map(|(pos, _)| Span::styled(&cells[pos], th.bright()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+    for &idx in &idxs {
+        let Some(idx) = idx else {
+            lines.push(Line::from(vec![Span::styled("…", th.dim())]));
+            continue; // outside the cached window
+        };
+        let spans: Vec<Span> = match g.render[idx].as_ref() {
+            Some((gen, c2, cells, nulls)) if *gen == g.render_gen && *c2 == cols => {
+                let abs = g.cache_start + idx as i64;
+                cols.iter()
+                    .enumerate()
+                    .map(|(pos, &c)| {
+                        let style = if abs == g.cur_row && c == g.cur_col {
+                            th.cursor()
+                        } else if abs == g.cur_row {
+                            th.bright()
+                        } else if nulls[pos] {
+                            th.dim()
+                        } else {
+                            th.base()
+                        };
+                        Span::styled(&cells[pos], style)
+                    })
+                    .collect()
+            }
+            _ => vec![Span::styled("…", th.dim())],
         };
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_detail_panel(f: &mut Frame, app: &App, state: &DetailState, area: Rect) {
-    let th = app.theme;
+fn draw_detail_panel(
+    f: &mut Frame,
+    state: &mut DetailState,
+    area: Rect,
+    th: &'static crate::theme::Theme,
+    focused: bool,
+    readonly: bool,
+) {
+    let border = if focused { th.bright() } else { th.dim() };
     let (child, child_col, key_sql) = match &state.grid.source {
         GridSource::Detail {
             child,
@@ -1607,10 +1667,10 @@ fn draw_detail_panel(f: &mut Frame, app: &App, state: &DetailState, area: Rect) 
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(focus_style(app, Focus::Detail))
-        .title(Span::styled(title, focus_style(app, Focus::Detail)))
+        .border_style(border)
+        .title(Span::styled(title, border))
         .title_bottom(Line::styled(
-            if app.db.link().readonly() || state.grid.rowids.is_none() {
+            if readonly || state.grid.rowids.is_none() {
                 " Tab master · v close · read-only "
             } else {
                 " Enter edit · a add · x delete · Tab master "
@@ -1638,36 +1698,84 @@ fn draw_detail_panel(f: &mut Frame, app: &App, state: &DetailState, area: Rect) 
         cols.push(c);
     }
 
-    let g = &state.grid;
-    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
-    lines.push(Line::from(
-        cols.iter()
-            .map(|&c| Span::styled(pad(&g.columns[c], g.widths[c]), th.bright()))
-            .collect::<Vec<_>>(),
-    ));
+    // #52: same per-row render cache as the master panel.
+    let g = &mut state.grid;
+    let mut idxs: Vec<Option<usize>> = Vec::with_capacity(visible as usize);
     for vis in 0..visible {
         let abs = g.row_off + vis;
         if abs >= g.total {
             break;
         }
-        let spans: Vec<Span> = match g.row(abs) {
-            Some(row) => cols
-                .iter()
-                .map(|&c| {
-                    let text = row.get(c).map(PValue::render).unwrap_or_default();
-                    let style = if abs == g.cur_row && c == g.cur_col {
-                        th.cursor()
-                    } else if abs == g.cur_row {
-                        th.bright()
-                    } else if matches!(row.get(c), Some(PValue::Null)) {
-                        th.dim()
-                    } else {
-                        th.base()
-                    };
-                    Span::styled(pad(&text, g.widths[c]), style)
-                })
-                .collect(),
-            None => vec![Span::styled("…", th.dim())],
+        idxs.push(abs.checked_sub(g.cache_start).map(|i| i as usize));
+    }
+    g.render.resize(
+        idxs.iter().flatten().copied().max().map_or(0, |m| m + 1),
+        None,
+    );
+    if !g
+        .header_cells
+        .as_ref()
+        .is_some_and(|(gen, c2, _)| *gen == g.render_gen && *c2 == cols)
+    {
+        let cells = cols
+            .iter()
+            .map(|&c| pad(&g.columns[c], g.widths[c]))
+            .collect();
+        g.header_cells = Some((g.render_gen, cols.clone(), cells));
+    }
+    for &idx in idxs.iter().flatten() {
+        if g.render[idx]
+            .as_ref()
+            .is_some_and(|(gen, c2, _, _)| *gen == g.render_gen && *c2 == cols)
+        {
+            continue; // fresh: data and column window unchanged
+        }
+        let Some(row) = g.row(g.cache_start + idx as i64) else {
+            continue;
+        };
+        let mut cells = Vec::with_capacity(cols.len());
+        let mut nulls = Vec::with_capacity(cols.len());
+        for &c in &cols {
+            let v = row.get(c);
+            nulls.push(matches!(v, Some(PValue::Null)));
+            cells.push(pad(&v.map(PValue::render).unwrap_or_default(), g.widths[c]));
+        }
+        g.render[idx] = Some((g.render_gen, cols.clone(), cells, nulls));
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(idxs.len() + 1);
+    if let Some((_, _, cells)) = g.header_cells.as_ref() {
+        lines.push(Line::from(
+            cols.iter()
+                .enumerate()
+                .map(|(pos, _)| Span::styled(&cells[pos], th.bright()))
+                .collect::<Vec<_>>(),
+        ));
+    }
+    for &idx in &idxs {
+        let Some(idx) = idx else {
+            lines.push(Line::from(vec![Span::styled("…", th.dim())]));
+            continue; // outside the cached window
+        };
+        let spans: Vec<Span> = match g.render[idx].as_ref() {
+            Some((gen, c2, cells, nulls)) if *gen == g.render_gen && *c2 == cols => {
+                let abs = g.cache_start + idx as i64;
+                cols.iter()
+                    .enumerate()
+                    .map(|(pos, &c)| {
+                        let style = if abs == g.cur_row && c == g.cur_col {
+                            th.cursor()
+                        } else if abs == g.cur_row {
+                            th.bright()
+                        } else if nulls[pos] {
+                            th.dim()
+                        } else {
+                            th.base()
+                        };
+                        Span::styled(&cells[pos], style)
+                    })
+                    .collect()
+            }
+            _ => vec![Span::styled("…", th.dim())],
         };
         lines.push(Line::from(spans));
     }
