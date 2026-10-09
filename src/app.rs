@@ -6795,17 +6795,25 @@ impl App {
                 Err(e) => self.err(e),
             };
         }
-        if let Some(rest) = line.strip_prefix("qbe") {
-            let t = rest.trim();
-            return self.open_qbe((!t.is_empty()).then(|| t.to_owned()));
+        // #65: dispatch on the first whitespace-delimited token, not a
+        // string prefix — `formwork` must not open the form designer for
+        // a table "work", `apples` must not open apps "les".
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let first = toks.first().copied();
+        let is_cmd = |w: &str| first.is_some_and(|t| t.eq_ignore_ascii_case(w));
+        let tail = || {
+            let t = first?;
+            let rest = line.get(t.len()..)?.trim();
+            (!rest.is_empty()).then(|| rest.to_owned())
+        };
+        if is_cmd("qbe") {
+            return self.open_qbe(tail());
         }
-        if let Some(rest) = line.strip_prefix("report") {
-            let t = rest.trim();
-            return self.open_report((!t.is_empty()).then(|| t.to_owned()));
+        if is_cmd("report") {
+            return self.open_report(tail());
         }
-        if let Some(rest) = line.strip_prefix("labels") {
-            let t = rest.trim();
-            return self.open_labels((!t.is_empty()).then(|| t.to_owned()));
+        if is_cmd("labels") {
+            return self.open_labels(tail());
         }
         if let Some(rest) = line.strip_prefix("run ") {
             let name = rest.trim();
@@ -6815,12 +6823,7 @@ impl App {
             };
         }
         {
-            let toks: Vec<&str> = line.split_whitespace().collect();
-            if toks
-                .first()
-                .is_some_and(|t| t.eq_ignore_ascii_case("create"))
-                && toks.len() <= 2
-            {
+            if is_cmd("create") && toks.len() <= 2 {
                 let second = toks.get(1).map(|t| t.to_ascii_lowercase());
                 let sql_word = matches!(
                     second.as_deref(),
@@ -6849,13 +6852,11 @@ impl App {
                 return self.find(&needle);
             }
         }
-        if let Some(rest) = line.strip_prefix("form") {
-            let t = rest.trim();
-            return self.open_form((!t.is_empty()).then(|| t.to_owned()));
+        if is_cmd("form") {
+            return self.open_form(tail());
         }
-        if let Some(rest) = line.strip_prefix("apps") {
-            let t = rest.trim();
-            return self.open_apps((!t.is_empty()).then(|| t.to_owned()));
+        if is_cmd("apps") {
+            return self.open_apps(tail());
         }
         if let Some(rest) = line.strip_prefix("app ") {
             let t = rest.trim();
@@ -6869,10 +6870,10 @@ impl App {
             self.focus = Focus::Sidebar;
             return;
         }
-        if line.starts_with("import") {
+        if is_cmd("import") {
             return self.handle_import(&line);
         }
-        if line.starts_with("export") {
+        if is_cmd("export") {
             return self.handle_export(&line);
         }
 
@@ -9427,6 +9428,40 @@ mod tests {
         a.apply(Command::PromptRun);
         a.sync();
         assert_eq!(a.status.as_ref().unwrap().0, "ok (batch)");
+    }
+
+    /// #65: dot-prompt dispatch matches the first whitespace-delimited
+    /// token, not a string prefix — `formwork` used to open the form
+    /// designer for a table "work", `apples` opened apps "les".
+    #[test]
+    fn prompt_dispatch_requires_word_boundaries() {
+        let mut a = app();
+        for input in ["formwork", "apples", "qbeta", "reports"] {
+            a.prompt.input = input.into();
+            a.apply(Command::PromptRun);
+            a.sync();
+            assert!(
+                !matches!(
+                    &a.overlay,
+                    Overlay::Form(_) | Overlay::Apps(_) | Overlay::Qbe(_) | Overlay::Report(_)
+                ),
+                "{input:?} must not dispatch as a command; overlay: {:?}",
+                std::mem::discriminant(&a.overlay)
+            );
+            assert!(
+                a.status.as_ref().is_some_and(|(_, e)| *e),
+                "{input:?} falls through to SQL and errors: {:?}",
+                a.status
+            );
+        }
+        // The exact commands still work.
+        a.prompt.input = "form".into();
+        a.apply(Command::PromptRun);
+        assert!(matches!(a.overlay, Overlay::Form(_)));
+        a.apply(Command::Back);
+        a.prompt.input = "apps".into();
+        a.apply(Command::PromptRun);
+        assert!(matches!(a.overlay, Overlay::Apps(_)));
     }
 
     /// #64: DML whose literals contain 'drop'/'create'/etc. must not
