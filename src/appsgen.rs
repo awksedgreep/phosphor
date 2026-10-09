@@ -102,28 +102,30 @@ pub fn app_id(db: &dyn DbLink, name: &str) -> Option<i64> {
     Some(store::int(out.rows.first()?.first()))
 }
 
-pub fn items(db: &dyn DbLink, app: &str) -> Vec<AppItem> {
+/// The app's items, or the query's error. A failure is propagated (not
+/// mapped to an empty Vec) so a transient remote error surfaces as a
+/// status message instead of a menu that looks empty (#75). An app that
+/// genuinely has no items is `Ok([])`.
+pub fn items(db: &dyn DbLink, app: &str) -> DbResult<Vec<AppItem>> {
     // Single JOIN (was: app_id lookup + items select = 2 round-trips
     // on every Apps open, worse over sqld).
-    db.query(&format!(
+    let out = db.query(&format!(
         "SELECT i.id, i.label, i.action_kind, i.action_ref, i.seq \
-         FROM _phosphor_items i JOIN _phosphor_apps a ON a.id = i.app_id \
-         WHERE a.name = {} ORDER BY i.seq, i.id",
+          FROM _phosphor_items i JOIN _phosphor_apps a ON a.id = i.app_id \
+          WHERE a.name = {} ORDER BY i.seq, i.id",
         store::q(app)
-    ))
-    .map(|out| {
-        out.rows
-            .into_iter()
-            .map(|r| AppItem {
-                id: store::int(r.first()),
-                label: store::text(r.get(1)),
-                kind: ActionKind::parse(&store::text(r.get(2))),
-                action_ref: store::text(r.get(3)),
-                seq: store::int(r.get(4)),
-            })
-            .collect()
-    })
-    .unwrap_or_default()
+    ))?;
+    Ok(out
+        .rows
+        .into_iter()
+        .map(|r| AppItem {
+            id: store::int(r.first()),
+            label: store::text(r.get(1)),
+            kind: ActionKind::parse(&store::text(r.get(2))),
+            action_ref: store::text(r.get(3)),
+            seq: store::int(r.get(4)),
+        })
+        .collect())
 }
 
 pub fn add_item(db: &dyn DbLink, app: &str, label: &str) -> DbResult<()> {
@@ -258,7 +260,7 @@ mod tests {
         assert_eq!(list_apps(&db), ["crm"]);
         add_item(&db, "crm", "Customers").unwrap();
         add_item(&db, "crm", "Aging report").unwrap();
-        let mut its = items(&db, "crm");
+        let mut its = items(&db, "crm").unwrap();
         assert_eq!(its.len(), 2);
         assert_eq!(its[0].label, "Customers");
         assert_eq!(its[0].kind, ActionKind::Browse);
@@ -267,13 +269,32 @@ mod tests {
         its[1].action_ref = "aging".into();
         update_item(&db, &its[1]).unwrap();
 
-        let its = items(&db, "crm");
+        let its = items(&db, "crm").unwrap();
         swap_items(&db, &its[0], &its[1]).unwrap();
-        let its = items(&db, "crm");
+        let its = items(&db, "crm").unwrap();
         assert_eq!(its[0].label, "Aging report");
         assert_eq!(its[0].kind, ActionKind::Report);
 
         delete_item(&db, its[1].id).unwrap();
-        assert_eq!(items(&db, "crm").len(), 1);
+        assert_eq!(items(&db, "crm").unwrap().len(), 1);
+    }
+
+    /// #75: a query failure is propagated as an error, not mapped to an
+    /// empty Vec — so a transient remote error can't masquerade as an
+    /// app that simply has no items.
+    #[test]
+    fn items_surfaces_query_errors() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        store::ensure(&db).unwrap();
+        ensure_app(&db, "crm").unwrap();
+        add_item(&db, "crm", "Customers").unwrap();
+        assert_eq!(items(&db, "crm").unwrap().len(), 1);
+        // Drop the items table: the JOIN now fails, and items() must
+        // return Err rather than an empty Vec.
+        db.execute("DROP TABLE _phosphor_items").unwrap();
+        assert!(
+            items(&db, "crm").is_err(),
+            "a query failure must be an error, not an empty menu"
+        );
     }
 }

@@ -4390,10 +4390,14 @@ impl App {
     }
 
     fn apps_reload(&mut self, app: &str) {
-        let items = appsgen::items(self.db.link(), app);
-        if let Overlay::Apps(st) = &mut self.overlay {
-            st.items = items;
-            st.cursor = st.cursor.min(st.items.len().saturating_sub(1));
+        match appsgen::items(self.db.link(), app) {
+            Ok(items) => {
+                if let Overlay::Apps(st) = &mut self.overlay {
+                    st.items = items;
+                    st.cursor = st.cursor.min(st.items.len().saturating_sub(1));
+                }
+            }
+            Err(e) => self.err(e),
         }
     }
 
@@ -4429,8 +4433,18 @@ impl App {
             .or_else(|| appsgen::list_apps(self.db.link()).into_iter().next())
             .unwrap_or_else(|| "app".to_owned());
         // Deliberately no ensure here: opening the designer is a READ.
-        // The first DesignerAdd creates the app (and its tables).
-        let items = appsgen::items(self.db.link(), &name);
+        // The first DesignerAdd creates the app (and its tables). An app
+        // that doesn't exist yet (or no apps table) opens empty; an app
+        // that DOES exist loads its items, surfacing a query failure
+        // instead of silently opening an empty designer (#75).
+        let items = if appsgen::app_id(self.db.link(), &name).is_some() {
+            match appsgen::items(self.db.link(), &name) {
+                Ok(it) => it,
+                Err(e) => return self.err(e),
+            }
+        } else {
+            Vec::new()
+        };
         self.overlay = Overlay::Apps(AppDesignState {
             app: name,
             items,
@@ -4456,7 +4470,10 @@ impl App {
         else {
             return self.err("no apps in this database yet — press A to craft one");
         };
-        let items = appsgen::items(self.db.link(), &name);
+        let items = match appsgen::items(self.db.link(), &name) {
+            Ok(it) => it,
+            Err(e) => return self.err(e),
+        };
         if items.is_empty() {
             return self.err(format!("app {name:?} has no items yet — A to design"));
         }
@@ -7692,7 +7709,7 @@ pub(crate) fn assert_builder_workflow(connect: impl Fn() -> Box<dyn DbLink>) {
     );
     a.apply(Command::Back);
     appsgen::add_item(a.db.link(), "design app", "Query").unwrap();
-    let mut item = appsgen::items(a.db.link(), "design app").remove(0);
+    let mut item = appsgen::items(a.db.link(), "design app").unwrap().remove(0);
     item.kind = ActionKind::Query;
     item.action_ref = "design copy".into();
     appsgen::update_item(a.db.link(), &item).unwrap();
@@ -7706,7 +7723,7 @@ pub(crate) fn assert_builder_workflow(connect: impl Fn() -> Box<dyn DbLink>) {
         .is_none());
     assert!(QbeSpec::load(a.db.link(), "design copy").unwrap().is_some());
     assert_eq!(
-        appsgen::items(a.db.link(), "design app")[0].action_ref,
+        appsgen::items(a.db.link(), "design app").unwrap()[0].action_ref,
         "design copy"
     );
     a.db.execute("DROP TRIGGER block_design_rename").unwrap();
@@ -7714,7 +7731,7 @@ pub(crate) fn assert_builder_workflow(connect: impl Fn() -> Box<dyn DbLink>) {
     assert!(!a.status.as_ref().unwrap().1, "{:?}", a.status);
     assert!(QbeSpec::load(a.db.link(), "design copy").unwrap().is_none());
     assert_eq!(
-        appsgen::items(a.db.link(), "design app")[0].action_ref,
+        appsgen::items(a.db.link(), "design app").unwrap()[0].action_ref,
         "design moved"
     );
     a.apply(Command::Back);
@@ -10249,7 +10266,7 @@ beta');",
         let mut a = App::new(Box::new(db), None);
         appsgen::ensure_app(a.db.link(), "demo").unwrap();
         appsgen::add_item(a.db.link(), "demo", "Do it").unwrap();
-        let mut items = appsgen::items(a.db.link(), "demo");
+        let mut items = appsgen::items(a.db.link(), "demo").unwrap();
         items[0].kind = ActionKind::Script;
         items[0].action_ref = String::new();
         appsgen::update_item(a.db.link(), &items[0]).unwrap();
@@ -10270,7 +10287,7 @@ beta');",
         }
         a.apply(Command::ScriptSave);
         assert!(matches!(a.overlay, Overlay::Apps(_)), "returns to designer");
-        let items = appsgen::items(a.db.link(), "demo");
+        let items = appsgen::items(a.db.link(), "demo").unwrap();
         assert!(
             items[0].action_ref.contains('\n'),
             "{:?}",
@@ -10317,7 +10334,7 @@ beta');",
         let mut a = app();
         appsgen::ensure_app(a.db.link(), "demo").unwrap();
         appsgen::add_item(a.db.link(), "demo", "Open t").unwrap();
-        let mut items = appsgen::items(a.db.link(), "demo");
+        let mut items = appsgen::items(a.db.link(), "demo").unwrap();
         items[0].kind = ActionKind::Script;
         items[0].action_ref = "ui.browse(\"t\")".into();
         appsgen::update_item(a.db.link(), &items[0]).unwrap();
@@ -10378,7 +10395,7 @@ beta');",
         let mut a = App::new(Box::new(db), None);
         appsgen::ensure_app(a.db.link(), "demo").unwrap();
         appsgen::add_item(a.db.link(), "demo", "Log it").unwrap();
-        let mut items = appsgen::items(a.db.link(), "demo");
+        let mut items = appsgen::items(a.db.link(), "demo").unwrap();
         items[0].kind = ActionKind::Script;
         items[0].action_ref = "say(execute(\"insert into log values ('hi')\"))".into();
         appsgen::update_item(a.db.link(), &items[0]).unwrap();
@@ -11795,7 +11812,7 @@ beta');",
         assert_eq!(st.app, "crm");
         assert_eq!(appsgen::list_apps(a.db.link()), ["crm"]);
         a.apply(Command::DesignerAdd); // an item under crm
-        assert_eq!(appsgen::items(a.db.link(), "crm").len(), 1);
+        assert_eq!(appsgen::items(a.db.link(), "crm").unwrap().len(), 1);
 
         a.apply(Command::RenameApp);
         for c in "sales".chars() {
@@ -11804,7 +11821,7 @@ beta');",
         a.apply(Command::DesignerCommit);
         assert_eq!(appsgen::list_apps(a.db.link()), ["sales"]);
         assert_eq!(
-            appsgen::items(a.db.link(), "sales").len(),
+            appsgen::items(a.db.link(), "sales").unwrap().len(),
             1,
             "items follow"
         );
@@ -11815,7 +11832,7 @@ beta');",
         let mut a = app();
         appsgen::ensure_app(a.db.link(), "demo").unwrap();
         appsgen::add_item(a.db.link(), "demo", "Totals").unwrap();
-        let mut items = appsgen::items(a.db.link(), "demo");
+        let mut items = appsgen::items(a.db.link(), "demo").unwrap();
         items[0].kind = ActionKind::Report;
         items[0].action_ref = "t".into();
         appsgen::update_item(a.db.link(), &items[0]).unwrap();
@@ -11829,6 +11846,29 @@ beta');",
         assert!(
             matches!(a.overlay, Overlay::AppMenu(_)),
             "menu-launched pager must return to the menu in app mode"
+        );
+    }
+
+    /// #75: when reading an app's items fails (a transient remote error),
+    /// the menu shows the real error — not "no items yet" — and does not
+    /// open at all.
+    #[test]
+    fn app_menu_surfaces_items_query_error() {
+        let mut a = app();
+        appsgen::ensure_app(a.db.link(), "demo").unwrap();
+        appsgen::add_item(a.db.link(), "demo", "Totals").unwrap();
+        // list_apps still finds "demo", but the items JOIN now fails.
+        a.db.execute("DROP TABLE _phosphor_items").unwrap();
+        a.apply(Command::OpenAppMenu(Some("demo".into())));
+        let (msg, is_err) = a.status.as_ref().expect("an error must be shown").clone();
+        assert!(is_err, "should be an error, got: {msg:?}");
+        assert!(
+            !msg.contains("no items yet"),
+            "a query error must not masquerade as an empty app: {msg:?}"
+        );
+        assert!(
+            !matches!(a.overlay, Overlay::AppMenu(_)),
+            "the menu must not open on a query error"
         );
     }
 

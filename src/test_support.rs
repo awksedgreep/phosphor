@@ -300,16 +300,19 @@ pub fn assert_transaction_and_script_workflows(db: &dyn crate::db::DbLink) {
         source
     );
     crate::appsgen::add_item(db, "Remote; app", text).unwrap();
-    let mut item = crate::appsgen::items(db, "Remote; app").remove(0);
+    let mut item = crate::appsgen::items(db, "Remote; app").unwrap().remove(0);
     item.kind = crate::appsgen::ActionKind::Script;
     item.action_ref = source.into();
     crate::appsgen::update_item(db, &item).unwrap();
     crate::appsgen::set_item_ref(db, item.id, source).unwrap();
     assert_eq!(
-        crate::appsgen::items(db, "Remote; app")[0].action_ref,
+        crate::appsgen::items(db, "Remote; app").unwrap()[0].action_ref,
         source
     );
-    assert_eq!(crate::appsgen::items(db, "Remote; app")[0].label, text);
+    assert_eq!(
+        crate::appsgen::items(db, "Remote; app").unwrap()[0].label,
+        text
+    );
     crate::store::pref_set(db, "theme;test", text);
     assert_eq!(crate::store::pref_get(db, "theme;test").unwrap(), text);
     // Quotes, semicolons and NULs are values, never SQL text.
