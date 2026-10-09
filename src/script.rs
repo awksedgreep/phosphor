@@ -23,6 +23,7 @@
 //! permission check — including `--readonly`.
 
 use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
 use mlua::{Lua, LuaOptions, StdLib, Value};
 
@@ -315,11 +316,68 @@ fn engine() -> mlua::Result<Lua> {
     }
     // 32 MB of Lua heap is plenty for a menu action.
     lua.set_memory_limit(32 * 1024 * 1024)?;
+    // 2M instructions: a full 10,000-row `query()` result with
+    // realistic per-row work costs ~25-30 instructions/row (250k-300k),
+    // so 200k killed legitimate scripts (#60). A runaway loop still
+    // dies in milliseconds at 2M.
+    const INSTRUCTION_BUDGET: u64 = 2_000_000;
+    const HOOK_STEP: u32 = 200_000;
+    let count = RefCell::new(0u64);
     lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(200_000),
-        |_lua, _debug| Err(mlua::Error::RuntimeError("script exceeded budget".into())),
+        mlua::HookTriggers::new().every_nth_instruction(HOOK_STEP),
+        {
+            let count = count.clone();
+            move |_lua, _debug| {
+                *count.borrow_mut() += u64::from(HOOK_STEP);
+                if *count.borrow() >= INSTRUCTION_BUDGET {
+                    Err(mlua::Error::RuntimeError(
+                        "script exceeded its instruction budget".into(),
+                    ))
+                } else {
+                    Ok(mlua::VmState::Continue)
+                }
+            }
+        },
     );
     Ok(lua)
+}
+
+/// Per-run caps the instruction hook cannot see: time spent inside a
+/// C callback (a DB round-trip) is not an instruction, so a loop of
+/// 20,000 `query()` calls fit the instruction budget and could still
+/// freeze the UI thread for minutes (#60).
+const MAX_DB_CALLS: u32 = 1_000;
+/// Wall time per script run, checked before each DB call. One call in
+/// flight may still run to the transport timeout; everything after it
+/// is refused.
+const TIME_BUDGET: Duration = Duration::from_secs(5);
+
+struct RunLimits {
+    db_calls_left: u32,
+    deadline: Instant,
+}
+
+impl RunLimits {
+    fn new() -> Self {
+        Self {
+            db_calls_left: MAX_DB_CALLS,
+            deadline: Instant::now() + TIME_BUDGET,
+        }
+    }
+
+    /// Charge one DB round-trip; refuse when either cap is spent.
+    fn take_db_call(&mut self) -> Result<(), String> {
+        if self.db_calls_left == 0 {
+            return Err(format!(
+                "script exceeded its database budget ({MAX_DB_CALLS} calls)"
+            ));
+        }
+        if Instant::now() > self.deadline {
+            return Err("script exceeded its time budget".into());
+        }
+        self.db_calls_left -= 1;
+        Ok(())
+    }
 }
 
 /// Register the queued `ui` table inside a `lua.scope` block. A macro
@@ -384,14 +442,19 @@ macro_rules! install_ui {
 /// Register the shared data/helper globals. `$messages` receives output;
 /// `$effects` receives `ui.*`.
 macro_rules! install_host {
-    ($scope:expr, $lua:expr, $db:expr, $messages:expr, $effects:expr) => {{
+    ($scope:expr, $lua:expr, $db:expr, $messages:expr, $effects:expr, $limits:expr) => {{
         // Bind references outside the `move` closures (see install_ui).
         let messages: &RefCell<Vec<String>> = $messages;
         let db: &dyn DbLink = $db;
+        let limits: &RefCell<RunLimits> = $limits;
 
         $lua.globals().set(
             "query",
             $scope.create_function(|lua, sql: String| {
+                limits
+                    .borrow_mut()
+                    .take_db_call()
+                    .map_err(mlua::Error::RuntimeError)?;
                 let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
                 rows_to_lua(lua, &q)
             })?,
@@ -399,6 +462,10 @@ macro_rules! install_host {
         $lua.globals().set(
             "query_one",
             $scope.create_function(|lua, sql: String| {
+                limits
+                    .borrow_mut()
+                    .take_db_call()
+                    .map_err(mlua::Error::RuntimeError)?;
                 let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
                 match q.rows.first() {
                     Some(row) => row_to_lua(lua, &q.columns, row),
@@ -409,6 +476,10 @@ macro_rules! install_host {
         $lua.globals().set(
             "scalar",
             $scope.create_function(|lua, sql: String| {
+                limits
+                    .borrow_mut()
+                    .take_db_call()
+                    .map_err(mlua::Error::RuntimeError)?;
                 let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
                 match q.rows.first().and_then(|r| r.first()) {
                     Some(v) => to_lua(lua, v),
@@ -419,6 +490,10 @@ macro_rules! install_host {
         $lua.globals().set(
             "execute",
             $scope.create_function(|_, sql: String| {
+                limits
+                    .borrow_mut()
+                    .take_db_call()
+                    .map_err(mlua::Error::RuntimeError)?;
                 let (n, _) = db.execute(&sql).map_err(mlua::Error::RuntimeError)?;
                 Ok(n)
             })?,
@@ -426,6 +501,10 @@ macro_rules! install_host {
         $lua.globals().set(
             "exists",
             $scope.create_function(|_, sql: String| {
+                limits
+                    .borrow_mut()
+                    .take_db_call()
+                    .map_err(mlua::Error::RuntimeError)?;
                 let q = db.query(&sql).map_err(mlua::Error::RuntimeError)?;
                 Ok(!q.rows.is_empty())
             })?,
@@ -433,6 +512,10 @@ macro_rules! install_host {
         $lua.globals().set(
             "columns",
             $scope.create_function(|lua, table: String| {
+                limits
+                    .borrow_mut()
+                    .take_db_call()
+                    .map_err(mlua::Error::RuntimeError)?;
                 let q = db
                     .query(&format!(
                         "SELECT name FROM pragma_table_info({})",
@@ -550,8 +633,9 @@ pub fn run(db: &dyn DbLink, source: &str) -> Result<Outcome, String> {
     let messages: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let effects: RefCell<Vec<Effect>> = RefCell::new(Vec::new());
 
+    let limits = RefCell::new(RunLimits::new());
     let result: mlua::Result<()> = lua.scope(|scope| {
-        install_host!(scope, lua, db, &messages, &effects);
+        install_host!(scope, lua, db, &messages, &effects, &limits);
         // A trailing expression is reported too, so `return #rows` works.
         let ret: Value = lua.load(source).eval()?;
         if !matches!(ret, Value::Nil) {
@@ -586,8 +670,9 @@ pub fn run_form_event(
     let effects: RefCell<Vec<Effect>> = RefCell::new(Vec::new());
     let failure: RefCell<Option<String>> = RefCell::new(None);
 
+    let limits = RefCell::new(RunLimits::new());
     let result: mlua::Result<()> = lua.scope(|scope| {
-        install_host!(scope, lua, db, &messages, &effects);
+        install_host!(scope, lua, db, &messages, &effects, &limits);
         let error = scope.create_function(|_, msg: Value| {
             *failure.borrow_mut() = Some(lua_to_string(&msg));
             Ok(())
@@ -714,6 +799,48 @@ mod tests {
         let db = db();
         let err = run(&db, "while true do end").unwrap_err();
         assert!(err.contains("budget"), "{err}");
+    }
+
+    /// #60: a loop of DB round-trips is capped per run — 20,000
+    /// `query()` calls fit the instruction budget (C-callback time is
+    /// not an instruction) and could freeze the UI thread for minutes.
+    #[test]
+    fn db_call_loops_are_capped() {
+        let db = db();
+        let err = run(&db, "for i = 1, 20000 do query('SELECT 1') end").unwrap_err();
+        assert!(err.contains("database budget"), "{err}");
+    }
+
+    /// #60: processing a full 10,000-row `query()` result with realistic
+    /// per-row work (~25-30 instructions/row) fits the instruction
+    /// budget — the old 200k cap died mid-run on exactly this.
+    #[test]
+    fn ten_k_row_scripts_fit_the_instruction_budget() {
+        let db = db();
+        db.execute("CREATE TABLE big(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO big(id, v) WITH RECURSIVE cnt(x) AS \
+             (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 10000) \
+             SELECT x, 'v' || x FROM cnt",
+        )
+        .unwrap();
+        let out = run(
+            &db,
+            r#"
+            local rows = query("SELECT id, v FROM big ORDER BY id")
+            local n = 0
+            for i = 1, #rows do
+              local r = rows[i]
+              if r.id % 2 == 0 and r.v ~= nil and tostring(r.id) ~= "" then
+                n = n + 1
+              end
+            end
+            say(n)
+            "#,
+        )
+        .unwrap();
+        assert!(out.messages.join("\n").contains("5000"), "{out:?}");
     }
 
     #[test]
