@@ -646,12 +646,17 @@ enum PendingOp {
         /// what was on screen when the scan started.
         sseq: u64,
     },
-    /// Health console rebuild: installs only if the overlay hasn't
-    /// moved on (discriminant guard); `sampled` says so on arrival.
+    /// Health console rebuild: installs only if the overlay AND the
+    /// grid identity haven't moved on; `sampled` says so on arrival.
+    /// The discriminant alone can't tell "still on the browser" from
+    /// "opened another table" — both are overlay `None`; the epoch
+    /// covers a table open that is itself still in flight (#68).
     Health {
         sampled: bool,
         seq: u64,
         overlay: std::mem::Discriminant<Overlay>,
+        grid: Option<String>,
+        epoch: u64,
     },
     /// Detail-pane rows for a split BROWSE, keyed by the parent key
     /// they were fetched for (stale arrivals drop).
@@ -690,6 +695,11 @@ pub struct App {
     pub tables: Vec<TableInfo>,
     pub sidebar_idx: usize,
     pub grid: Option<Grid>,
+    /// Bumped on every grid-target change at SUBMIT time (#68). The
+    /// grid itself only swaps in when the response lands, so a
+    /// staleness guard that reads `grid` on arrival can't see a change
+    /// still in flight — the epoch can.
+    pub grid_epoch: u64,
     /// Split-view detail pane (None = single-pane BROWSE, as always).
     /// The pane's Grid lives here too; its source is GridSource::Detail.
     pub detail: Option<DetailState>,
@@ -809,6 +819,7 @@ impl App {
             tables: Vec::new(),
             sidebar_idx: 0,
             grid: None,
+            grid_epoch: 0,
             detail: None,
             prompt: Prompt {
                 input: String::new(),
@@ -1300,11 +1311,16 @@ impl App {
                     sampled,
                     seq,
                     overlay,
+                    grid,
+                    epoch,
                 },
                 DbResponse::HealthConsole(r),
             ) => match r {
                 Ok(h) => {
-                    if std::mem::discriminant(&self.overlay) != overlay {
+                    if std::mem::discriminant(&self.overlay) != overlay
+                        || self.grid_table() != grid
+                        || self.grid_epoch != epoch
+                    {
                         return; // user moved on; silent drop, no yank
                     }
                     self.health = h.health.clone();
@@ -3132,12 +3148,27 @@ impl App {
         })
     }
 
+    /// The table on screen when the grid is a plain table — the health
+    /// console's staleness identity beside the overlay discriminant
+    /// (#68): overlay `None` covers both "browser" and "new table".
+    fn grid_table(&self) -> Option<String> {
+        match &self.grid {
+            Some(g) => match &g.source {
+                GridSource::Table { name, .. } => Some(name.clone()),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
     fn open_health(&mut self) {
         // Async: the bundle (base + report + sparks + dot) arrives as
         // one job; the current screen stays put until the console does.
-        // The overlay discriminant guards stale installs (user moved on).
+        // Overlay + grid identity guard stale installs (user moved on).
         let seq = self.status_seq;
         let overlay = std::mem::discriminant(&self.overlay);
+        let grid = self.grid_table();
+        let epoch = self.grid_epoch;
         match self.db.submit(Box::new(move |db| {
             DbResponse::HealthConsole(Self::fetch_health_console(db))
         })) {
@@ -3148,6 +3179,8 @@ impl App {
                         sampled: false,
                         seq,
                         overlay,
+                        grid,
+                        epoch,
                     },
                 );
             }
@@ -3173,6 +3206,8 @@ impl App {
                 // with the fresh console so the message never lies.
                 let seq = self.status_seq;
                 let overlay = std::mem::discriminant(&self.overlay);
+                let grid = self.grid_table();
+                let epoch = self.grid_epoch;
                 match self.db.submit(Box::new(move |db| {
                     DbResponse::HealthConsole(Self::fetch_health_console(db))
                 })) {
@@ -3183,6 +3218,8 @@ impl App {
                                 sampled: true,
                                 seq,
                                 overlay,
+                                grid,
+                                epoch,
                             },
                         );
                     }
@@ -4439,6 +4476,8 @@ impl App {
         // until then the previous screen stays put.
         let seq = self.status_seq;
         let query = sql.to_owned();
+        // A query grid is a new target, however similar the rows look.
+        self.grid_epoch = self.grid_epoch.wrapping_add(1);
         match self
             .db
             .submit(Box::new(move |db| DbResponse::Query(db.query(&query))))
@@ -4946,6 +4985,15 @@ impl App {
         // and failures leave the old view intact.
         let table = name.to_owned();
         let limit = self.visible_rows + OVERSCAN;
+        // The target changed NOW, even though the rows land later (#68).
+        // Re-opening the table already on screen is not a change.
+        let same = self
+            .grid
+            .as_ref()
+            .is_some_and(|g| matches!(&g.source, GridSource::Table { name: n, .. } if n == name));
+        if !same {
+            self.grid_epoch = self.grid_epoch.wrapping_add(1);
+        }
         let submitted = self.db.submit(Box::new(move |db| {
             let res = (|| -> DbResult<crate::worker::OpenedGrid> {
                 let columns = db.columns(&table)?;
@@ -9743,6 +9791,75 @@ mod tests {
             matches!(a.overlay, Overlay::Qbe(_)),
             "late health console must not clobber QBE"
         );
+    }
+
+    /// #68: the health console's staleness guard covered only the
+    /// overlay discriminant — from the browser (overlay `None`), opening
+    /// a table leaves the discriminant `None`, so the in-flight console
+    /// installed over the freshly opened table. The guard now carries
+    /// the grid's table identity too.
+    #[test]
+    fn stale_health_console_drops_when_a_table_opens_in_flight() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+             CREATE VIEW t_report AS
+               SELECT 'c' AS \"check\", 'ok' AS status, 1.0 AS value, 'a' AS advice;",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenHealth);
+        // Still on the browser while in flight: open a table.
+        a.apply(Command::OpenSelected);
+        a.sync();
+        assert!(
+            matches!(a.overlay, Overlay::None),
+            "the console must not install over the new table: {:?}",
+            a.status
+        );
+        let GridSource::Table { name, .. } = &a.grid.as_ref().unwrap().source else {
+            panic!("grid lost the table");
+        };
+        assert_eq!(name, "t");
+        // No movement: the console still installs (guard, not block).
+        let (db2, _) = EmbeddedDb::open(":memory:").unwrap();
+        db2.execute(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+             CREATE VIEW t_report AS
+               SELECT 'c' AS \"check\", 'ok' AS status, 1.0 AS value, 'a' AS advice;",
+        )
+        .unwrap();
+        let mut b = App::new(Box::new(db2), None);
+        b.apply(Command::OpenHealth);
+        b.sync();
+        assert!(
+            matches!(b.overlay, Overlay::Health(_)),
+            "a plain F10 must still open the console: {:?}",
+            b.status
+        );
+    }
+
+    /// #68: F10 in a designer is a dead key, never the global OpenHealth
+    /// — a stray press mid-design must not threaten unsaved design
+    /// state with the console.
+    #[test]
+    fn f10_in_designers_is_never_open_health() {
+        use ratatui::crossterm::event::KeyCode;
+        let mut a = app();
+        a.open_qbe(Some("t".into()));
+        assert!(
+            a.map_key(KeyCode::F(10).into()).is_none(),
+            "F10 in the QBE designer must not map to a command"
+        );
+        a.apply(Command::Back);
+        a.open_report(Some("t".into()));
+        assert!(a.map_key(KeyCode::F(10).into()).is_none());
+        a.apply(Command::Back);
+        a.open_form(Some("t".into()));
+        assert!(a.map_key(KeyCode::F(10).into()).is_none());
+        // In the browser (no designer), F10 still opens the console.
+        a.apply(Command::Back);
+        assert_eq!(a.map_key(KeyCode::F(10).into()), Some(Command::OpenHealth));
     }
 
     /// Full-stack phase 3, when the timeless extension is built next
