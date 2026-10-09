@@ -3885,13 +3885,21 @@ impl App {
                             app_rename = Some(new);
                         }
                     } else if let Some(item) = st.items.get_mut(st.cursor) {
-                        if st.editing_ref {
+                        let was_ref = st.editing_ref;
+                        if was_ref {
                             item.action_ref = buf;
                         } else {
                             item.label = buf;
                         }
                         let item = item.clone();
                         let _ = appsgen::update_item(self.db.link(), &item);
+                        // A target the user just typed is checked against the
+                        // live catalog and named if it can't resolve (#45).
+                        if was_ref {
+                            if let Some(e) = appsgen::item_target_error(self.db.link(), &item) {
+                                self.say(format!("target doesn't resolve — {e}"));
+                            }
+                        }
                     }
                 }
             }
@@ -4086,6 +4094,11 @@ impl App {
                 )),
             },
             ActionKind::Report => {
+                // A broken report target must not silently degrade to a
+                // (wrong or missing) table report (#45): name it.
+                if let Some(e) = appsgen::item_target_error(self.db.link(), item) {
+                    return self.err(e);
+                }
                 self.start_report(None, item.action_ref.clone());
             }
             ActionKind::Sql => {
@@ -4490,6 +4503,17 @@ impl App {
             return self.err(format!("app {name:?} has no items yet — A to design"));
         }
         let version = appsgen::app_version(self.db.link(), &name);
+        // Caught before handoff: name any target that can't resolve against
+        // the live catalog (#45). The menu still opens so valid items run.
+        let broken = appsgen::broken_targets_in(&items, self.db.link());
+        if let Some((_, reason)) = broken.first() {
+            let extra = if broken.len() > 1 {
+                format!(" (+{} more)", broken.len() - 1)
+            } else {
+                String::new()
+            };
+            self.say(format!("{:?} has a broken target — {reason}{extra}", name));
+        }
         self.overlay = Overlay::AppMenu(AppMenuState {
             app: name,
             version,
@@ -11932,6 +11956,84 @@ beta');",
             !matches!(a.overlay, Overlay::AppMenu(_)),
             "the menu must not open on a query error"
         );
+    }
+
+    /// #45: a broken target is named when the menu is opened (before
+    /// handoff), as a warning — and the menu still opens so valid items run.
+    #[test]
+    fn app_menu_warns_on_a_broken_target() {
+        let mut a = app();
+        appsgen::ensure_app(a.db.link(), "demo").unwrap();
+        appsgen::add_item(a.db.link(), "demo", "Aging").unwrap();
+        let mut items = appsgen::items(a.db.link(), "demo").unwrap();
+        items[0].kind = ActionKind::Report;
+        items[0].action_ref = "no_such_report".into(); // neither a report nor a table
+        appsgen::update_item(a.db.link(), &items[0]).unwrap();
+
+        a.apply(Command::OpenAppMenu(Some("demo".into())));
+        let (msg, is_err) = a.status.as_ref().expect("a warning must be shown").clone();
+        assert!(
+            !is_err,
+            "a broken target is a warning, not an error: {msg:?}"
+        );
+        assert!(msg.contains("broken target"), "{msg:?}");
+        assert!(
+            msg.contains("no report or table named \"no_such_report\""),
+            "{msg:?}"
+        );
+        assert!(
+            matches!(a.overlay, Overlay::AppMenu(_)),
+            "the menu still opens despite the broken target"
+        );
+    }
+
+    /// #45: running a broken report target names the problem instead of
+    /// silently degrading to a (wrong or missing) table report.
+    #[test]
+    fn running_a_broken_report_target_is_named() {
+        let mut a = app();
+        appsgen::ensure_app(a.db.link(), "demo").unwrap();
+        appsgen::add_item(a.db.link(), "demo", "Aging").unwrap();
+        let mut items = appsgen::items(a.db.link(), "demo").unwrap();
+        items[0].kind = ActionKind::Report;
+        items[0].action_ref = "no_such_report".into();
+        appsgen::update_item(a.db.link(), &items[0]).unwrap();
+
+        a.apply(Command::OpenAppMenu(Some("demo".into())));
+        a.status = None; // clear the handoff warning; assert the run error
+        a.apply(Command::DesignerRun);
+        a.sync();
+        let (msg, is_err) = a.status.as_ref().expect("an error must be shown").clone();
+        assert!(is_err, "a broken report target must be an error: {msg:?}");
+        assert!(
+            msg.contains("no report or table named \"no_such_report\""),
+            "{msg:?}"
+        );
+        assert!(
+            matches!(a.overlay, Overlay::AppMenu(_)),
+            "no pager may open for a broken report target"
+        );
+    }
+
+    /// #45: committing a target in the designer checks it against the live
+    /// catalog and names it if it can't resolve.
+    #[test]
+    fn designer_names_a_broken_target_on_commit() {
+        let mut a = app();
+        a.apply(Command::OpenApps(Some("crm".into())));
+        a.apply(Command::DesignerAdd);
+        a.apply(Command::DesignerEditAlt); // begin editing the action_ref
+        for c in "ghost".chars() {
+            a.apply(Command::DesignerChar(c));
+        }
+        a.apply(Command::DesignerCommit);
+        let (msg, is_err) = a.status.as_ref().expect("a warning must be shown").clone();
+        assert!(
+            !is_err,
+            "a broken target is a warning, not an error: {msg:?}"
+        );
+        assert!(msg.contains("target doesn't resolve"), "{msg:?}");
+        assert!(msg.contains("no table named \"ghost\""), "{msg:?}");
     }
 
     #[test]

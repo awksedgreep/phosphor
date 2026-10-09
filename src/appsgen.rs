@@ -209,6 +209,60 @@ pub fn swap_items(db: &dyn DbLink, a: &AppItem, b: &AppItem) -> DbResult<()> {
     .map(|_| ())
 }
 
+/// True when a table or view with that name exists (case-insensitive) —
+/// the target a Browse (or a report-on-table) item points at.
+fn table_exists(db: &dyn DbLink, name: &str) -> bool {
+    db.tables()
+        .map(|ts| ts.iter().any(|t| t.name.eq_ignore_ascii_case(name)))
+        .unwrap_or(false)
+}
+
+/// True when a saved QBE query with that name exists.
+fn saved_query_exists(db: &dyn DbLink, name: &str) -> bool {
+    store::names(db, "_phosphor_queries", "name")
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// True when a saved report with that name exists.
+fn saved_report_exists(db: &dyn DbLink, name: &str) -> bool {
+    store::names(db, "_phosphor_reports", "name")
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// Why a menu item's target is broken, if it is (`None` = valid), checked
+/// against the live catalog so a broken target is caught before the app is
+/// handed off rather than only at run time (#45).
+pub fn item_target_error(db: &dyn DbLink, item: &AppItem) -> Option<String> {
+    let broken = match item.kind {
+        ActionKind::Browse => !table_exists(db, &item.action_ref),
+        ActionKind::Query => !saved_query_exists(db, &item.action_ref),
+        // A report item is valid if a saved report exists OR the target is a
+        // table (start_report falls back to a report on that table).
+        ActionKind::Report => {
+            !saved_report_exists(db, &item.action_ref) && !table_exists(db, &item.action_ref)
+        }
+        ActionKind::Sql | ActionKind::Script => item.action_ref.trim().is_empty(),
+    };
+    broken.then(|| match item.kind {
+        ActionKind::Browse => format!("no table named {:?}", item.action_ref),
+        ActionKind::Query => format!("no saved query named {:?}", item.action_ref),
+        ActionKind::Report => format!("no report or table named {:?}", item.action_ref),
+        ActionKind::Sql => "empty SQL target".to_owned(),
+        ActionKind::Script => "empty script target".to_owned(),
+    })
+}
+
+/// Every broken target among the given items as `(item id, reason)` — the
+/// check run before an app is handed off as the application (#45).
+pub fn broken_targets_in(items: &[AppItem], db: &dyn DbLink) -> Vec<(i64, String)> {
+    items
+        .iter()
+        .filter_map(|it| item_target_error(db, it).map(|e| (it.id, e)))
+        .collect()
+}
+
 /// Designer state: items of one app, immediate persistence.
 pub struct AppDesignState {
     pub app: String,
@@ -277,6 +331,116 @@ mod tests {
 
         delete_item(&db, its[1].id).unwrap();
         assert_eq!(items(&db, "crm").unwrap().len(), 1);
+    }
+
+    /// #45: menu targets are validated against the live catalog, per action
+    /// kind, so a broken one is caught (and named) before handoff.
+    #[test]
+    fn menu_targets_validate_against_the_catalog() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        store::ensure(&db).unwrap();
+        db.execute("CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO _phosphor_queries(name, sql_text) \
+             VALUES ('by city', 'SELECT * FROM customers')",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO _phosphor_reports(name, title, source_sql) \
+             VALUES ('aging', 'Aging', 'customers')",
+        )
+        .unwrap();
+
+        let mk = |kind: ActionKind, ref_: &str| AppItem {
+            id: 0,
+            label: String::new(),
+            kind,
+            action_ref: ref_.into(),
+            seq: 0,
+        };
+
+        // Valid targets resolve (table names are case-insensitive; a report
+        // may also name a table, matching start_report's fallback).
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Browse, "customers")),
+            None
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Browse, "CUSTOMERS")),
+            None
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Query, "by city")),
+            None
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Report, "aging")),
+            None
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Report, "customers")),
+            None
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Sql, "SELECT 1")),
+            None
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Script, "say('hi')")),
+            None
+        );
+
+        // Broken targets are named, per kind.
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Browse, "ghost")).as_deref(),
+            Some("no table named \"ghost\"")
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Query, "ghost")).as_deref(),
+            Some("no saved query named \"ghost\"")
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Report, "ghost")).as_deref(),
+            Some("no report or table named \"ghost\"")
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Sql, "  ")).as_deref(),
+            Some("empty SQL target")
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Script, "")).as_deref(),
+            Some("empty script target")
+        );
+
+        // The batch check names each broken item by id.
+        let its = vec![
+            AppItem {
+                id: 11,
+                label: "A".into(),
+                kind: ActionKind::Browse,
+                action_ref: "customers".into(),
+                seq: 1,
+            },
+            AppItem {
+                id: 12,
+                label: "B".into(),
+                kind: ActionKind::Query,
+                action_ref: "ghost".into(),
+                seq: 2,
+            },
+            AppItem {
+                id: 13,
+                label: "C".into(),
+                kind: ActionKind::Report,
+                action_ref: "aging".into(),
+                seq: 3,
+            },
+        ];
+        assert_eq!(
+            broken_targets_in(&its, &db),
+            vec![(12, "no saved query named \"ghost\"".into())]
+        );
     }
 
     /// #75: a query failure is propagated as an error, not mapped to an
