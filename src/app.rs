@@ -6076,9 +6076,44 @@ impl App {
         if !editable {
             return self.say("no unambiguous row identity; cannot delete from this grid");
         }
-        let idx = (g.cur_row - g.cache_start) as usize;
-        let Some(rowid) = g.rowids.as_ref().and_then(|r| r.get(idx)).copied() else {
-            return;
+        // The cursor can sit outside the cached window: a stale refill
+        // window installs while the user has scrolled on (#61). Resolve
+        // the rowid for the absolute row instead of giving up silently.
+        let cached = (g.cur_row - g.cache_start)
+            .try_into()
+            .ok()
+            .and_then(|i: usize| g.rowids.as_ref().and_then(|r| r.get(i)).copied());
+        let rowid = match cached {
+            Some(id) => id,
+            None => {
+                let found = match &g.source {
+                    GridSource::Detail {
+                        child,
+                        child_col,
+                        key_sql,
+                        ..
+                    } => {
+                        match Self::fetch_detail(
+                            self.db.link(),
+                            child,
+                            child_col,
+                            key_sql,
+                            g.cur_row,
+                        ) {
+                            Ok(data) => data.rowids.and_then(|r| r.into_iter().next()),
+                            Err(e) => return self.err(e),
+                        }
+                    }
+                    _ => match self.db.open_window(name, g.cur_row, 1) {
+                        Ok((page, _)) => page.rowids.and_then(|r| r.into_iter().next()),
+                        Err(e) => return self.err(e),
+                    },
+                };
+                match found {
+                    Some(id) => id,
+                    None => return self.say("that row is gone; press F5 to reposition"),
+                }
+            }
         };
         let table = name.clone();
         if self.pending_delete == Some((table.clone(), rowid)) {
@@ -9005,6 +9040,44 @@ mod tests {
         a.apply(Command::Refresh);
         a.sync();
         assert_eq!(a.grid.as_ref().unwrap().cur_row, 5);
+    }
+
+    /// #61: x must not silently no-op when the cursor is outside the
+    /// cached window (a stale refill window installing while the user
+    /// had scrolled on): the rowid is resolved for the absolute row,
+    /// both below and above the window.
+    #[test]
+    fn delete_resolves_rowid_outside_the_cached_window() {
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        // Cursor below the cached window (window covers the first rows,
+        // cursor is at 30 — as after a stale window installed late).
+        if let Some(g) = a.grid.as_mut() {
+            g.cur_row = 30;
+        }
+        a.apply(Command::DeleteRow);
+        a.sync();
+        let (msg, is_err) = a.status.clone().unwrap();
+        assert!(is_err, "{msg}");
+        assert!(msg.contains("rowid 31"), "row 30 is rowid 31: {msg}");
+        a.apply(Command::DeleteRow);
+        a.sync();
+        assert_eq!(a.grid.as_ref().unwrap().total, 499);
+
+        // Cursor above the cached window (the i64->usize wrap case).
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        if let Some(g) = a.grid.as_mut() {
+            g.cache_start = 30;
+            g.cur_row = 2;
+        }
+        a.apply(Command::DeleteRow);
+        a.sync();
+        let (msg, is_err) = a.status.clone().unwrap();
+        assert!(is_err, "{msg}");
+        assert!(msg.contains("rowid 3"), "row 2 is rowid 3: {msg}");
     }
 
     #[test]
