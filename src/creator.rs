@@ -161,6 +161,23 @@ pub fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// #51: the DEFAULT/REFERENCES renderers pass text through as SQL
+/// (parenthesized expressions, CURRENT_*, quoted identifiers), which
+/// is a multi-statement injection hole: `DEFAULT (1)); DROP TABLE x; --`
+/// would run the DROP in execute_batch before the trailing fragment
+/// errors. Anything the designer assembles for execution must be
+/// exactly one statement.
+fn single_statement(sql: &str, what: &str) -> DbResult<()> {
+    match crate::sql::split(sql) {
+        Ok(parts) if parts.len() == 1 => Ok(()),
+        Ok(parts) => Err(format!(
+            "{what} would run {} statements — a DEFAULT or REFERENCES value smuggles extra SQL",
+            parts.len()
+        )),
+        Err(e) => Err(format!("{what} is not one valid SQL statement ({e})")),
+    }
+}
+
 /// Render a DEFAULT clause value: numbers, NULL, CURRENT_* and
 /// parenthesized expressions pass through; everything else is quoted.
 fn default_sql(raw: &str) -> String {
@@ -486,6 +503,9 @@ impl TableDraft {
         let mut out = alter_lines;
         out.extend(add_lines);
         out.extend(drop_lines);
+        for stmt in &out {
+            single_statement(stmt, "a table change")?;
+        }
         Ok(out)
     }
 
@@ -505,6 +525,7 @@ impl TableDraft {
                 return Err(format!("duplicate field name {:?}", f.name));
             }
         }
+        single_statement(&self.sql(), "the CREATE TABLE")?;
         Ok(())
     }
 
@@ -891,5 +912,99 @@ mod tests {
         let q = db.query("SELECT rank FROM crew").unwrap();
         assert_eq!(q.rows[0][0], crate::db::PValue::Text("ensign".into()));
         assert!(db.has_rowid("crew"));
+    }
+
+    /// #51: DEFAULT/REFERENCES text that smuggles a second statement
+    /// into the assembled DDL must be refused before any SQL runs —
+    /// every passthrough rule (parenthesized expression, CURRENT_
+    /// prefix, quoted REFERENCES target).
+    #[test]
+    fn designer_rejects_multistatement_injection() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute("CREATE TABLE keepme(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let keepme_gone = || {
+            db.query("SELECT count(*) FROM sqlite_master WHERE name = 'keepme'")
+                .unwrap()
+                .rows[0][0]
+                != crate::db::PValue::Int(1)
+        };
+
+        // Parenthesized-expression passthrough.
+        let mut d = TableDraft::new("pwn1");
+        let f = d.add_field();
+        d.fields[f].default = "(1)); DROP TABLE keepme; --)".into();
+        assert!(d.create(&db).is_err());
+        // CURRENT_ prefix passthrough.
+        let mut d = TableDraft::new("pwn2");
+        let f = d.add_field();
+        d.fields[f].default = "CURRENT_TIMESTAMP; DROP TABLE keepme; --".into();
+        assert!(d.create(&db).is_err());
+        // Quoted REFERENCES passthrough.
+        let mut d = TableDraft::new("pwn3");
+        let f = d.add_field();
+        d.fields[f].references = "\"keepme\"); DROP TABLE keepme; --\"".into();
+        assert!(d.create(&db).is_err());
+        assert!(!keepme_gone(), "the injected DROP must not run");
+
+        // The TABLE EDITOR path (compiled ALTERs) is gated too.
+        db.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let sch = EditorSchema {
+            table: "parent".into(),
+            columns: db.columns("parent").unwrap(),
+            fks: Vec::new(),
+        };
+        let mut d = TableDraft::from_live(&sch);
+        let mut extra = FieldDef::new("evil", FType::Text);
+        extra.default = "(1)); DROP TABLE keepme; --)".into();
+        d.fields.push(extra);
+        assert!(d.apply_script(&sch).is_err());
+        assert!(!keepme_gone(), "the injected DROP must not run");
+    }
+
+    /// #51's other half: a semicolon INSIDE a quoted default is a
+    /// single statement and must keep working, on both paths.
+    #[test]
+    fn designer_allows_semicolons_inside_quoted_defaults() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        let mut d = TableDraft::new("ok_defaults");
+        let f = d.add_field();
+        d.fields[f].name = "s".into();
+        d.fields[f].default = "a;b".into(); // plain value -> 'a;b'
+        let g = d.add_field();
+        d.fields[g].name = "expr".into();
+        d.fields[g].default = "(lower('A;B'))".into();
+        d.create(&db).unwrap();
+        db.execute("INSERT INTO ok_defaults DEFAULT VALUES")
+            .unwrap();
+        let q = db.query("SELECT s, expr FROM ok_defaults").unwrap();
+        assert_eq!(
+            q.rows[0],
+            vec![
+                crate::db::PValue::Text("a;b".into()),
+                crate::db::PValue::Text("a;b".into()),
+            ]
+        );
+        // The TABLE EDITOR path compiles the same shape into ADD COLUMN:
+        // a quoted literal whose text contains a semicolon (a constant —
+        // ADD COLUMN forbids non-constant defaults, so no function calls).
+        let sch = EditorSchema {
+            table: "ok_defaults".into(),
+            columns: db.columns("ok_defaults").unwrap(),
+            fks: Vec::new(),
+        };
+        let mut d2 = TableDraft::from_live(&sch);
+        let mut extra = FieldDef::new("more", FType::Text);
+        extra.default = "x;y".into(); // -> 'x;y'
+        d2.fields.push(extra);
+        let lines = d2.apply_script(&sch).unwrap();
+        db.apply_schema_changes(&lines).unwrap();
+        db.execute("INSERT INTO ok_defaults DEFAULT VALUES")
+            .unwrap();
+        let q = db
+            .query("SELECT more FROM ok_defaults ORDER BY id DESC LIMIT 1")
+            .unwrap();
+        assert_eq!(q.rows[0][0], crate::db::PValue::Text("x;y".into()));
     }
 }
