@@ -82,6 +82,12 @@ pub struct DetailData {
     pub rows: Vec<Vec<PValue>>,
     pub rowids: Option<Vec<i64>>,
     pub total: i64,
+    /// The child table's persisted grid prefs (width JSON, freeze
+    /// count), fetched in the same job (#55): the pane re-fetches on
+    /// every master-cursor move, so the UI must not round-trip for
+    /// them again on arrival.
+    pub width_pref: Option<String>,
+    pub freeze_pref: Option<String>,
 }
 
 impl DbResponse {

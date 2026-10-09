@@ -151,6 +151,34 @@ pub fn pref_get(db: &dyn DbLink, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// `pref_get` for two keys in ONE query — callers that need both (grid
+/// pane prefs riding a worker job) avoid one round trip per key. Same
+/// semantics: missing table or empty value = None.
+pub fn pref_get_pair(db: &dyn DbLink, a: &str, b: &str) -> (Option<String>, Option<String>) {
+    let mut out = (None, None);
+    let list = format!("{}, {}", q(a), q(b));
+    if let Ok(qres) = db.query(&format!(
+        "SELECT key, value FROM _phosphor_prefs WHERE key IN ({list})"
+    )) {
+        for row in qres.rows {
+            let (Some(PValue::Text(k)), Some(PValue::Text(v))) =
+                (row.first().cloned(), row.get(1).cloned())
+            else {
+                continue;
+            };
+            if v.is_empty() {
+                continue;
+            }
+            if k == a {
+                out.0 = Some(v);
+            } else if k == b {
+                out.1 = Some(v);
+            }
+        }
+    }
+    out
+}
+
 pub fn ensure(db: &dyn DbLink) -> DbResult<()> {
     db.execute(DDL).map(|_| ())
 }
@@ -240,4 +268,28 @@ pub fn names(db: &dyn DbLink, table: &str, name_col: &str) -> Vec<String> {
     ))
     .map(|out| out.rows.into_iter().map(|r| text(r.first())).collect())
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::EmbeddedDb;
+
+    #[test]
+    fn pref_get_pair_reads_both_keys_in_one_query() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        // A database without the prefs table reads as all-None.
+        assert_eq!(
+            pref_get_pair(&db, "width:orders", "freeze:orders"),
+            (None, None)
+        );
+
+        pref_set(&db, "width:orders", r#"{"sku":30}"#);
+        pref_set(&db, "freeze:orders", "1");
+        assert_eq!(
+            pref_get_pair(&db, "width:orders", "freeze:orders"),
+            (Some(r#"{"sku":30}"#.into()), Some("1".into()))
+        );
+        assert_eq!(pref_get_pair(&db, "theme", "width:notes"), (None, None));
+    }
 }

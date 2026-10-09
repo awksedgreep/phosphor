@@ -1270,7 +1270,6 @@ impl App {
                         } => (parent.clone(), child.clone(), child_col.clone()),
                         _ => return,
                     };
-                    let child_for_prefs = child.clone();
                     state.grid.source = GridSource::Detail {
                         parent,
                         child,
@@ -1285,7 +1284,8 @@ impl App {
                     g.rowids = d.rowids;
                     g.cur_row = g.cur_row.clamp(0, g.total.saturating_sub(1).max(0));
                     g.row_off = g.row_off.min(g.cur_row);
-                    apply_width_prefs(g, &child_for_prefs, self.db.link());
+                    // #55: prefs came back with the rows — no round-trip.
+                    apply_width_prefs_from(g, d.width_pref.as_deref(), d.freeze_pref.as_deref());
                     g.compute_widths();
                     self.last_ms = Some(took.as_secs_f64() * 1000.0);
                 }
@@ -4618,11 +4618,17 @@ impl App {
             Some(PValue::Int(total)) => *total,
             _ => return Err("could not count related records".into()),
         };
+        // #55: the pane's width/freeze prefs ride along — the UI used to
+        // pay two blocking round-trips for them on every arrival.
+        let (width_pref, freeze_pref) =
+            crate::store::pref_get_pair(db, &format!("width:{child}"), &format!("freeze:{child}"));
         Ok(crate::worker::DetailData {
             columns: q.columns,
             rows: q.rows,
             rowids,
             total,
+            width_pref,
+            freeze_pref,
         })
     }
 
@@ -7124,8 +7130,16 @@ type EditValues = (String, bool, Option<String>, Vec<(String, PValue)>);
 /// Apply persisted column widths/freeze for `table` to a fresh Grid.
 /// Read-only path: a database without prefs keeps auto widths.
 fn apply_width_prefs(grid: &mut Grid, table: &str, db: &dyn DbLink) {
-    if let Some(s) = store::pref_get(db, &format!("width:{table}")) {
-        if let Ok(map) = serde_json::from_str::<HashMap<String, u16>>(&s) {
+    let (width, freeze) =
+        store::pref_get_pair(db, &format!("width:{table}"), &format!("freeze:{table}"));
+    apply_width_prefs_from(grid, width.as_deref(), freeze.as_deref());
+}
+
+/// The pref-less half of `apply_width_prefs`, for callers that already
+/// hold the pref strings (the detail pane rides them in its job, #55).
+fn apply_width_prefs_from(grid: &mut Grid, width_pref: Option<&str>, freeze_pref: Option<&str>) {
+    if let Some(s) = width_pref {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, u16>>(s) {
             for (name, w) in map {
                 if grid.columns.iter().any(|c| c == &name) {
                     grid.manual.insert(name, w.clamp(3, 80));
@@ -7133,9 +7147,7 @@ fn apply_width_prefs(grid: &mut Grid, table: &str, db: &dyn DbLink) {
             }
         }
     }
-    if let Some(n) =
-        store::pref_get(db, &format!("freeze:{table}")).and_then(|s| s.parse::<usize>().ok())
-    {
+    if let Some(n) = freeze_pref.and_then(|s| s.parse::<usize>().ok()) {
         grid.frozen = n.min(grid.columns.len());
         if grid.col_off < grid.frozen {
             grid.col_off = grid.frozen;
@@ -10472,6 +10484,46 @@ beta');",
         assert_eq!(child, "tracks");
         assert_eq!(key_sql, "'Kind of Blue'", "non-pk FK target, quoted text");
         assert_eq!(d.grid.total, 2, "both tracks of the album");
+    }
+
+    /// #55: the detail pane's width/freeze prefs ride back in the fetch
+    /// job itself — a master-cursor move re-fetches the pane, and the
+    /// layout must come back with the rows (no UI-thread round-trips).
+    #[test]
+    fn detail_pane_width_prefs_ride_the_fetch_job() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id), sku TEXT);
+             INSERT INTO customers VALUES (1, 'Ada'), (2, 'Grace');
+             INSERT INTO orders(customer_id, sku) VALUES (1, 'A1'), (1, 'A2'), (2, 'B1');",
+        )
+        .unwrap();
+        let mut a = App::new(Box::new(db), None);
+        a.apply(Command::OpenSelected);
+        a.sync();
+        a.visible_cols_width = 120;
+        a.apply(Command::ToggleSplit);
+        a.sync();
+        let child = match &a.detail.as_ref().unwrap().grid.source {
+            GridSource::Detail { child, .. } => child.clone(),
+            _ => panic!("no detail pane"),
+        };
+        // A custom layout on the child table — the shape resizing writes.
+        crate::store::pref_set(&a.db, &format!("width:{child}"), r#"{"sku":30}"#);
+        crate::store::pref_set(&a.db, &format!("freeze:{child}"), "1");
+
+        // Next customer: the pane re-fetches — layout included.
+        a.apply(Command::GridMove { dr: 1, dc: 0 });
+        a.sync();
+        let g = &a.detail.as_ref().unwrap().grid;
+        assert_eq!(g.total, 1, "Grace has one order");
+        assert_eq!(g.frozen, 1, "freeze pref applied from the job payload");
+        assert_eq!(
+            g.manual.get("sku").copied(),
+            Some(30),
+            "width pref applied from the job payload"
+        );
     }
 
     /// Three related tables: 'v' must visit ALL of them (fronted by
