@@ -507,6 +507,12 @@ pub enum Command {
     DesignerJoin,
     /// QBE: cycle the GROUP BY column on/off (`g`).
     DesignerGroup,
+    /// Apps: the type-aware target picker — filter, navigate, choose (#45).
+    TargetPickerChar(char),
+    TargetPickerBackspace,
+    TargetPickerMove(i64),
+    TargetPickerCommit,
+    TargetPickerCancel,
     PagerScroll(i64),
     PagerWrite,
     PagerPrint,
@@ -1920,6 +1926,20 @@ impl App {
             });
         }
         if let Overlay::Apps(st) = &self.overlay {
+            if st.target_picker.is_some() {
+                // The picker owns the keys: type filters, ↑↓ move,
+                // Enter chooses, Esc cancels (#45).
+                return Some(match key.code {
+                    Up | Char('k') => Command::TargetPickerMove(-1),
+                    Down | Char('j') => Command::TargetPickerMove(1),
+                    Esc => Command::TargetPickerCancel,
+                    Enter => Command::TargetPickerCommit,
+                    Backspace => Command::TargetPickerBackspace,
+                    // Any other letter filters — 'q' must type, not cancel.
+                    Char(c) => Command::TargetPickerChar(c),
+                    _ => return None,
+                });
+            }
             return Some(match (&st.editing, key.code) {
                 (None, PageUp) => Command::DesignerPage(-1),
                 (None, PageDown) => Command::DesignerPage(1),
@@ -2713,6 +2733,11 @@ impl App {
             Command::DesignerEditAlt => self.designer_edit_alt(),
             Command::DesignerEditMask => self.designer_edit_mask(),
             Command::DesignerEditComputed => self.designer_edit_computed(),
+            Command::TargetPickerChar(c) => self.target_picker_char(c),
+            Command::TargetPickerBackspace => self.target_picker_backspace(),
+            Command::TargetPickerMove(d) => self.target_picker_move(d),
+            Command::TargetPickerCommit => self.target_picker_commit(),
+            Command::TargetPickerCancel => self.target_picker_cancel(),
             Command::OpenForm(t) => self.open_form(t),
             Command::OpenTable(name) => self.open_table(&name),
             Command::OpenSavedQuery(name) => match QbeSpec::saved_sql(self.db.link(), &name) {
@@ -3671,10 +3696,26 @@ impl App {
         self.editor_fresh = true;
         match &mut self.overlay {
             Overlay::Apps(st) => {
-                if let Some(item) = st.items.get(st.cursor) {
-                    st.editing_ref = true;
-                    st.renaming_app = false;
-                    st.editing = Some(item.action_ref.clone());
+                let (kind, idx, ref_text) = match st.items.get(st.cursor) {
+                    Some(item) => (item.kind, st.cursor, item.action_ref.clone()),
+                    None => return,
+                };
+                match kind {
+                    // Catalog-backed kinds: choose from the live catalog
+                    // instead of remembering a name (#45).
+                    ActionKind::Browse | ActionKind::Query | ActionKind::Report => {
+                        st.editing = None;
+                        st.editing_ref = false;
+                        st.renaming_app = false;
+                        st.target_picker =
+                            Some(appsgen::TargetPickerState::open(kind, self.db.link(), idx));
+                    }
+                    // Raw SQL / Lua: keep the inline text buffer.
+                    ActionKind::Sql | ActionKind::Script => {
+                        st.editing_ref = true;
+                        st.renaming_app = false;
+                        st.editing = Some(ref_text);
+                    }
                 }
             }
             Overlay::Create(st) => {
@@ -3710,6 +3751,75 @@ impl App {
                 st.editing_mask = false;
                 st.editing = Some(f.computed.clone());
             }
+        }
+    }
+
+    // ── the type-aware target picker (Apps) ──────────────────────────
+    // Choosing a menu target is a pick from the catalog, not a recollection
+    // of a name (#45). Type filters, ↑↓ move, Enter chooses, Esc cancels.
+
+    fn target_picker_char(&mut self, c: char) {
+        if let Overlay::Apps(st) = &mut self.overlay {
+            if let Some(p) = st.target_picker.as_mut() {
+                p.search.push(c);
+                p.cursor = 0;
+            }
+        }
+    }
+
+    fn target_picker_backspace(&mut self) {
+        if let Overlay::Apps(st) = &mut self.overlay {
+            if let Some(p) = st.target_picker.as_mut() {
+                p.search.pop();
+                p.cursor = 0;
+            }
+        }
+    }
+
+    fn target_picker_move(&mut self, d: i64) {
+        if let Overlay::Apps(st) = &mut self.overlay {
+            let Some(p) = st.target_picker.as_mut() else {
+                return;
+            };
+            let n = p.options().len();
+            if n == 0 {
+                return;
+            }
+            p.cursor = ((p.cursor as i64 + d).rem_euclid(n as i64)) as usize;
+        }
+    }
+
+    fn target_picker_commit(&mut self) {
+        let choice = {
+            let st = match &self.overlay {
+                Overlay::Apps(st) => st,
+                _ => return,
+            };
+            let p = match &st.target_picker {
+                Some(p) => p,
+                None => return,
+            };
+            p.options().get(p.cursor).cloned()
+        };
+        let index = match &self.overlay {
+            Overlay::Apps(st) => st.target_picker.as_ref().map(|p| p.item_index),
+            _ => None,
+        };
+        if let Overlay::Apps(st) = &mut self.overlay {
+            st.target_picker = None;
+            if let (Some(choice), Some(index)) = (choice, index) {
+                if let Some(item) = st.items.get_mut(index) {
+                    item.action_ref = choice;
+                    let item = item.clone();
+                    let _ = appsgen::update_item(self.db.link(), &item);
+                }
+            }
+        }
+    }
+
+    fn target_picker_cancel(&mut self) {
+        if let Overlay::Apps(st) = &mut self.overlay {
+            st.target_picker = None;
         }
     }
 
@@ -4477,6 +4587,7 @@ impl App {
             editing: None,
             editing_ref: false,
             renaming_app: false,
+            target_picker: None,
         });
     }
 
@@ -10726,11 +10837,10 @@ beta');",
             st.editing = Some("Rows".into());
         }
         a.apply(Command::DesignerCommit);
+        // `e` opens the type-aware target picker; the catalog is ["t"], so
+        // choosing picks it (no name remembered — #45).
         a.apply(Command::DesignerEditAlt);
-        if let Overlay::Apps(st) = &mut a.overlay {
-            st.editing = Some("t".into());
-        }
-        a.apply(Command::DesignerCommit);
+        a.apply(Command::TargetPickerCommit);
         // F2: designer → live menu.
         a.apply(Command::DesignerRun);
         assert!(matches!(a.overlay, Overlay::AppMenu(_)));
@@ -12015,25 +12125,40 @@ beta');",
         );
     }
 
-    /// #45: committing a target in the designer checks it against the live
-    /// catalog and names it if it can't resolve.
+    /// #45: `e` on a Browse item opens the type-aware target picker — the
+    /// target is chosen from the catalog (type filters, Enter chooses), not
+    /// typed. A no-match filter is a no-op; the chosen name is saved.
     #[test]
-    fn designer_names_a_broken_target_on_commit() {
+    fn designer_picks_a_target_from_the_catalog() {
         let mut a = app();
         a.apply(Command::OpenApps(Some("crm".into())));
-        a.apply(Command::DesignerAdd);
-        a.apply(Command::DesignerEditAlt); // begin editing the action_ref
-        for c in "ghost".chars() {
-            a.apply(Command::DesignerChar(c));
+        a.apply(Command::DesignerAdd); // new Browse item, empty target
+        a.apply(Command::DesignerEditAlt); // opens the picker (catalog = ["t"])
+
+        // Typing a non-matching filter changes nothing; committing it is a no-op.
+        for c in "zzz".chars() {
+            a.apply(Command::TargetPickerChar(c));
         }
-        a.apply(Command::DesignerCommit);
-        let (msg, is_err) = a.status.as_ref().expect("a warning must be shown").clone();
-        assert!(
-            !is_err,
-            "a broken target is a warning, not an error: {msg:?}"
+        a.apply(Command::TargetPickerCommit);
+        a.sync();
+        let items = appsgen::items(a.db.link(), "crm").unwrap();
+        assert_eq!(
+            items[0].action_ref, "",
+            "a no-match filter must not touch the target"
         );
-        assert!(msg.contains("target doesn't resolve"), "{msg:?}");
-        assert!(msg.contains("no table named \"ghost\""), "{msg:?}");
+
+        // Reopen, filter to the table, and choose it.
+        a.apply(Command::DesignerEditAlt);
+        a.apply(Command::TargetPickerChar('t'));
+        a.apply(Command::TargetPickerCommit);
+        a.sync();
+        let items = appsgen::items(a.db.link(), "crm").unwrap();
+        assert_eq!(
+            items[0].action_ref, "t",
+            "the chosen catalog name becomes the target"
+        );
+        let is_err = a.status.as_ref().map(|(_, e)| *e).unwrap_or(false);
+        assert!(!is_err, "choosing a catalog target must not error");
     }
 
     #[test]

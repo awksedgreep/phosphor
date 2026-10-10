@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use std::borrow::Cow;
 
 use crate::app::{App, DetailState, Focus, Grid, GridSource, Overlay, ScriptTarget};
+use crate::appsgen::{ActionKind, AppDesignState, TargetPickerState};
 use crate::db::{DbLink, PValue};
 
 #[derive(Default)]
@@ -900,6 +901,11 @@ fn draw_apps(f: &mut Frame, app: &mut App) {
     let Overlay::Apps(st) = &app.overlay else {
         return;
     };
+    // The type-aware target picker replaces the item list while open (#45).
+    if let Some(p) = &st.target_picker {
+        draw_target_picker(f, th, st, p, &mut app.viewports.apps);
+        return;
+    }
     let area = centered(
         dialog_area(f.area()),
         72,
@@ -972,6 +978,63 @@ fn draw_apps(f: &mut Frame, app: &mut App) {
         if st.renaming_app { 0 } else { st.cursor + 1 },
         &mut app.viewports.apps,
     );
+}
+
+/// The type-aware target picker: a searchable name list for choosing a
+/// menu item's target from the live catalog (#45).
+fn draw_target_picker(
+    f: &mut Frame,
+    th: &crate::theme::Theme,
+    st: &AppDesignState,
+    p: &TargetPickerState,
+    viewport: &mut Scroll,
+) {
+    let what = match p.kind {
+        ActionKind::Browse => "TABLE",
+        ActionKind::Query => "SAVED QUERY",
+        ActionKind::Report => "REPORT OR TABLE",
+        _ => "TARGET",
+    };
+    let label = st
+        .items
+        .get(p.item_index)
+        .map(|i| i.label.as_str())
+        .unwrap_or("target");
+    let options = p.options();
+    let height = ((options.len() as u16).min(10) + 6)
+        .max(9)
+        .min(f.area().height);
+    let area = centered(dialog_area(f.area()), 44, height);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" CHOOSE {what} · {label} "),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " type filters · ↑↓ · Enter choose · Esc ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled("filter: ", th.dim()),
+        Span::styled(p.search.clone(), th.bright()),
+    ])];
+    if options.is_empty() {
+        lines.push(Line::styled("  (no matches)", th.dim()));
+    } else {
+        for (i, name) in options.iter().enumerate() {
+            let selected = i == p.cursor;
+            let style = if selected { th.cursor() } else { th.base() };
+            lines.push(Line::from(vec![Span::styled(format!("  {name}"), style)]));
+        }
+    }
+    draw_rows(f, inner, lines, 1, p.cursor + 1, viewport);
 }
 
 fn draw_app_menu(f: &mut Frame, app: &mut App) {

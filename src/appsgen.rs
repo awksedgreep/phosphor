@@ -263,6 +263,74 @@ pub fn broken_targets_in(items: &[AppItem], db: &dyn DbLink) -> Vec<(i64, String
         .collect()
 }
 
+fn table_names(db: &dyn DbLink) -> Vec<String> {
+    db.tables()
+        .map(|ts| {
+            ts.into_iter()
+                .filter(|t| !crate::app::App::is_internal(t))
+                .map(|t| t.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The catalog a menu-item target can name, per its kind — what the
+/// type-aware picker lists so a target is chosen, not remembered (#45).
+fn target_options(kind: ActionKind, db: &dyn DbLink) -> Vec<String> {
+    match kind {
+        ActionKind::Browse => table_names(db),
+        ActionKind::Query => store::names(db, "_phosphor_queries", "name"),
+        ActionKind::Report => {
+            let mut v = store::names(db, "_phosphor_reports", "name");
+            for t in table_names(db) {
+                if !v.iter().any(|r| r.eq_ignore_ascii_case(&t)) {
+                    v.push(t);
+                }
+            }
+            v
+        }
+        ActionKind::Sql | ActionKind::Script => Vec::new(),
+    }
+}
+
+/// A searchable, in-memory name picker for choosing a menu-item target
+/// (Browse→tables, Query→saved queries, Report→saved reports or tables).
+pub struct TargetPickerState {
+    pub kind: ActionKind,
+    pub all: Vec<String>,
+    pub search: String,
+    pub cursor: usize,
+    /// Index of the item being edited, into `AppDesignState::items`.
+    pub item_index: usize,
+}
+
+impl TargetPickerState {
+    pub fn open(kind: ActionKind, db: &dyn DbLink, item_index: usize) -> Self {
+        let all = target_options(kind, db);
+        TargetPickerState {
+            kind,
+            all,
+            search: String::new(),
+            cursor: 0,
+            item_index,
+        }
+    }
+
+    /// The catalog filtered by the current search text (case-insensitive).
+    pub fn options(&self) -> Vec<String> {
+        let s = self.search.to_lowercase();
+        if s.is_empty() {
+            self.all.clone()
+        } else {
+            self.all
+                .iter()
+                .filter(|o| o.to_lowercase().contains(&s))
+                .cloned()
+                .collect()
+        }
+    }
+}
+
 /// Designer state: items of one app, immediate persistence.
 pub struct AppDesignState {
     pub app: String,
@@ -273,6 +341,8 @@ pub struct AppDesignState {
     pub editing_ref: bool,
     /// true → the buffer edits the app's name (`r`).
     pub renaming_app: bool,
+    /// Some → the type-aware target picker is open for `item_index` (#45).
+    pub target_picker: Option<TargetPickerState>,
 }
 
 /// Runtime state: the menu end users drive.
@@ -440,6 +510,28 @@ mod tests {
         assert_eq!(
             broken_targets_in(&its, &db),
             vec![(12, "no saved query named \"ghost\"".into())]
+        );
+    }
+
+    /// #45: the Browse/Report target picker lists only user tables —
+    /// phosphor's own catalog and engine shadow tables stay out of the list.
+    #[test]
+    fn target_options_hides_internal_tables() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        db.execute(
+            "CREATE TABLE orders(a INTEGER); \
+             CREATE TABLE _phosphor_queries(name TEXT); \
+             CREATE TABLE _chunks(x INT);",
+        )
+        .unwrap();
+        let browse = target_options(ActionKind::Browse, &db);
+        assert!(
+            browse.iter().any(|n| n == "orders"),
+            "user table listed: {browse:?}"
+        );
+        assert!(
+            browse.iter().all(|n| !n.starts_with('_')),
+            "internal tables hidden: {browse:?}"
         );
     }
 
