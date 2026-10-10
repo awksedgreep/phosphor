@@ -8,7 +8,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::appsgen::{self, ActionKind, AppDesignState, AppItem, AppMenuState};
+use crate::appsgen::{
+    self, ActionKind, AppDesignState, AppItem, AppMenuState, AssetBrowserState, AssetEntry,
+    AssetKind,
+};
 use crate::creator::CreateState;
 use crate::db::{ColumnInfo, DbLink, DbResult, PValue, TableInfo};
 use crate::forms::{
@@ -53,6 +56,9 @@ pub enum Overlay {
     Create(CreateState),
     Apps(AppDesignState),
     AppMenu(AppMenuState),
+    /// The saved-asset catalog: find / preview / edit queries, reports,
+    /// forms, and apps (#45).
+    Assets(AssetBrowserState),
     /// The multi-line Lua editor for a form lifecycle script.
     ScriptEditor(ScriptState),
 }
@@ -544,6 +550,17 @@ pub enum Command {
     ScriptSave,
     OpenApps(Option<String>),
     OpenAppMenu(Option<String>),
+    /// Open the saved-asset catalog browser (#45).
+    OpenAssets,
+    AssetFilter(char),
+    AssetBackspace,
+    AssetMove(i64),
+    /// Restrict the browser to a kind; None lists every kind (#45).
+    AssetType(Option<AssetKind>),
+    /// Enter: preview the selected asset (run / render / open) (#45).
+    AssetRun,
+    /// `e`: open the selected asset's designer (#45).
+    AssetEdit,
     OpenInsert,
     /// Flip the EDIT form to the previous/next RECORD (dBASE paging).
     EditPage(i64),
@@ -1979,6 +1996,25 @@ impl App {
                 _ => return None,
             });
         }
+        if matches!(self.overlay, Overlay::Assets(_)) {
+            return Some(match key.code {
+                Esc => Command::Back,
+                Up | Char('k') => Command::AssetMove(-1),
+                Down | Char('j') => Command::AssetMove(1),
+                PageUp => Command::AssetMove(-10),
+                PageDown => Command::AssetMove(10),
+                Enter => Command::AssetRun,
+                Char('e') => Command::AssetEdit,
+                Char('1') => Command::AssetType(Some(AssetKind::Query)),
+                Char('2') => Command::AssetType(Some(AssetKind::Report)),
+                Char('3') => Command::AssetType(Some(AssetKind::Form)),
+                Char('4') => Command::AssetType(Some(AssetKind::App)),
+                Char('0') => Command::AssetType(None),
+                Backspace => Command::AssetBackspace,
+                Char(c) => Command::AssetFilter(c),
+                _ => return None,
+            });
+        }
         if key.code == F(10) {
             return Some(Command::OpenHealth);
         }
@@ -2022,6 +2058,7 @@ impl App {
                 Char('L') => Command::OpenLabels(None),
                 Char('F') => Command::OpenForm(None),
                 Char('A') => Command::OpenApps(None),
+                Char('S') => Command::OpenAssets,
                 Char('C') => Command::OpenCreate(None),
                 Char('.') => Command::Focus(Focus::Prompt),
                 Tab => {
@@ -2068,6 +2105,7 @@ impl App {
                 Char('L') => Command::OpenLabels(None),
                 Char('F') => Command::OpenForm(None),
                 Char('A') => Command::OpenApps(None),
+                Char('S') => Command::OpenAssets,
                 Char('.') => Command::Focus(Focus::Prompt),
                 // Tab bounces between the linked panes when split is
                 // open; otherwise it heads for the dot prompt.
@@ -2762,6 +2800,13 @@ impl App {
             Command::ScriptSave => self.script_save(),
             Command::OpenApps(name) => self.open_apps(name),
             Command::OpenAppMenu(name) => self.open_app_menu(name),
+            Command::OpenAssets => self.open_assets(),
+            Command::AssetFilter(c) => self.asset_filter(c),
+            Command::AssetBackspace => self.asset_backspace(),
+            Command::AssetMove(d) => self.asset_move(d),
+            Command::AssetType(k) => self.asset_type(k),
+            Command::AssetRun => self.asset_run(),
+            Command::AssetEdit => self.asset_edit(),
             Command::OpenInsert => self.open_insert(),
             Command::EditPage(d) => self.edit_page(d),
             Command::DeleteRow => self.delete_row(),
@@ -2933,7 +2978,8 @@ impl App {
             | Overlay::Form(_)
             | Overlay::Apps(_)
             | Overlay::Create(_)
-            | Overlay::AppMenu(_) => self.overlay = Overlay::None,
+            | Overlay::AppMenu(_)
+            | Overlay::Assets(_) => self.overlay = Overlay::None,
             Overlay::None => match self.focus {
                 Focus::Prompt => {
                     self.focus = if self.grid.is_some() {
@@ -3047,7 +3093,7 @@ impl App {
             Overlay::Qbe(_) => "qbe",
             Overlay::Report(_) | Overlay::Pager(_) => "reports",
             Overlay::Form(_) | Overlay::Paint(_) => "forms",
-            Overlay::Apps(_) | Overlay::AppMenu(_) => "apps",
+            Overlay::Apps(_) | Overlay::AppMenu(_) | Overlay::Assets(_) => "apps",
             Overlay::Create(_) => "browse",
             Overlay::ScriptEditor(_) => "script",
             Overlay::Help(_) => return,
@@ -4631,6 +4677,88 @@ impl App {
             items,
             cursor: 0,
         });
+    }
+
+    // ── the saved-asset catalog (#45) ────────────────────────────────
+    // Find / preview / edit every saved asset after a restart, without
+    // remembering names or typing SQL.
+
+    fn open_assets(&mut self) {
+        self.overlay = Overlay::Assets(AssetBrowserState::open(self.db.link()));
+    }
+
+    fn asset_selected(&self) -> Option<AssetEntry> {
+        let st = match &self.overlay {
+            Overlay::Assets(st) => st,
+            _ => return None,
+        };
+        st.entries().get(st.cursor).cloned()
+    }
+
+    fn asset_filter(&mut self, c: char) {
+        if let Overlay::Assets(st) = &mut self.overlay {
+            st.search.push(c);
+            st.cursor = 0;
+        }
+    }
+
+    fn asset_backspace(&mut self) {
+        if let Overlay::Assets(st) = &mut self.overlay {
+            st.search.pop();
+            st.cursor = 0;
+        }
+    }
+
+    fn asset_move(&mut self, d: i64) {
+        if let Overlay::Assets(st) = &mut self.overlay {
+            let n = st.entries().len();
+            if n == 0 {
+                return;
+            }
+            st.cursor = ((st.cursor as i64 + d).rem_euclid(n as i64)) as usize;
+        }
+    }
+
+    fn asset_type(&mut self, kind: Option<AssetKind>) {
+        if let Overlay::Assets(st) = &mut self.overlay {
+            st.only = kind;
+            st.cursor = 0;
+        }
+    }
+
+    /// Enter: preview the selected asset — run a query, render a report,
+    /// open a form, or open an app's menu (#45).
+    fn asset_run(&mut self) {
+        let Some(e) = self.asset_selected() else {
+            return self.err("no saved asset selected (S to list them)");
+        };
+        match e.kind {
+            AssetKind::Query => match QbeSpec::saved_sql(self.db.link(), &e.name) {
+                Some(sql) => {
+                    // Leave the browser; the grid fills in on arrival.
+                    self.overlay = Overlay::None;
+                    self.focus = Focus::Grid;
+                    self.run_select(&sql);
+                }
+                None => self.err(format!("no runnable SQL for query {:?}", e.name)),
+            },
+            AssetKind::Report => self.start_report(None, e.name),
+            AssetKind::Form => self.open_form(Some(e.name)),
+            AssetKind::App => self.open_app_menu(Some(e.name)),
+        }
+    }
+
+    /// `e`: open the selected asset's designer for editing (#45).
+    fn asset_edit(&mut self) {
+        let Some(e) = self.asset_selected() else {
+            return self.err("no saved asset selected (S to list them)");
+        };
+        match e.kind {
+            AssetKind::Query => self.open_qbe(Some(e.name)),
+            AssetKind::Report => self.open_report(Some(e.name)),
+            AssetKind::Form => self.open_form(Some(e.name)),
+            AssetKind::App => self.open_apps(Some(e.name)),
+        }
     }
 
     /// Run a SELECT into the query grid (shared by prompt + QBE + apps).
@@ -12159,6 +12287,101 @@ beta');",
         );
         let is_err = a.status.as_ref().map(|(_, e)| *e).unwrap_or(false);
         assert!(!is_err, "choosing a catalog target must not error");
+    }
+
+    /// #45: the saved-asset catalog lists every query, report, form, and
+    /// app after a restart — find them without remembering names or SQL.
+    #[test]
+    fn asset_browser_lists_each_saved_asset() {
+        let mut a = app();
+        crate::store::ensure(a.db.link()).unwrap();
+        a.db.execute(
+            "INSERT INTO _phosphor_queries(name, sql_text) \
+             VALUES ('big', 'SELECT * FROM t')",
+        )
+        .unwrap();
+        a.db.execute(
+            "INSERT INTO _phosphor_reports(name, title, source_sql) \
+             VALUES ('aging', 'Aging', 't')",
+        )
+        .unwrap();
+        a.db.execute(
+            "INSERT INTO _phosphor_forms(table_ref, layout_json) \
+             VALUES ('t', '{}')",
+        )
+        .unwrap();
+        appsgen::ensure_app(a.db.link(), "crm").unwrap();
+
+        a.apply(Command::OpenAssets);
+        let Overlay::Assets(st) = &a.overlay else {
+            panic!("asset browser did not open")
+        };
+        let e = st.entries();
+        assert!(e
+            .iter()
+            .any(|x| x.kind == AssetKind::Query && x.name == "big"));
+        assert!(e
+            .iter()
+            .any(|x| x.kind == AssetKind::Report && x.name == "aging"));
+        assert!(e.iter().any(|x| x.kind == AssetKind::Form && x.name == "t"));
+        assert!(e
+            .iter()
+            .any(|x| x.kind == AssetKind::App && x.name == "crm"));
+    }
+
+    /// #45: the catalog narrows by kind (1-4) and by typed search text.
+    #[test]
+    fn asset_browser_filters_by_kind_and_text() {
+        let mut a = app();
+        crate::store::ensure(a.db.link()).unwrap();
+        a.db.execute(
+            "INSERT INTO _phosphor_queries(name, sql_text) \
+             VALUES ('big', 'SELECT 1'), ('tiny', 'SELECT 1')",
+        )
+        .unwrap();
+        appsgen::ensure_app(a.db.link(), "crm").unwrap();
+
+        a.apply(Command::OpenAssets);
+        a.apply(Command::AssetType(Some(AssetKind::Query))); // 1 = queries only
+        let Overlay::Assets(st) = &a.overlay else {
+            panic!()
+        };
+        let e = st.entries();
+        assert!(e.iter().all(|x| x.kind == AssetKind::Query), "{e:?}");
+        assert_eq!(e.len(), 2, "{e:?}");
+        a.apply(Command::AssetFilter('t')); // narrow to the matching name
+        let Overlay::Assets(st) = &a.overlay else {
+            panic!()
+        };
+        assert_eq!(
+            st.entries(),
+            vec![AssetEntry {
+                kind: AssetKind::Query,
+                name: "tiny".into()
+            }]
+        );
+    }
+
+    /// #45: previewing a saved query from the catalog runs it into the grid
+    /// with no SQL typed.
+    #[test]
+    fn asset_browser_preview_runs_a_saved_query() {
+        let mut a = app();
+        crate::store::ensure(a.db.link()).unwrap();
+        a.db.execute(
+            "INSERT INTO _phosphor_queries(name, sql_text) \
+             VALUES ('all', 'SELECT * FROM t')",
+        )
+        .unwrap();
+
+        a.apply(Command::OpenAssets);
+        a.apply(Command::AssetRun); // the single query, at the top
+        a.sync();
+        assert!(
+            matches!(a.overlay, Overlay::None),
+            "previewing must close the browser to show the grid"
+        );
+        assert_eq!(a.grid.as_ref().unwrap().total, 500);
     }
 
     #[test]

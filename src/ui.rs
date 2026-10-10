@@ -216,6 +216,7 @@ pub fn draw(f: &mut Frame, app: &mut App) -> bool {
         Overlay::Paint(_) => draw_paint(f, app),
         Overlay::Apps(_) => draw_apps(f, app),
         Overlay::AppMenu(_) => draw_app_menu(f, app),
+        Overlay::Assets(_) => draw_assets(f, app),
         Overlay::Create(_) => draw_create(f, app),
         Overlay::ScriptEditor(_) => draw_script_editor(f, app),
         Overlay::None => {}
@@ -1090,6 +1091,60 @@ fn draw_app_menu(f: &mut Frame, app: &mut App) {
         st.cursor * 2 + 1,
         &mut app.viewports.menu,
     );
+}
+
+/// The saved-asset catalog (#45): every query, report, form, and app, each
+/// previewable (Enter) and editable (`e`) without remembered names or SQL.
+fn draw_assets(f: &mut Frame, app: &mut App) {
+    let th = app.theme;
+    let Overlay::Assets(st) = &app.overlay else {
+        return;
+    };
+    let entries = st.entries();
+    let height = ((entries.len() as u16).min(14) + 6)
+        .max(10)
+        .min(f.area().height);
+    let area = centered(dialog_area(f.area()), 52, height);
+    f.render_widget(Clear, area);
+    let scope = match st.only {
+        None => "ALL".to_owned(),
+        Some(k) => k.as_str().to_owned(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(th.bright())
+        .style(th.base())
+        .title(Span::styled(
+            format!(" SAVED ASSETS · {scope} "),
+            th.bright(),
+        ))
+        .title_bottom(Line::styled(
+            " type filters · 1-4 kind · 0 all · Enter preview · e edit · Esc ",
+            th.dim(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled("filter: ", th.dim()),
+        Span::styled(st.search.clone(), th.bright()),
+    ])];
+    if entries.is_empty() {
+        lines.push(Line::styled(
+            "  (no saved assets yet — Q, R, F, A craft them)",
+            th.dim(),
+        ));
+    } else {
+        for (i, e) in entries.iter().enumerate() {
+            let selected = i == st.cursor;
+            let style = if selected { th.cursor() } else { th.base() };
+            lines.push(Line::from(vec![
+                Span::styled(pad(e.kind.as_str(), 9), style),
+                Span::styled(format!("  {}", e.name), style),
+            ]));
+        }
+    }
+    draw_rows(f, inner, lines, 1, st.cursor + 1, &mut app.viewports.apps);
 }
 
 /// The editing cell: buffer + caret, PADDED to the column width so the

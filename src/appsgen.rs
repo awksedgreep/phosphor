@@ -353,6 +353,96 @@ pub struct AppMenuState {
     pub cursor: usize,
 }
 
+/// The four saved-asset kinds the catalog browser lists (#45).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetKind {
+    Query,
+    Report,
+    Form,
+    App,
+}
+
+impl AssetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AssetKind::Query => "QUERY",
+            AssetKind::Report => "REPORT",
+            AssetKind::Form => "FORM",
+            AssetKind::App => "APP",
+        }
+    }
+}
+
+/// One saved asset in the catalog browser (#45).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetEntry {
+    pub kind: AssetKind,
+    pub name: String,
+}
+
+/// The saved-asset catalog: every query, report, form, and app, so each can
+/// be found, previewed, and edited after a restart without remembered names
+/// or SQL (#45).
+pub struct AssetBrowserState {
+    pub all: Vec<AssetEntry>,
+    pub cursor: usize,
+    pub search: String,
+    /// Type filter; None lists every kind.
+    pub only: Option<AssetKind>,
+}
+
+impl AssetBrowserState {
+    pub fn open(db: &dyn DbLink) -> Self {
+        let mut all: Vec<AssetEntry> = Vec::new();
+        for n in store::names(db, "_phosphor_queries", "name") {
+            all.push(AssetEntry {
+                kind: AssetKind::Query,
+                name: n,
+            });
+        }
+        for n in store::names(db, "_phosphor_reports", "name") {
+            all.push(AssetEntry {
+                kind: AssetKind::Report,
+                name: n,
+            });
+        }
+        for n in store::names(db, "_phosphor_forms", "table_ref") {
+            all.push(AssetEntry {
+                kind: AssetKind::Form,
+                name: n,
+            });
+        }
+        for n in list_apps(db) {
+            all.push(AssetEntry {
+                kind: AssetKind::App,
+                name: n,
+            });
+        }
+        all.sort_by(|a, b| {
+            (a.kind as u8, a.name.to_lowercase()).cmp(&(b.kind as u8, b.name.to_lowercase()))
+        });
+        AssetBrowserState {
+            all,
+            cursor: 0,
+            search: String::new(),
+            only: None,
+        }
+    }
+
+    /// The visible entries after the type filter and search text.
+    pub fn entries(&self) -> Vec<AssetEntry> {
+        let s = self.search.to_lowercase();
+        self.all
+            .iter()
+            .filter(|e| {
+                (self.only.is_none() || self.only == Some(e.kind))
+                    && (s.is_empty() || e.name.to_lowercase().contains(&s))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
