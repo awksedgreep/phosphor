@@ -991,7 +991,7 @@ fn draw_target_picker(
     viewport: &mut Scroll,
 ) {
     let what = match p.kind {
-        ActionKind::Browse => "TABLE",
+        ActionKind::Browse | ActionKind::Form | ActionKind::NewRecord => "TABLE",
         ActionKind::Query => "SAVED QUERY",
         ActionKind::Report => "REPORT OR TABLE",
         _ => "TARGET",

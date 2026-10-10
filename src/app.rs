@@ -3749,7 +3749,11 @@ impl App {
                 match kind {
                     // Catalog-backed kinds: choose from the live catalog
                     // instead of remembering a name (#45).
-                    ActionKind::Browse | ActionKind::Query | ActionKind::Report => {
+                    ActionKind::Browse
+                    | ActionKind::Query
+                    | ActionKind::Report
+                    | ActionKind::Form
+                    | ActionKind::NewRecord => {
                         st.editing = None;
                         st.editing_ref = false;
                         st.renaming_app = false;
@@ -4256,6 +4260,24 @@ impl App {
                     return self.err(e);
                 }
                 self.start_report(None, item.action_ref.clone());
+            }
+            ActionKind::Form => {
+                if let Some(e) = appsgen::item_target_error(self.db.link(), item) {
+                    return self.err(e);
+                }
+                self.overlay = Overlay::None;
+                self.open_form(Some(item.action_ref.clone()));
+            }
+            ActionKind::NewRecord => {
+                if let Some(e) = appsgen::item_target_error(self.db.link(), item) {
+                    return self.err(e);
+                }
+                if self.readonly {
+                    self.err("read-only mode: this action inserts a record");
+                } else {
+                    self.overlay = Overlay::None;
+                    self.open_insert_form(item.action_ref.clone(), None);
+                }
             }
             ActionKind::Sql => {
                 if self.readonly {
@@ -12382,6 +12404,49 @@ beta');",
             "previewing must close the browser to show the grid"
         );
         assert_eq!(a.grid.as_ref().unwrap().total, 500);
+    }
+
+    /// #45: a declarative `form` menu action opens the crafted form for its
+    /// table target.
+    #[test]
+    fn form_menu_action_opens_the_crafted_form() {
+        let mut a = app();
+        appsgen::ensure_app(a.db.link(), "demo").unwrap();
+        appsgen::add_item(a.db.link(), "demo", "Edit").unwrap();
+        let mut items = appsgen::items(a.db.link(), "demo").unwrap();
+        items[0].kind = ActionKind::Form;
+        items[0].action_ref = "t".into();
+        appsgen::update_item(a.db.link(), &items[0]).unwrap();
+
+        a.apply(Command::OpenAppMenu(Some("demo".into())));
+        a.apply(Command::DesignerRun);
+        a.sync();
+        assert!(
+            matches!(a.overlay, Overlay::Form(_)),
+            "the form action must open the crafted form"
+        );
+    }
+
+    /// #45: a declarative `newrec` menu action opens a blank insert form for
+    /// its table target.
+    #[test]
+    fn newrec_menu_action_opens_an_insert_form() {
+        let mut a = app();
+        appsgen::ensure_app(a.db.link(), "demo").unwrap();
+        appsgen::add_item(a.db.link(), "demo", "New").unwrap();
+        let mut items = appsgen::items(a.db.link(), "demo").unwrap();
+        items[0].kind = ActionKind::NewRecord;
+        items[0].action_ref = "t".into();
+        appsgen::update_item(a.db.link(), &items[0]).unwrap();
+
+        a.apply(Command::OpenAppMenu(Some("demo".into())));
+        a.apply(Command::DesignerRun);
+        a.sync();
+        let Overlay::Edit(ed) = &a.overlay else {
+            panic!("the newrec action must open an insert form")
+        };
+        assert!(ed.inserting, "newrec opens in insert mode");
+        assert_eq!(ed.table, "t");
     }
 
     #[test]

@@ -334,14 +334,24 @@ Each menu item has a label, a kind, and a target:
   browse    opens a table in the grid (with its crafted form)
   query     runs a query saved from QBE, by name
   report    runs a saved report (or a plain table report), by name
+  form      opens a table's crafted form
+  newrec    opens a blank new-record form for a table
   sql       executes a statement — good for one-key housekeeping
   script    a one-line Lua script: query(sql), execute(sql), say(v)
 
-In the designer: n adds an item, Enter edits the label, e edits the
-target, c cycles the kind, [ and ] reorder, x deletes, and r
-renames the app itself. For a `script` item, E opens the full Lua
-editor (see Scripting). All changes save as you go. F2 opens the
-live menu to try it; Esc returns to your place in the designer.
+In the designer: n adds an item, Enter edits the label, and e
+chooses the target. For browse/query/report/form/newrec it opens
+a list of the matching catalog — type to narrow, Enter to pick —
+so you attach an asset without remembering its name. A broken
+target is named before the menu is handed off. c cycles the
+kind, [ and ] reorder, x deletes, and r renames the app itself.
+For a `script` item, E opens the full Lua editor (see Scripting).
+All changes save as you go. F2 opens the live menu to try it; Esc
+returns to your place in the designer.
+
+S opens the saved-asset catalog: every query, report, form, and
+app in the database, to preview (Enter) or open for editing (e) —
+no names to recall.
 
 The menu itself is pure 1988: arrow keys and Enter, or press the
 bright first letter of an item to run it instantly.

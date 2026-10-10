@@ -12,6 +12,10 @@ pub enum ActionKind {
     Browse,
     Query,
     Report,
+    /// Open a table's crafted form (its designer).
+    Form,
+    /// Open a new-record (insert) form for a table.
+    NewRecord,
     Sql,
     /// A one-line Lua script (docs: `src/script.rs`): `query`, `execute`,
     /// and `say` are the sandboxed surface.
@@ -23,7 +27,9 @@ impl ActionKind {
         match self {
             ActionKind::Browse => ActionKind::Query,
             ActionKind::Query => ActionKind::Report,
-            ActionKind::Report => ActionKind::Sql,
+            ActionKind::Report => ActionKind::Form,
+            ActionKind::Form => ActionKind::NewRecord,
+            ActionKind::NewRecord => ActionKind::Sql,
             ActionKind::Sql => ActionKind::Script,
             ActionKind::Script => ActionKind::Browse,
         }
@@ -34,6 +40,8 @@ impl ActionKind {
             ActionKind::Browse => "browse",
             ActionKind::Query => "query",
             ActionKind::Report => "report",
+            ActionKind::Form => "form",
+            ActionKind::NewRecord => "newrec",
             ActionKind::Sql => "sql",
             ActionKind::Script => "script",
         }
@@ -43,6 +51,8 @@ impl ActionKind {
         match s {
             "query" => ActionKind::Query,
             "report" => ActionKind::Report,
+            "form" => ActionKind::Form,
+            "newrec" => ActionKind::NewRecord,
             "sql" => ActionKind::Sql,
             "script" => ActionKind::Script,
             _ => ActionKind::Browse,
@@ -236,7 +246,9 @@ fn saved_report_exists(db: &dyn DbLink, name: &str) -> bool {
 /// handed off rather than only at run time (#45).
 pub fn item_target_error(db: &dyn DbLink, item: &AppItem) -> Option<String> {
     let broken = match item.kind {
-        ActionKind::Browse => !table_exists(db, &item.action_ref),
+        ActionKind::Browse | ActionKind::Form | ActionKind::NewRecord => {
+            !table_exists(db, &item.action_ref)
+        }
         ActionKind::Query => !saved_query_exists(db, &item.action_ref),
         // A report item is valid if a saved report exists OR the target is a
         // table (start_report falls back to a report on that table).
@@ -246,7 +258,9 @@ pub fn item_target_error(db: &dyn DbLink, item: &AppItem) -> Option<String> {
         ActionKind::Sql | ActionKind::Script => item.action_ref.trim().is_empty(),
     };
     broken.then(|| match item.kind {
-        ActionKind::Browse => format!("no table named {:?}", item.action_ref),
+        ActionKind::Browse | ActionKind::Form | ActionKind::NewRecord => {
+            format!("no table named {:?}", item.action_ref)
+        }
         ActionKind::Query => format!("no saved query named {:?}", item.action_ref),
         ActionKind::Report => format!("no report or table named {:?}", item.action_ref),
         ActionKind::Sql => "empty SQL target".to_owned(),
@@ -278,7 +292,7 @@ fn table_names(db: &dyn DbLink) -> Vec<String> {
 /// type-aware picker lists so a target is chosen, not remembered (#45).
 fn target_options(kind: ActionKind, db: &dyn DbLink) -> Vec<String> {
     match kind {
-        ActionKind::Browse => table_names(db),
+        ActionKind::Browse | ActionKind::Form | ActionKind::NewRecord => table_names(db),
         ActionKind::Query => store::names(db, "_phosphor_queries", "name"),
         ActionKind::Report => {
             let mut v = store::names(db, "_phosphor_reports", "name");
