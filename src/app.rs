@@ -1946,14 +1946,20 @@ impl App {
             if st.target_picker.is_some() {
                 // The picker owns the keys: type filters, ↑↓ move,
                 // Enter chooses, Esc cancels (#45).
+                // Every printable character types into the filter (no
+                // j/k or q hijack — `jobs` and `kpi_daily` must be findable).
+                let plain = !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
                 return Some(match key.code {
-                    Up | Char('k') => Command::TargetPickerMove(-1),
-                    Down | Char('j') => Command::TargetPickerMove(1),
+                    Up => Command::TargetPickerMove(-1),
+                    Down => Command::TargetPickerMove(1),
+                    PageUp => Command::TargetPickerMove(-10),
+                    PageDown => Command::TargetPickerMove(10),
                     Esc => Command::TargetPickerCancel,
                     Enter => Command::TargetPickerCommit,
                     Backspace => Command::TargetPickerBackspace,
-                    // Any other letter filters — 'q' must type, not cancel.
-                    Char(c) => Command::TargetPickerChar(c),
+                    Char(c) if plain => Command::TargetPickerChar(c),
                     _ => return None,
                 });
             }
@@ -1996,22 +2002,24 @@ impl App {
                 _ => return None,
             });
         }
-        if matches!(self.overlay, Overlay::Assets(_)) {
+        if let Overlay::Assets(st) = &self.overlay {
+            // Every printable character types into the search; actions live
+            // on non-printing keys so a name containing e/j/k/digits is
+            // searchable (typing "ce" must not open a designer).
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let plain = !ctrl && !key.modifiers.contains(KeyModifiers::ALT);
             return Some(match key.code {
                 Esc => Command::Back,
-                Up | Char('k') => Command::AssetMove(-1),
-                Down | Char('j') => Command::AssetMove(1),
+                Up => Command::AssetMove(-1),
+                Down => Command::AssetMove(1),
                 PageUp => Command::AssetMove(-10),
                 PageDown => Command::AssetMove(10),
                 Enter => Command::AssetRun,
-                Char('e') => Command::AssetEdit,
-                Char('1') => Command::AssetType(Some(AssetKind::Query)),
-                Char('2') => Command::AssetType(Some(AssetKind::Report)),
-                Char('3') => Command::AssetType(Some(AssetKind::Form)),
-                Char('4') => Command::AssetType(Some(AssetKind::App)),
-                Char('0') => Command::AssetType(None),
+                Char('e') if ctrl => Command::AssetEdit,
+                Tab => Command::AssetType(AssetKind::cycle(st.only, 1)),
+                BackTab => Command::AssetType(AssetKind::cycle(st.only, -1)),
                 Backspace => Command::AssetBackspace,
-                Char(c) => Command::AssetFilter(c),
+                Char(c) if plain => Command::AssetFilter(c),
                 _ => return None,
             });
         }
@@ -3855,15 +3863,24 @@ impl App {
             Overlay::Apps(st) => st.target_picker.as_ref().map(|p| p.item_index),
             _ => None,
         };
+        let mut failed = None;
         if let Overlay::Apps(st) = &mut self.overlay {
             st.target_picker = None;
             if let (Some(choice), Some(index)) = (choice, index) {
                 if let Some(item) = st.items.get_mut(index) {
-                    item.action_ref = choice;
-                    let item = item.clone();
-                    let _ = appsgen::update_item(self.db.link(), &item);
+                    let mut updated = item.clone();
+                    updated.action_ref = choice;
+                    // Persist first; only show the new target once it is
+                    // actually written, and say so when it isn't.
+                    match appsgen::update_item(self.db.link(), &updated) {
+                        Ok(()) => *item = updated,
+                        Err(e) => failed = Some(e),
+                    }
                 }
             }
+        }
+        if let Some(e) = failed {
+            self.err(format!("target not saved: {e}"));
         }
     }
 
@@ -12273,6 +12290,82 @@ beta');",
             matches!(a.overlay, Overlay::AppMenu(_)),
             "no pager may open for a broken report target"
         );
+    }
+
+    /// Every printable key types into the target picker's filter — `j`,
+    /// `k`, and `q` included — so names like `jobs` are findable; only the
+    /// arrow keys move.
+    #[test]
+    fn target_picker_types_every_printable_key() {
+        let mut a = app();
+        a.apply(Command::OpenApps(Some("crm".into())));
+        a.apply(Command::DesignerAdd);
+        a.apply(Command::DesignerEditAlt);
+        for c in ['j', 'k', 'q', 'e', '1'] {
+            assert!(
+                matches!(
+                    a.map_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+                    Some(Command::TargetPickerChar(x)) if x == c
+                ),
+                "{c:?} must filter, not navigate"
+            );
+        }
+        assert!(matches!(
+            a.map_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Some(Command::TargetPickerMove(1))
+        ));
+    }
+
+    /// Every printable key types into the asset browser's search — typing
+    /// "ce" must not open a designer, digits must not switch the kind.
+    /// Ctrl-E edits; Tab / Shift-Tab cycle the kind filter.
+    #[test]
+    fn asset_browser_search_types_every_printable_key() {
+        let mut a = app();
+        a.apply(Command::OpenAssets);
+        for c in ['e', 'j', 'k', '0', '1', '4'] {
+            assert!(
+                matches!(
+                    a.map_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+                    Some(Command::AssetFilter(x)) if x == c
+                ),
+                "{c:?} must type into the search"
+            );
+        }
+        assert!(matches!(
+            a.map_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Some(Command::AssetEdit)
+        ));
+        assert!(matches!(
+            a.map_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(Command::AssetType(Some(AssetKind::Query)))
+        ));
+        assert!(matches!(
+            a.map_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(Command::AssetType(Some(AssetKind::App)))
+        ));
+    }
+
+    /// A target that fails to save is reported, and the designer keeps
+    /// showing the target that's actually stored.
+    #[test]
+    fn target_picker_save_failure_is_reported() {
+        let mut a = app();
+        a.apply(Command::OpenApps(Some("crm".into())));
+        a.apply(Command::DesignerAdd);
+        a.apply(Command::DesignerEditAlt);
+        a.sync();
+        // Make the write fail underneath the picker.
+        a.db.link().execute("DROP TABLE _phosphor_items").unwrap();
+        a.apply(Command::TargetPickerChar('t'));
+        a.apply(Command::TargetPickerCommit);
+        let (msg, is_err) = a.status.clone().expect("a status is shown");
+        assert!(is_err && msg.contains("target not saved"), "{msg}");
+        if let Overlay::Apps(st) = &a.overlay {
+            assert_eq!(st.items[0].action_ref, "", "unsaved target not shown");
+        } else {
+            panic!("designer closed");
+        }
     }
 
     /// #45: `e` on a Browse item opens the type-aware target picker — the

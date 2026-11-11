@@ -219,69 +219,113 @@ pub fn swap_items(db: &dyn DbLink, a: &AppItem, b: &AppItem) -> DbResult<()> {
     .map(|_| ())
 }
 
-/// True when a table or view with that name exists (case-insensitive) —
-/// the target a Browse (or a report-on-table) item points at.
-fn table_exists(db: &dyn DbLink, name: &str) -> bool {
-    db.tables()
-        .map(|ts| ts.iter().any(|t| t.name.eq_ignore_ascii_case(name)))
-        .unwrap_or(false)
+/// The live catalog a menu target can name, loaded once per check so
+/// validating N items costs a few catalog reads, not N of each — which
+/// matters on the remote backend, where every read is a round trip.
+struct Catalog {
+    /// (name, is_view) of every table and view.
+    tables: Vec<(String, bool)>,
+    queries: Vec<String>,
+    reports: Vec<String>,
 }
 
-/// True when a saved QBE query with that name exists.
-fn saved_query_exists(db: &dyn DbLink, name: &str) -> bool {
-    store::names(db, "_phosphor_queries", "name")
-        .iter()
-        .any(|n| n.eq_ignore_ascii_case(name))
-}
+impl Catalog {
+    fn load(db: &dyn DbLink) -> Self {
+        Catalog {
+            tables: db
+                .tables()
+                .map(|ts| ts.into_iter().map(|t| (t.name, t.is_view)).collect())
+                .unwrap_or_default(),
+            queries: store::names(db, "_phosphor_queries", "name"),
+            reports: store::names(db, "_phosphor_reports", "name"),
+        }
+    }
 
-/// True when a saved report with that name exists.
-fn saved_report_exists(db: &dyn DbLink, name: &str) -> bool {
-    store::names(db, "_phosphor_reports", "name")
-        .iter()
-        .any(|n| n.eq_ignore_ascii_case(name))
+    /// A table or view with that name exists (case-insensitive).
+    fn relation(&self, name: &str) -> bool {
+        self.tables
+            .iter()
+            .any(|(t, _)| t.eq_ignore_ascii_case(name))
+    }
+
+    /// A base table (not a view) with that name exists — what an insert
+    /// needs.
+    fn base_table(&self, name: &str) -> bool {
+        self.tables
+            .iter()
+            .any(|(t, v)| !v && t.eq_ignore_ascii_case(name))
+    }
+
+    fn has(list: &[String], name: &str) -> bool {
+        list.iter().any(|n| n.eq_ignore_ascii_case(name))
+    }
+
+    /// Why `item`'s target is broken against this catalog (`None` = valid).
+    fn target_error(&self, item: &AppItem) -> Option<String> {
+        let r = &item.action_ref;
+        match item.kind {
+            ActionKind::Browse | ActionKind::Form => {
+                (!self.relation(r)).then(|| format!("no table named {r:?}"))
+            }
+            // A new-record form inserts, so a view can't be its target.
+            ActionKind::NewRecord => {
+                if self.base_table(r) {
+                    None
+                } else if self.relation(r) {
+                    Some(format!("{r:?} is a view — new records need a table"))
+                } else {
+                    Some(format!("no table named {r:?}"))
+                }
+            }
+            ActionKind::Query => {
+                (!Self::has(&self.queries, r)).then(|| format!("no saved query named {r:?}"))
+            }
+            // A report item is valid if a saved report exists OR the target
+            // is a table (start_report falls back to a report on that table).
+            ActionKind::Report => (!Self::has(&self.reports, r) && !self.relation(r))
+                .then(|| format!("no report or table named {r:?}")),
+            ActionKind::Sql => r.trim().is_empty().then(|| "empty SQL target".to_owned()),
+            ActionKind::Script => r
+                .trim()
+                .is_empty()
+                .then(|| "empty script target".to_owned()),
+        }
+    }
 }
 
 /// Why a menu item's target is broken, if it is (`None` = valid), checked
 /// against the live catalog so a broken target is caught before the app is
 /// handed off rather than only at run time (#45).
 pub fn item_target_error(db: &dyn DbLink, item: &AppItem) -> Option<String> {
-    let broken = match item.kind {
-        ActionKind::Browse | ActionKind::Form | ActionKind::NewRecord => {
-            !table_exists(db, &item.action_ref)
+    match item.kind {
+        // Free-text kinds need no catalog read.
+        ActionKind::Sql | ActionKind::Script => Catalog {
+            tables: Vec::new(),
+            queries: Vec::new(),
+            reports: Vec::new(),
         }
-        ActionKind::Query => !saved_query_exists(db, &item.action_ref),
-        // A report item is valid if a saved report exists OR the target is a
-        // table (start_report falls back to a report on that table).
-        ActionKind::Report => {
-            !saved_report_exists(db, &item.action_ref) && !table_exists(db, &item.action_ref)
-        }
-        ActionKind::Sql | ActionKind::Script => item.action_ref.trim().is_empty(),
-    };
-    broken.then(|| match item.kind {
-        ActionKind::Browse | ActionKind::Form | ActionKind::NewRecord => {
-            format!("no table named {:?}", item.action_ref)
-        }
-        ActionKind::Query => format!("no saved query named {:?}", item.action_ref),
-        ActionKind::Report => format!("no report or table named {:?}", item.action_ref),
-        ActionKind::Sql => "empty SQL target".to_owned(),
-        ActionKind::Script => "empty script target".to_owned(),
-    })
+        .target_error(item),
+        _ => Catalog::load(db).target_error(item),
+    }
 }
 
 /// Every broken target among the given items as `(item id, reason)` — the
-/// check run before an app is handed off as the application (#45).
+/// check run before an app is handed off as the application (#45). The
+/// catalog is read once for the whole menu.
 pub fn broken_targets_in(items: &[AppItem], db: &dyn DbLink) -> Vec<(i64, String)> {
+    let cat = Catalog::load(db);
     items
         .iter()
-        .filter_map(|it| item_target_error(db, it).map(|e| (it.id, e)))
+        .filter_map(|it| cat.target_error(it).map(|e| (it.id, e)))
         .collect()
 }
 
-fn table_names(db: &dyn DbLink) -> Vec<String> {
+/// User-visible relations; `tables_only` drops views (insert targets).
+fn table_names(db: &dyn DbLink, tables_only: bool) -> Vec<String> {
     db.tables()
         .map(|ts| {
             ts.into_iter()
-                .filter(|t| !crate::app::App::is_internal(t))
+                .filter(|t| !crate::app::App::is_internal(t) && !(tables_only && t.is_view))
                 .map(|t| t.name)
                 .collect()
         })
@@ -292,11 +336,12 @@ fn table_names(db: &dyn DbLink) -> Vec<String> {
 /// type-aware picker lists so a target is chosen, not remembered (#45).
 fn target_options(kind: ActionKind, db: &dyn DbLink) -> Vec<String> {
     match kind {
-        ActionKind::Browse | ActionKind::Form | ActionKind::NewRecord => table_names(db),
+        ActionKind::Browse | ActionKind::Form => table_names(db, false),
+        ActionKind::NewRecord => table_names(db, true),
         ActionKind::Query => store::names(db, "_phosphor_queries", "name"),
         ActionKind::Report => {
             let mut v = store::names(db, "_phosphor_reports", "name");
-            for t in table_names(db) {
+            for t in table_names(db, false) {
                 if !v.iter().any(|r| r.eq_ignore_ascii_case(&t)) {
                     v.push(t);
                 }
@@ -377,6 +422,22 @@ pub enum AssetKind {
 }
 
 impl AssetKind {
+    /// The catalog browser's kind filter, in Tab order (None = every kind).
+    const CYCLE: [Option<AssetKind>; 5] = [
+        None,
+        Some(AssetKind::Query),
+        Some(AssetKind::Report),
+        Some(AssetKind::Form),
+        Some(AssetKind::App),
+    ];
+
+    /// Step the kind filter forward (`d > 0`, Tab) or back (Shift-Tab).
+    pub fn cycle(current: Option<AssetKind>, d: i64) -> Option<AssetKind> {
+        let n = Self::CYCLE.len() as i64;
+        let i = Self::CYCLE.iter().position(|k| *k == current).unwrap_or(0) as i64;
+        Self::CYCLE[(i + d).rem_euclid(n) as usize]
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             AssetKind::Query => "QUERY",
@@ -615,6 +676,51 @@ mod tests {
             broken_targets_in(&its, &db),
             vec![(12, "no saved query named \"ghost\"".into())]
         );
+    }
+
+    /// A new-record item can't target a view (inserts need a table), and
+    /// its picker doesn't offer views; browse still may.
+    #[test]
+    fn new_record_targets_exclude_views() {
+        let (db, _) = EmbeddedDb::open(":memory:").unwrap();
+        store::ensure(&db).unwrap();
+        db.execute(
+            "CREATE TABLE orders(a INTEGER); \
+             CREATE VIEW big_orders AS SELECT * FROM orders WHERE a > 10;",
+        )
+        .unwrap();
+        let mk = |kind: ActionKind, ref_: &str| AppItem {
+            id: 0,
+            label: String::new(),
+            kind,
+            action_ref: ref_.into(),
+            seq: 0,
+        };
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::NewRecord, "orders")),
+            None
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::NewRecord, "big_orders")).as_deref(),
+            Some("\"big_orders\" is a view — new records need a table")
+        );
+        assert_eq!(
+            item_target_error(&db, &mk(ActionKind::Browse, "big_orders")),
+            None
+        );
+        let opts = target_options(ActionKind::NewRecord, &db);
+        assert!(opts.iter().any(|n| n == "orders"), "{opts:?}");
+        assert!(!opts.iter().any(|n| n == "big_orders"), "{opts:?}");
+        assert!(target_options(ActionKind::Browse, &db)
+            .iter()
+            .any(|n| n == "big_orders"));
+    }
+
+    #[test]
+    fn asset_kind_filter_cycles_both_ways() {
+        assert_eq!(AssetKind::cycle(None, 1), Some(AssetKind::Query));
+        assert_eq!(AssetKind::cycle(Some(AssetKind::App), 1), None);
+        assert_eq!(AssetKind::cycle(None, -1), Some(AssetKind::App));
     }
 
     /// #45: the Browse/Report target picker lists only user tables —

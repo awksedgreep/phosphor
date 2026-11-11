@@ -1119,7 +1119,7 @@ fn draw_assets(f: &mut Frame, app: &mut App) {
             th.bright(),
         ))
         .title_bottom(Line::styled(
-            " type filters · 1-4 kind · 0 all · Enter preview · e edit · Esc ",
+            " type filters · Tab kind · Enter preview · ^E edit · Esc ",
             th.dim(),
         ));
     let inner = block.inner(area);

@@ -364,7 +364,8 @@ All changes save as you go. F2 opens the live menu to try it; Esc
 returns to your place in the designer.
 
 S opens the saved-asset catalog: every query, report, form, and
-app in the database, to preview (Enter) or open for editing (e) —
+app in the database, to preview (Enter) or open for editing
+(Ctrl-E). Type to search; Tab / Shift-Tab cycle the kind filter —
 no names to recall.
 
 The menu itself is pure 1988: arrow keys and Enter, or press the
