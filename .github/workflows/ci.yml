@@ -33,6 +33,12 @@ jobs:
         run: cargo test --release perf_budget
       - name: build release
         run: cargo build --release
+      - name: retain Linux release binary
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: phosphor-linux-x86_64
+          path: target/release/phosphor
       - name: terminal fixture dependency
         run: |
           if ! command -v sqlite3 >/dev/null; then

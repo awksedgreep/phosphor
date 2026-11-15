@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 — 2026-11-14
+
 ### Added
 - A saved-asset catalog (`S`) finds, previews, and opens queries, reports,
   forms, and applications. Application menus now offer type-aware target
