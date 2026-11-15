@@ -7,8 +7,10 @@ against the captured output (ANSI-stripped) — so regressions fail
 mechanically, and a green run leaves publishable GIFs behind.
 
     python3 tools/demo/uitest.py            # record + assert
+    python3 tools/demo/uitest.py --reels paging scripting tutorial
     python3 tools/demo/uitest.py --render   # ...and render GIFs on green
 """
+import argparse
 import json
 import os
 import re
@@ -21,9 +23,11 @@ from record import record, typing
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 BIN = os.path.join(ROOT, "target/release/phosphor")
 DB = "/tmp/phosphor-uitest.db"
-EXT = os.path.abspath(
-    os.path.join(ROOT, "../timeless-libsql/target/release/libdbhealth_ext.so")
+EXT_BASE = os.path.abspath(
+    os.path.join(ROOT, "../timeless-libsql/target/release/libdbhealth_ext")
 )
+EXT = next((path for path in (EXT_BASE + ".so", EXT_BASE + ".dylib", EXT_BASE)
+            if os.path.isfile(path)), "")
 ENV = {"PHOSPHOR_EXT": EXT}
 OUT = os.path.join(ROOT, "docs/demo/ui")
 WORK = "/tmp/phosphor-uitest-work"  # cwd for the app: report files land here
@@ -208,14 +212,22 @@ class Reel:
         return failures
 
 
-def seed():
+def seed(with_health=False):
     subprocess.run(
         [os.path.join(ROOT, "tools/demo/seed.sh"), DB],
         check=True,
         capture_output=True,
+        env={**os.environ, "DBHEALTH_EXT": EXT if with_health else ""},
     )
     os.makedirs(WORK, exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
+    # The scratch reel saves to a fixed path. A previous sweep must not
+    # turn its successful save into an "already exists" failure.
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(os.path.join(WORK, "scratch CRM.db" + suffix))
+        except FileNotFoundError:
+            pass
     # Fixture for the `data` reel's CSV import.
     with open(os.path.join(WORK, "people-import.csv"), "w") as f:
         f.write("id,name\n1,Imported Ada\n2,Imported Grace\n")
@@ -237,9 +249,10 @@ def reels():
     r.key(HOME, 0.4)
     r.key(ESC, 0.5)
     r.key("i", 0.5).expect("internal tables shown")
-    r.keys(["d"] * 5, gap=0.3)                        # seek cycles the d's
-    r.key(ENTER, 0.9).expect("(read-only)")           # dbhealth_now view
-    r.key(ESC, 0.4)
+    if EXT:
+        r.keys(["d"] * 5, gap=0.3)                    # seek cycles the d's
+        r.key(ENTER, 0.9).expect("(read-only)")       # dbhealth_now view
+        r.key(ESC, 0.4)
     r.key("i", 0.5).expect("internal tables hidden")
     out.append(r)
 
@@ -426,7 +439,8 @@ def reels():
     r.key(ESC, 0.4).key(ESC, 0.5)
     r.key(F1, 0.7).expect("BROWSING & EDITING")
     r.key(ESC, 0.4)
-    out.append(r)
+    if EXT:
+        out.append(r)
 
     # ── R · relations: declared FKs become child panes on the form ───
     r = Reel("relations", "foreign keys → SET RELATION: child panes on the form")
@@ -476,7 +490,7 @@ def reels():
     # A script menu item, authored in the full-screen editor, run by hotkey.
     r.key("A", 0.7).expect("APPLICATIONS GENERATOR · crm")
     r.key("n", 0.5).key(ENTER, 0.4).type("Tally").key(ENTER, 0.4)
-    r.keys(["c"] * 4, gap=0.4)                        # browse→query→report→sql→script
+    r.keys(["c"] * 6, gap=0.4)                        # browse→query→report→form→newrec→sql→script
     r.key("E", 0.8).expect("SCRIPT · crm · Tally")
     r.type('local n = scalar("select count(*) from people")')
     r.key(ENTER, 0.5)
@@ -849,9 +863,18 @@ def reels():
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reels", nargs="+", help="run only these named reels")
+    parser.add_argument("--render", action="store_true", help="render GIFs after a green run")
+    args = parser.parse_args()
+    selected = [r for r in reels() if args.reels is None or r.name in args.reels]
+    if args.reels and set(args.reels) != {r.name for r in selected}:
+        parser.error("unknown or unavailable reel")
     all_fail = {}
-    for r in reels():
-        seed()  # every reel starts from the same pristine database
+    for r in selected:
+        with_health = bool(EXT) and r.name in {"nav", "health"}
+        ENV["PHOSPHOR_EXT"] = EXT if with_health else ""
+        seed(with_health=with_health)  # every reel starts from a pristine database
         failures = r.run()
         status = "PASS" if not failures else "FAIL"
         print(f"[{status}] {r.name}: {r.title}")
@@ -862,10 +885,12 @@ def main():
     if all_fail:
         print(f"\n{len(all_fail)} reel(s) failed")
         sys.exit(1)
+    if not EXT and args.reels is None:
+        print("[SKIP] health: optional dbhealth extension not installed")
     print("\nALL REELS PASSED")
-    if "--render" in sys.argv:
+    if args.render:
         font = os.environ.get("AGG_FONT", "CaskaydiaMono Nerd Font Mono")
-        for r in reels():
+        for r in selected:
             cast = os.path.join(OUT, f"{r.name}.cast")
             gif = os.path.join(OUT, f"{r.name}.gif")
             subprocess.run(

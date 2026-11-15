@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Added
+- A saved-asset catalog (`S`) finds, previews, and opens queries, reports,
+  forms, and applications. Application menus now offer type-aware target
+  pickers, crafted-form actions, and new-record actions (#45).
+
+### Changed
+- Prompt SQL writes and CSV imports run as cancellable jobs with progress.
+  Grid rendering, table lookup, script binding, and detail-pane preferences
+  use caches or batched work to keep navigation responsive (#52–#55, #77).
+
+### Fixed
+- CSV import enforces declared types and preserves field whitespace; BLOB
+  columns round-trip through CSV. Lua scripts preserve BLOBs, apply form
+  lifecycle UI effects, bound database work, and return full-range epoch
+  seconds (#57, #59, #60, #62, #76, #79).
+- Record and designer paths retain the intended row, field value, and saved
+  design through paging, edits, async refreshes, and failures. Menu errors
+  and blocking validation errors are shown instead of being hidden (#56,
+  #58, #61, #68, #69, #74, #75, #78).
+- Multiline and BLOB fields open in the note editor, grid-header clicks leave
+  records alone, wide grids avoid width overflow, related panes use their
+  measured height, and the health console chooses the dbhealth report view
+  when other report views are present (#49, #50, #66, #67, #80).
+- Reports keep CJK columns aligned, sum large integers exactly, skip totals
+  for all-NULL columns, and keep footers within page bounds (#70–#72).
+  SQL parsing and designer DDL checks preserve statement boundaries and
+  handle non-finite numbers and multibyte whitespace (#51, #63–#65, #73).
+- Grid rendering no longer panics when a visible row precedes the current
+  fetch window. Terminal regression fixtures now follow the current menu
+  kinds and load the optional dbhealth extension on macOS.
+
 ## 0.2.0 — 2026-09-14
 
 New database and application tools, safer record and schema editing, and

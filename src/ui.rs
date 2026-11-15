@@ -1571,6 +1571,14 @@ fn draw_sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// A visible row can be outside the current fetch window while a new
+/// window is in flight. Only cached rows may index the render cache.
+fn cached_row_index(grid: &Grid, abs: i64) -> Option<usize> {
+    let offset = abs.checked_sub(grid.cache_start)?;
+    let index = usize::try_from(offset).ok()?;
+    (index < grid.cache.len()).then_some(index)
+}
+
 fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     draw_master_panel(f, app, area);
 }
@@ -1685,7 +1693,7 @@ fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
         if abs >= g.total {
             break;
         }
-        idxs.push(abs.checked_sub(g.cache_start).map(|i| i as usize));
+        idxs.push(cached_row_index(g, abs));
     }
     g.render.resize(
         idxs.iter().flatten().copied().max().map_or(0, |m| m + 1),
@@ -1829,7 +1837,7 @@ fn draw_detail_panel(
         if abs >= g.total {
             break;
         }
-        idxs.push(abs.checked_sub(g.cache_start).map(|i| i as usize));
+        idxs.push(cached_row_index(g, abs));
     }
     g.render.resize(
         idxs.iter().flatten().copied().max().map_or(0, |m| m + 1),

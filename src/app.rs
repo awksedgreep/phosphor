@@ -8480,6 +8480,15 @@ mod tests {
     use super::*;
     use crate::db::EmbeddedDb;
 
+    fn timeless_extension() -> Option<&'static str> {
+        [
+            "../timeless-libsql/target/release/libdbhealth_ext.so",
+            "../timeless-libsql/target/release/libdbhealth_ext.dylib",
+        ]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+    }
+
     #[test]
     fn cancelling_an_embedded_read_preserves_the_callers_transaction() {
         crate::test_support::assert_cancelled_read_keeps_transaction(
@@ -10106,6 +10115,27 @@ mod tests {
         assert_eq!(cursor_symbol(&a, &terminal), "999");
     }
 
+    #[test]
+    fn drawing_while_the_visible_row_precedes_the_fetch_window_is_bounded() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut a = app();
+        a.apply(Command::OpenSelected);
+        a.sync();
+        let g = a.grid.as_mut().unwrap();
+        g.row_off = 0;
+        g.cache_start = 1; // a later fetch arrived while an earlier row is visible
+        g.render.clear();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                crate::ui::draw(f, &mut a);
+            })
+            .unwrap();
+        assert!(a.grid.as_ref().unwrap().render.len() <= a.grid.as_ref().unwrap().cache.len());
+    }
+
     /// A health response arriving after the user moved on is dropped,
     /// never yanked over the new screen.
     #[test]
@@ -10202,11 +10232,10 @@ mod tests {
     /// door: dbhealth vtab + samples + the console over the bus.
     #[test]
     fn health_console_over_timeless_extension() {
-        let ext = "../timeless-libsql/target/release/libdbhealth_ext.so";
-        if !std::path::Path::new(ext).exists() {
-            eprintln!("skipping: {ext} not built");
+        let Some(ext) = timeless_extension() else {
+            eprintln!("skipping: timeless extension not built");
             return;
-        }
+        };
         std::env::set_var("PHOSPHOR_EXT", ext);
         let (db, warn) = EmbeddedDb::open(":memory:").unwrap();
         assert!(warn.is_none(), "extension failed to load: {warn:?}");
@@ -12047,11 +12076,10 @@ beta');",
     /// Full-stack: the LIVE console samples on tick without keys.
     #[test]
     fn health_console_ticks_a_sample_when_due() {
-        let ext = "../timeless-libsql/target/release/libdbhealth_ext.so";
-        if !std::path::Path::new(ext).exists() {
-            eprintln!("skipping: {ext} not built");
+        let Some(ext) = timeless_extension() else {
+            eprintln!("skipping: timeless extension not built");
             return;
-        }
+        };
         std::env::set_var("PHOSPHOR_EXT", ext);
         let (db, warn) = crate::db::EmbeddedDb::open(":memory:").unwrap();
         assert!(warn.is_none(), "extension failed to load: {warn:?}");

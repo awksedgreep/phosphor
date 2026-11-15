@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DB="${1:-/tmp/phosphor-demo.db}"
-DBHEALTH_EXT="${DBHEALTH_EXT:-$ROOT/../timeless-libsql/target/release/libdbhealth_ext}"
+DBHEALTH_EXT="${DBHEALTH_EXT-$ROOT/../timeless-libsql/target/release/libdbhealth_ext}"
 
 rm -f "$DB" "$DB"-journal "$DB"-wal "$DB"-shm
 sqlite3 "$DB" <<'SQL'
@@ -64,10 +64,29 @@ SQL
 # dbhealth with a fast cadence so the live console moves on camera.
 # Optional: the timeless extension ships in its own repo; when it is
 # not built, seed everything else and let the health demo be skipped.
-if [ -f "${DBHEALTH_EXT}.so" ] || [ -f "$DBHEALTH_EXT" ]; then
-  sqlite3 "$DB" ".load $DBHEALTH_EXT" \
-    "CREATE VIRTUAL TABLE dbhealth USING dbhealth(every=2);
-     INSERT INTO dbhealth(dbhealth) VALUES ('sample');"
+DBHEALTH_PATH=""
+if [ -n "$DBHEALTH_EXT" ]; then
+  for candidate in "$DBHEALTH_EXT" "${DBHEALTH_EXT}.so" "${DBHEALTH_EXT}.dylib"; do
+    if [ -f "$candidate" ]; then
+      DBHEALTH_PATH="$candidate"
+      break
+    fi
+  done
+fi
+if [ -n "$DBHEALTH_PATH" ]; then
+  # Python's SQLite loader works on macOS too, where the sqlite3 CLI can
+  # be built without the .load command.
+  python3 - "$DB" "$DBHEALTH_PATH" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    connection.enable_load_extension(True)
+    connection.load_extension(sys.argv[2])
+    connection.enable_load_extension(False)
+    connection.execute("CREATE VIRTUAL TABLE dbhealth USING dbhealth(every=2)")
+    connection.execute("INSERT INTO dbhealth(dbhealth) VALUES ('sample')")
+PY
   echo "seeded $DB (with dbhealth)"
 else
   echo "seeded $DB (dbhealth skipped: $DBHEALTH_EXT not built)"

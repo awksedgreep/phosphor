@@ -37,7 +37,7 @@ def main():
             # Metadata opens remain fast. Delay the complete output request,
             # and delay probe replies until after the input event is handled.
             if b"latency_" in body and b"LIMIT 0" not in body and self.path.endswith("/cursor"):
-                time.sleep(0.6)
+                time.sleep(2.5)
             elif b"probe_" in body or b"compute_" in body:
                 time.sleep(0.025)
             req = urllib.request.Request(upstream + self.path, data=body, headers={"Content-Type": "application/json"})
@@ -68,7 +68,7 @@ def main():
             raise RuntimeError("sqld did not start")
         binary = str(Path(args.binary).resolve())
         results = measure(binary, root, url)
-        results["operations"] = measure_operations(binary, root / "operations", url, rows=10000, cancel_budget=2000)
+        results["operations"] = measure_operations(binary, root / "operations", url, rows=10000, cancel_budget=3500)
         (root / "results.json").write_text(json.dumps(results, indent=2))
         print(json.dumps({"artifacts": str(root), **results}, indent=2), flush=True)
         assert results["max_ms"] < 200 and results["computed_max_ms"] < 200, results

@@ -49,6 +49,7 @@ def main():
     args = parser.parse_args()
     root = Path(tempfile.mkdtemp(prefix="pfr-", dir="/tmp"))
     ui.DB, ui.OUT, ui.WORK = [str(root / n) for n in ("ui.db", "casts", "work")]
+    ui.EXT = ""  # the server cannot load the local embedded extension
     ui.ENV = {"PHOSPHOR_EXT": "", "PHOSPHOR_TOKEN": ""}
     results = {}
     print("Artifacts:", root, flush=True)

@@ -33,5 +33,13 @@ jobs:
         run: cargo test --release perf_budget
       - name: build release
         run: cargo build --release
+      - name: terminal fixture dependency
+        run: |
+          if ! command -v sqlite3 >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y sqlite3
+          fi
+      - name: terminal paging, scripting, and first-run workflows
+        run: python3 tools/demo/uitest.py --reels paging scripting tutorial
       - name: terminal response latency and slow output cancellation
         run: python3 tools/test_latency.py

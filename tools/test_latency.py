@@ -48,9 +48,11 @@ class Terminal:
         return (time.monotonic() - start) * 1000
 
     def resize(self, cols, rows):
-        self.screen = Screen(cols, rows)
+        self.screen.resize(cols, rows)
         self.events.append([time.monotonic() - self.start, "r", f"{cols}x{rows}"])
+        previous = len(self.events)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        self.wait(lambda _text: len(self.events) > previous, timeout=1)
 
     def wait(self, predicate, timeout=5):
         deadline = time.monotonic() + timeout
@@ -136,6 +138,9 @@ def measure_operations(binary, directory, database=":memory:", rows=1000000000, 
         terminal.wait(lambda text: "HELP" in text and "STATUS & CONNECTION" not in text)
         terminal.send("\x1b")
         terminal.wait(lambda text: "Preparing report" in text and "HELP" not in text)
+        # Give the terminal parser time to finish this Esc before sending
+        # another one to cancel the operation after the resize checks.
+        time.sleep(0.1)
         terminal.resize(40, 12)
         terminal.wait(lambda text: "rows read" in text)
         terminal.resize(80, 24)
