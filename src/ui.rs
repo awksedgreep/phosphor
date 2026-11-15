@@ -1670,12 +1670,18 @@ fn draw_master_panel(f: &mut Frame, app: &mut App, area: Rect) {
     let start = g.col_off.max(frozen);
     let mut cols: Vec<usize> = Vec::new();
     let mut used: u16 = 0;
-    for c in 0..frozen {
-        used = used.saturating_add(g.widths[c] + 1);
+    for (c, width) in g.widths.iter().enumerate().take(frozen) {
+        used = used.saturating_add(*width + 1);
         cols.push(c);
     }
-    for c in start..g.columns.len() {
-        let w = g.widths[c] + 1;
+    for (c, width) in g
+        .widths
+        .iter()
+        .enumerate()
+        .take(g.columns.len())
+        .skip(start)
+    {
+        let w = *width + 1;
         if used + w > inner.width && !cols.is_empty() {
             break;
         }
@@ -1820,8 +1826,15 @@ fn draw_detail_panel(
     // Visible column window (pane is ~half the screen).
     let mut cols: Vec<usize> = Vec::new();
     let mut used: u16 = 0;
-    for c in state.grid.col_off..state.grid.columns.len() {
-        let w = state.grid.widths[c] + 1;
+    for (c, width) in state
+        .grid
+        .widths
+        .iter()
+        .enumerate()
+        .take(state.grid.columns.len())
+        .skip(state.grid.col_off)
+    {
+        let w = *width + 1;
         if used + w > inner.width && !cols.is_empty() {
             break;
         }
